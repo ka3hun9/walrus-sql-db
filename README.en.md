@@ -6,11 +6,13 @@ Pure on-chain oriented Walrus SQL SDK starter.
 
 ## Features
 
-- SQL capability: `WHERE(AND/OR/IN/comparators)`, multi-order, group/having, aggregates, explain
-- Simulator INNER JOIN (`npm run sql:join`)
+- SQL capability: `WHERE(AND/OR/IN/comparators/LIKE/IS NULL)`, multi-order, group/having, aggregates, explain
+- Simulator JOIN (`INNER/LEFT/RIGHT`) + UNION/UNION ALL + `ROW_NUMBER()` (first-cut)
+- Subquery first-cut: `IN (SELECT col FROM table)`
 - On-chain replay SELECT with persistent cache (`WALRUS_SQL_REPLAY_CACHE_FILE`)
-- On-chain replay INNER JOIN (replay left+right tables then local join)
+- On-chain replay JOIN (replay left+right tables then local join)
 - Auto table discovery by `TableCreated` events
+- Gap tracking matrix: `docs/SQL_GAP_MATRIX.md`
 
 ## RPC failover (testnet)
 
@@ -25,6 +27,7 @@ npm install
 npm run build
 npm run sql:advanced
 npm run sql:join
+npm run sql:roadmap
 npm run onchain:select-replay
 npm run onchain:join-replay
 npm run onchain:benchmark-replay

@@ -44,7 +44,7 @@ export interface OnchainQueryRequest {
   having?: string;
   explain?: boolean;
   join?: {
-    type: "INNER" | "LEFT";
+    type: "INNER" | "LEFT" | "RIGHT";
     table: string;
     leftField: string;
     rightField: string;

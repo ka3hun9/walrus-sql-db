@@ -36,7 +36,7 @@ type ParsedSelect = {
   groupBy?: string[];
   having?: string;
   join?: {
-    type: "INNER" | "LEFT";
+    type: "INNER" | "LEFT" | "RIGHT";
     table: string;
     leftField: string;
     rightField: string;
@@ -347,11 +347,11 @@ export class WalrusSqlClient {
     let join: ParsedSelect["join"];
 
     const joinMatch = tail.match(
-      /^\s+(INNER|LEFT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+      /^\s+(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
     );
     if (joinMatch) {
       join = {
-        type: joinMatch[1].toUpperCase() as "INNER" | "LEFT",
+        type: joinMatch[1].toUpperCase() as "INNER" | "LEFT" | "RIGHT",
         table: joinMatch[2],
         leftField: joinMatch[3],
         rightField: joinMatch[4],
@@ -470,6 +470,17 @@ export class WalrusSqlClient {
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
   ): SqlRow[] {
+    if (join.type === "RIGHT") {
+      const syntheticLeftRows = this.requireTable(join.table);
+      const syntheticJoin: NonNullable<ParsedSelect["join"]> = {
+        type: "LEFT",
+        table: leftTable,
+        leftField: join.rightField,
+        rightField: join.leftField,
+      };
+      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin);
+    }
+
     const rightRows = this.requireTable(join.table);
     const leftField = join.leftField.includes(".") ? join.leftField.split(".")[1] : join.leftField;
     const rightField = join.rightField.includes(".") ? join.rightField.split(".")[1] : join.rightField;
@@ -500,7 +511,6 @@ export class WalrusSqlClient {
           merged[k] = v;
           merged[`${leftTable}.${k}`] = v;
         }
-        merged[`__left_only__`] = true;
         out.push(merged);
       }
     }

@@ -6,11 +6,13 @@
 
 ## 功能
 
-- SQL 能力：`WHERE(AND/OR/IN/比较符)`、多字段排序、GROUP BY/HAVING、聚合、EXPLAIN
-- Simulator INNER JOIN（`npm run sql:join`）
+- SQL 能力：`WHERE(AND/OR/IN/比较符/LIKE/IS NULL)`、多字段排序、GROUP BY/HAVING、聚合、EXPLAIN
+- Simulator JOIN（`INNER/LEFT/RIGHT`）+ UNION/UNION ALL + `ROW_NUMBER()`（首版）
+- 子查询首版：`IN (SELECT col FROM table)`
 - On-chain replay 查询 + 持久化缓存（`WALRUS_SQL_REPLAY_CACHE_FILE`）
-- On-chain replay INNER JOIN（两表回放 + 本地 join）
+- On-chain replay JOIN（两表回放 + 本地 join）
 - 基于 `TableCreated` 事件的自动发现表
+- 差距跟踪矩阵：`docs/SQL_GAP_MATRIX.md`
 
 ## Testnet RPC（故障切换）
 
@@ -25,6 +27,7 @@ npm install
 npm run build
 npm run sql:advanced
 npm run sql:join
+npm run sql:roadmap
 npm run onchain:select-replay
 npm run onchain:join-replay
 npm run onchain:benchmark-replay

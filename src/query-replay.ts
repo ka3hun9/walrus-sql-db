@@ -298,7 +298,7 @@ function groupRows(
 }
 
 function joinRows(
-  joinType: "INNER" | "LEFT",
+  joinType: "INNER" | "LEFT" | "RIGHT",
   leftTable: string,
   leftRows: SqlRow[],
   rightTable: string,
@@ -306,6 +306,10 @@ function joinRows(
   leftFieldExpr: string,
   rightFieldExpr: string,
 ): SqlRow[] {
+  if (joinType === "RIGHT") {
+    return joinRows("LEFT", rightTable, rightRows, leftTable, leftRows, rightFieldExpr, leftFieldExpr);
+  }
+
   const leftField = leftFieldExpr.includes(".") ? leftFieldExpr.split(".")[1] : leftFieldExpr;
   const rightField = rightFieldExpr.includes(".") ? rightFieldExpr.split(".")[1] : rightFieldExpr;
 
