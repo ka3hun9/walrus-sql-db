@@ -37,7 +37,12 @@ export interface OnchainQueryRequest {
   offset?: number;
   orderBy?: string;
   orderDirection?: "ASC" | "DESC";
-  aggregate?: "COUNT";
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+  aggregateField?: string;
+  groupBy?: string[];
+  having?: string;
+  explain?: boolean;
 }
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;

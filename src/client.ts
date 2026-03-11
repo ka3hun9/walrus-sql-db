@@ -1,12 +1,41 @@
-﻿import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import type {
   ExecuteResult,
   QueryProofResult,
   QueryResult,
+  SqlPrimitive,
   SqlRow,
   WalrusSqlClientOptions,
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
+
+type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN";
+type LogicOp = "AND" | "OR";
+
+type WhereClause = {
+  logic?: LogicOp;
+  field: string;
+  op: CompareOp;
+  value?: SqlPrimitive;
+  values?: SqlPrimitive[];
+};
+
+type ParsedSelect = {
+  explain: boolean;
+  table: string;
+  fields: string[] | ["*"];
+  where?: string;
+  whereClauses: WhereClause[];
+  limit?: number;
+  offset?: number;
+  orderBy?: string;
+  orderDirection?: "ASC" | "DESC";
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+  aggregateField?: string;
+  groupBy?: string[];
+  having?: string;
+};
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
@@ -128,6 +157,24 @@ export class WalrusSqlClient {
     const normalized = sql.trim().replace(/\s+/g, " ");
     const parsed = this.parseSelect(normalized, sql);
 
+    if (parsed.explain) {
+      return {
+        rows: [
+          {
+            type: "EXPLAIN",
+            table: parsed.table,
+            where: parsed.where ?? null,
+            groupBy: parsed.groupBy?.join(",") ?? null,
+            aggregate: parsed.aggregate ?? null,
+            orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
+            limit: parsed.limit ?? null,
+            offset: parsed.offset ?? null,
+            mode: this.opts.mode ?? "simulator",
+          },
+        ],
+      };
+    }
+
     if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor) {
       return this.opts.onchainQueryExecutor({
         sql,
@@ -138,36 +185,40 @@ export class WalrusSqlClient {
         offset: parsed.offset,
         orderBy: parsed.orderBy,
         orderDirection: parsed.orderDirection,
+        orderByList: parsed.orderByList,
         aggregate: parsed.aggregate,
+        aggregateField: parsed.aggregateField,
+        groupBy: parsed.groupBy,
+        having: parsed.having,
+        explain: parsed.explain,
       });
     }
 
     const bucket = this.requireTable(parsed.table);
-    const filtered = parsed.where ? this.applyWhere(bucket, parsed.where) : bucket;
+    const filtered = parsed.whereClauses.length ? this.applyWhereClauses(bucket, parsed.whereClauses) : bucket;
 
-    if (parsed.aggregate === "COUNT") {
-      return { rows: [{ count: filtered.length }] };
+    if (parsed.groupBy?.length) {
+      const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
+      const havingRows = parsed.having ? this.applyWhereClauses(grouped, this.parseWhere(parsed.having)) : grouped;
+      const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
+      const pagedGrouped = this.applyPage(orderedGrouped, parsed.offset, parsed.limit);
+      return {
+        rows: pagedGrouped.map((row) => this.pickFields(row, parsed.fields)),
+      };
     }
 
-    const ordered = parsed.orderBy
-      ? [...filtered].sort((a, b) => {
-          const av = a[parsed.orderBy!];
-          const bv = b[parsed.orderBy!];
-          const cmp = String(av ?? "").localeCompare(String(bv ?? ""), undefined, { numeric: true });
-          return parsed.orderDirection === "DESC" ? -cmp : cmp;
-        })
-      : filtered;
+    if (parsed.aggregate) {
+      return {
+        rows: [this.computeAggregateRow(filtered, parsed.aggregate, parsed.aggregateField)],
+      };
+    }
 
-    const paged = ordered.slice(parsed.offset ?? 0, (parsed.offset ?? 0) + (parsed.limit ?? ordered.length));
+    const ordered = this.applyOrder(filtered, parsed.orderByList);
+    const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
 
-    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return { rows: paged };
-
-    const rows = paged.map((row) => {
-      const out: SqlRow = {};
-      for (const f of parsed.fields) out[f] = row[f] ?? null;
-      return out;
-    });
-    return { rows };
+    return {
+      rows: paged.map((row) => this.pickFields(row, parsed.fields)),
+    };
   }
 
   async queryOne(sql: string): Promise<SqlRow | null> {
@@ -223,7 +274,9 @@ export class WalrusSqlClient {
   }
 
   private parseUpdate(sql: string): { setField: string; setValue: string; whereField: string; whereValue: string } {
-    const m = sql.match(/UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
+    const m = sql.match(
+      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i,
+    );
     if (!m) throw new Error(`Unsupported UPDATE syntax: ${sql}`);
     return {
       setField: m[1].trim(),
@@ -234,7 +287,9 @@ export class WalrusSqlClient {
   }
 
   private parseDelete(sql: string): { whereField: string; whereValue: string } {
-    const m = sql.match(/DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
+    const m = sql.match(
+      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i,
+    );
     if (!m) throw new Error(`Unsupported DELETE syntax: ${sql}`);
     return {
       whereField: m[1].trim(),
@@ -242,68 +297,277 @@ export class WalrusSqlClient {
     };
   }
 
-  private parseSelect(
-    normalizedSql: string,
-    rawSql: string,
-  ): {
-    table: string;
-    fields: string[] | ["*"];
-    where?: string;
-    limit?: number;
-    offset?: number;
-    orderBy?: string;
-    orderDirection?: "ASC" | "DESC";
-    aggregate?: "COUNT";
-  } {
-    const m = normalizedSql.match(
-      /SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+?))?(?:\s+ORDER BY\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(ASC|DESC))?)?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?$/i,
-    );
+  private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
+    const explain = /^EXPLAIN\s+/i.test(normalizedSql);
+    const base = explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "") : normalizedSql;
+
+    const m = base.match(/^SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(.*)$/i);
     if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
 
     const selectFields = m[1].trim();
     const table = m[2];
-    const where = m[3]?.trim();
-    const orderBy = m[4]?.trim();
-    const orderDirection = (m[5]?.toUpperCase() as "ASC" | "DESC" | undefined) ?? "ASC";
-    const limit = m[6] ? Number(m[6]) : undefined;
-    const offset = m[7] ? Number(m[7]) : undefined;
+    const tail = m[3] ?? "";
 
-    const aggregate = /^COUNT\(\*\)$/i.test(selectFields) ? "COUNT" : undefined;
+    const tm = tail.match(
+      /^(?:\s+WHERE\s+(.+?))?(?:\s+GROUP BY\s+(.+?))?(?:\s+HAVING\s+(.+?))?(?:\s+ORDER BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$/i,
+    );
+    if (!tm) throw new Error(`Unsupported SELECT clauses: ${rawSql}`);
 
-    if (aggregate === "COUNT") {
+    const where = tm[1]?.trim();
+    const groupBy = tm[2]?.split(",").map((x) => x.trim()).filter(Boolean);
+    const having = tm[3]?.trim();
+    const orderByText = tm[4]?.trim();
+    const limit = tm[5] ? Number(tm[5]) : undefined;
+    const offset = tm[6] ? Number(tm[6]) : undefined;
+
+    const orderByList = orderByText
+      ? orderByText
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((part) => {
+            const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(ASC|DESC))?$/i);
+            if (!om) throw new Error(`Unsupported ORDER BY segment: ${part}`);
+            return { field: om[1], direction: (om[2]?.toUpperCase() as "ASC" | "DESC" | undefined) ?? "ASC" };
+          })
+      : undefined;
+
+    const rawFieldList = selectFields.split(",").map((x) => x.trim());
+    const aggregateFieldExpr = rawFieldList.find((f) => /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i.test(f));
+
+    const aggregateMatch = aggregateFieldExpr?.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
+    const aggregate = aggregateMatch?.[1]?.toUpperCase() as ParsedSelect["aggregate"] | undefined;
+    const aggregateField = aggregateMatch?.[2];
+
+    const whereClauses = where ? this.parseWhere(where) : [];
+
+    const normalizedFieldList = rawFieldList.map((f) => {
+      const aliasMatch = f.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+      if (aliasMatch) return aliasMatch[2];
+      const agg = f.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
+      if (agg) return agg[1].toLowerCase();
+      return f;
+    });
+
+    if (aggregate) {
       return {
+        explain,
         table,
-        fields: ["count"],
+        fields: normalizedFieldList as string[],
         where,
+        whereClauses,
         limit,
         offset,
-        orderBy,
-        orderDirection,
+        orderBy: orderByList?.[0]?.field,
+        orderDirection: orderByList?.[0]?.direction,
+        orderByList,
         aggregate,
+        aggregateField,
+        groupBy,
+        having,
       };
     }
 
     if (selectFields === "*") {
-      return { table, fields: ["*"], where, limit, offset, orderBy, orderDirection };
+      return {
+        explain,
+        table,
+        fields: ["*"],
+        where,
+        whereClauses,
+        limit,
+        offset,
+        orderBy: orderByList?.[0]?.field,
+        orderDirection: orderByList?.[0]?.direction,
+        orderByList,
+        groupBy,
+        having,
+      };
     }
 
     return {
+      explain,
       table,
       fields: selectFields.split(",").map((x) => x.trim()),
       where,
+      whereClauses,
       limit,
       offset,
-      orderBy,
-      orderDirection,
+      orderBy: orderByList?.[0]?.field,
+      orderDirection: orderByList?.[0]?.direction,
+      orderByList,
+      groupBy,
+      having,
     };
   }
 
-  private applyWhere(rows: SqlRow[], whereExpr: string): SqlRow[] {
-    const m = whereExpr.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
-    if (!m) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
-    const field = m[1].trim();
-    const value = this.trimQuoted(m[2].trim());
-    return rows.filter((r) => String(r[field]) === value);
+  private parseWhere(whereExpr: string): WhereClause[] {
+    const tokens = whereExpr.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
+    const out: WhereClause[] = [];
+    let pendingLogic: LogicOp | undefined;
+
+    for (const token of tokens) {
+      const upper = token.toUpperCase();
+      if (upper === "AND" || upper === "OR") {
+        pendingLogic = upper;
+        continue;
+      }
+
+      const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+IN\s*\((.+)\)$/i);
+      if (inMatch) {
+        out.push({
+          logic: pendingLogic,
+          field: inMatch[1],
+          op: "IN",
+          values: this.smartSplit(inMatch[2]).map((v) => this.castValue(v)),
+        });
+        pendingLogic = undefined;
+        continue;
+      }
+
+      const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
+      if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
+
+      out.push({
+        logic: pendingLogic,
+        field: cmpMatch[1],
+        op: cmpMatch[2] as CompareOp,
+        value: this.castValue(cmpMatch[3]),
+      });
+      pendingLogic = undefined;
+    }
+
+    return out;
+  }
+
+  private applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {
+    return rows.filter((row) => {
+      let acc: boolean | null = null;
+      for (const c of clauses) {
+        const matched = this.evaluateClause(row, c);
+        if (acc === null) {
+          acc = matched;
+        } else if (c.logic === "OR") {
+          acc = acc || matched;
+        } else {
+          acc = acc && matched;
+        }
+      }
+      return Boolean(acc);
+    });
+  }
+
+  private evaluateClause(row: SqlRow, clause: WhereClause): boolean {
+    const left = row[clause.field];
+
+    if (clause.op === "IN") {
+      return (clause.values ?? []).some((v) => this.eq(left, v));
+    }
+
+    const right = clause.value;
+    switch (clause.op) {
+      case "=":
+        return this.eq(left, right);
+      case "!=":
+        return !this.eq(left, right);
+      case ">":
+        return this.compare(left, right) > 0;
+      case "<":
+        return this.compare(left, right) < 0;
+      case ">=":
+        return this.compare(left, right) >= 0;
+      case "<=":
+        return this.compare(left, right) <= 0;
+      default:
+        return false;
+    }
+  }
+
+  private applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>): SqlRow[] {
+    if (!orderByList?.length) return rows;
+    return [...rows].sort((a, b) => {
+      for (const { field, direction } of orderByList) {
+        const cmp = this.compare(a[field], b[field]);
+        if (cmp !== 0) return direction === "DESC" ? -cmp : cmp;
+      }
+      return 0;
+    });
+  }
+
+  private applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
+    const from = offset ?? 0;
+    const size = limit ?? rows.length;
+    return rows.slice(from, from + size);
+  }
+
+  private groupRows(
+    rows: SqlRow[],
+    groupBy: string[],
+    aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+    aggregateField?: string,
+  ): SqlRow[] {
+    const buckets = new Map<string, SqlRow[]>();
+
+    for (const row of rows) {
+      const key = groupBy.map((g) => String(row[g])).join("||");
+      const bucket = buckets.get(key) ?? [];
+      bucket.push(row);
+      buckets.set(key, bucket);
+    }
+
+    const out: SqlRow[] = [];
+    for (const bucketRows of buckets.values()) {
+      const row: SqlRow = {};
+      for (const g of groupBy) row[g] = bucketRows[0]?.[g] ?? null;
+
+      if (aggregate) {
+        Object.assign(row, this.computeAggregateRow(bucketRows, aggregate, aggregateField));
+      }
+
+      out.push(row);
+    }
+
+    return out;
+  }
+
+  private computeAggregateRow(
+    rows: SqlRow[],
+    aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+    aggregateField?: string,
+  ): SqlRow {
+    if (aggregate === "COUNT") {
+      return { count: rows.length };
+    }
+
+    if (!aggregateField || aggregateField === "*") {
+      throw new Error(`${aggregate} requires a numeric field`);
+    }
+
+    const nums = rows.map((r) => Number(r[aggregateField])).filter((n) => Number.isFinite(n));
+
+    if (aggregate === "SUM") return { sum: nums.reduce((a, b) => a + b, 0) };
+    if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0 };
+    if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
+    return { max: nums.length ? Math.max(...nums) : null };
+  }
+
+  private pickFields(row: SqlRow, fields: string[] | ["*"]): SqlRow {
+    if (fields.length === 1 && fields[0] === "*") return row;
+    const out: SqlRow = {};
+    for (const f of fields) out[f] = row[f] ?? null;
+    return out;
+  }
+
+  private eq(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): boolean {
+    if (a == null && b == null) return true;
+    return String(a) === String(b);
+  }
+
+  private compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): number {
+    const an = Number(a);
+    const bn = Number(b);
+    if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+    return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
   }
 
   private castValue(raw: string): string | number | boolean | null {

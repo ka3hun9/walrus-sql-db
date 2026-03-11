@@ -13,6 +13,7 @@
     "onchain:select": "tsx examples/select.ts",
     "onchain:select-replay": "tsx examples/select-replay.ts",
     "onchain:benchmark-replay": "tsx examples/benchmark-replay.ts",
+    "sql:advanced": "tsx examples/sql-advanced.ts",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
   },

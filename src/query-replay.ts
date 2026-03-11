@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
-import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlRow } from "./types.js";
+import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow } from "./types.js";
 
 type Payload =
   | {
@@ -35,6 +35,16 @@ type Payload =
     };
 
 type Cursor = { txDigest: string; eventSeq: string } | null | undefined;
+type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN";
+type LogicOp = "AND" | "OR";
+
+type WhereClause = {
+  logic?: LogicOp;
+  field: string;
+  op: CompareOp;
+  value?: SqlPrimitive;
+  values?: SqlPrimitive[];
+};
 
 type ReplayCache = {
   cursor: Cursor;
@@ -62,13 +72,194 @@ function trimQuoted(raw: string): string {
   return raw;
 }
 
-function parseWhere(whereExpr: string): Array<{ field: string; value: string }> {
-  const parts = whereExpr.split(/\s+AND\s+/i).map((x) => x.trim());
-  return parts.map((part) => {
-    const m = part.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
-    if (!m) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
-    return { field: m[1].trim(), value: trimQuoted(m[2].trim()) };
+function castValue(raw: string): SqlPrimitive {
+  const v = trimQuoted(raw.trim());
+  if (v.toLowerCase() === "null") return null;
+  if (v.toLowerCase() === "true") return true;
+  if (v.toLowerCase() === "false") return false;
+  if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
+  return v;
+}
+
+function smartSplit(input: string): string[] {
+  const out: string[] = [];
+  let buf = "";
+  let quote = "";
+  for (const ch of input) {
+    if ((ch === "'" || ch === '"') && !quote) {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+    if (ch === quote) {
+      quote = "";
+      buf += ch;
+      continue;
+    }
+    if (ch === "," && !quote) {
+      out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+function parseWhere(whereExpr: string): WhereClause[] {
+  const tokens = whereExpr.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
+  const out: WhereClause[] = [];
+  let pendingLogic: LogicOp | undefined;
+
+  for (const token of tokens) {
+    const upper = token.toUpperCase();
+    if (upper === "AND" || upper === "OR") {
+      pendingLogic = upper;
+      continue;
+    }
+
+    const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+IN\s*\((.+)\)$/i);
+    if (inMatch) {
+      out.push({
+        logic: pendingLogic,
+        field: inMatch[1],
+        op: "IN",
+        values: smartSplit(inMatch[2]).map((v) => castValue(v)),
+      });
+      pendingLogic = undefined;
+      continue;
+    }
+
+    const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
+    if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
+
+    out.push({
+      logic: pendingLogic,
+      field: cmpMatch[1],
+      op: cmpMatch[2] as CompareOp,
+      value: castValue(cmpMatch[3]),
+    });
+    pendingLogic = undefined;
+  }
+
+  return out;
+}
+
+function eq(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): boolean {
+  if (a == null && b == null) return true;
+  return String(a) === String(b);
+}
+
+function compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): number {
+  const an = Number(a);
+  const bn = Number(b);
+  if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+  return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
+}
+
+function evaluateClause(row: SqlRow, clause: WhereClause): boolean {
+  const left = row[clause.field];
+
+  if (clause.op === "IN") {
+    return (clause.values ?? []).some((v) => eq(left, v));
+  }
+
+  const right = clause.value;
+  switch (clause.op) {
+    case "=":
+      return eq(left, right);
+    case "!=":
+      return !eq(left, right);
+    case ">":
+      return compare(left, right) > 0;
+    case "<":
+      return compare(left, right) < 0;
+    case ">=":
+      return compare(left, right) >= 0;
+    case "<=":
+      return compare(left, right) <= 0;
+    default:
+      return false;
+  }
+}
+
+function applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {
+  return rows.filter((row) => {
+    let acc: boolean | null = null;
+    for (const c of clauses) {
+      const matched = evaluateClause(row, c);
+      if (acc === null) {
+        acc = matched;
+      } else if (c.logic === "OR") {
+        acc = acc || matched;
+      } else {
+        acc = acc && matched;
+      }
+    }
+    return Boolean(acc);
   });
+}
+
+function applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>): SqlRow[] {
+  if (!orderByList?.length) return rows;
+  return [...rows].sort((a, b) => {
+    for (const { field, direction } of orderByList) {
+      const cmp = compare(a[field], b[field]);
+      if (cmp !== 0) return direction === "DESC" ? -cmp : cmp;
+    }
+    return 0;
+  });
+}
+
+function applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
+  const from = offset ?? 0;
+  const size = limit ?? rows.length;
+  return rows.slice(from, from + size);
+}
+
+function computeAggregateRow(
+  rows: SqlRow[],
+  aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+  aggregateField?: string,
+): SqlRow {
+  if (aggregate === "COUNT") {
+    return { count: rows.length };
+  }
+
+  if (!aggregateField || aggregateField === "*") {
+    throw new Error(`${aggregate} requires a numeric field`);
+  }
+
+  const nums = rows.map((r) => Number(r[aggregateField])).filter((n) => Number.isFinite(n));
+  if (aggregate === "SUM") return { sum: nums.reduce((a, b) => a + b, 0) };
+  if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0 };
+  if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
+  return { max: nums.length ? Math.max(...nums) : null };
+}
+
+function groupRows(
+  rows: SqlRow[],
+  groupBy: string[],
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+  aggregateField?: string,
+): SqlRow[] {
+  const buckets = new Map<string, SqlRow[]>();
+  for (const row of rows) {
+    const key = groupBy.map((g) => String(row[g])).join("||");
+    const bucket = buckets.get(key) ?? [];
+    bucket.push(row);
+    buckets.set(key, bucket);
+  }
+
+  const out: SqlRow[] = [];
+  for (const bucketRows of buckets.values()) {
+    const row: SqlRow = {};
+    for (const g of groupBy) row[g] = bucketRows[0]?.[g] ?? null;
+    if (aggregate) Object.assign(row, computeAggregateRow(bucketRows, aggregate, aggregateField));
+    out.push(row);
+  }
+  return out;
 }
 
 function pickFields(row: SqlRow, fields: string[] | ["*"]): SqlRow {
@@ -94,7 +285,7 @@ function hashHex(input: string): string {
 }
 
 function verifyPayloadChain(payload: Payload, expectedPreviousHash: string): boolean {
-  if (!payload.currentCommitHash) return true; // v1 compatibility
+  if (!payload.currentCommitHash) return true;
   const previous = payload.previousCommitHash ?? "GENESIS";
   if (previous !== expectedPreviousHash) return false;
 
@@ -168,7 +359,14 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
       const raw = await fs.readFile(options.cacheFilePath, "utf8");
       const data = JSON.parse(raw) as Record<
         string,
-        { cursor: Cursor; rows: SqlRow[]; seenDigests: string[]; initialized: boolean; lastCommitHash: string; invalidPayloads: number }
+        {
+          cursor: Cursor;
+          rows: SqlRow[];
+          seenDigests: string[];
+          initialized: boolean;
+          lastCommitHash: string;
+          invalidPayloads: number;
+        }
       >;
 
       for (const [tableId, cache] of Object.entries(data)) {
@@ -191,7 +389,14 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
 
     const out: Record<
       string,
-      { cursor: Cursor; rows: SqlRow[]; seenDigests: string[]; initialized: boolean; lastCommitHash: string; invalidPayloads: number }
+      {
+        cursor: Cursor;
+        rows: SqlRow[];
+        seenDigests: string[];
+        initialized: boolean;
+        lastCommitHash: string;
+        invalidPayloads: number;
+      }
     > = {};
 
     for (const [tableId, cache] of cacheByTableId.entries()) {
@@ -327,32 +532,53 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
   }
 
   return async (req: OnchainQueryRequest): Promise<QueryResult> => {
+    if (req.explain) {
+      return {
+        rows: [
+          {
+            type: "EXPLAIN",
+            table: req.table,
+            where: req.where ?? null,
+            groupBy: req.groupBy?.join(",") ?? null,
+            aggregate: req.aggregate ?? null,
+            aggregateField: req.aggregateField ?? null,
+            orderBy: req.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
+            limit: req.limit ?? null,
+            offset: req.offset ?? null,
+            keysetHint: "Use WHERE id > '<last_id>' ORDER BY id ASC LIMIT n",
+          },
+        ],
+      };
+    }
+
     const tableId = await resolveTableId(req.table);
     if (!tableId) throw new Error(`Table not found: ${req.table}`);
 
     const replayed = await replayRowsIncremental(tableId);
 
     const clauses = req.where ? parseWhere(req.where) : [];
-    const filtered = clauses.length
-      ? replayed.filter((row) => clauses.every((c) => String(row[c.field]) === c.value))
-      : replayed;
+    const filtered = clauses.length ? applyWhereClauses(replayed, clauses) : replayed;
 
-    if (req.aggregate === "COUNT") {
-      return { rows: [{ count: filtered.length }] };
+    let materialized: SqlRow[];
+    if (req.groupBy?.length) {
+      materialized = groupRows(filtered, req.groupBy, req.aggregate, req.aggregateField);
+      if (req.having) {
+        materialized = applyWhereClauses(materialized, parseWhere(req.having));
+      }
+    } else if (req.aggregate) {
+      materialized = [computeAggregateRow(filtered, req.aggregate, req.aggregateField)];
+    } else {
+      materialized = filtered;
     }
 
-    const ordered = req.orderBy
-      ? [...filtered].sort((a, b) => {
-          const av = a[req.orderBy!];
-          const bv = b[req.orderBy!];
-          const cmp = String(av ?? "").localeCompare(String(bv ?? ""), undefined, { numeric: true });
-          return req.orderDirection === "DESC" ? -cmp : cmp;
-        })
-      : filtered;
+    const ordered = applyOrder(
+      materialized,
+      req.orderByList ?? (req.orderBy ? [{ field: req.orderBy, direction: req.orderDirection ?? "ASC" }] : undefined),
+    );
 
     const offset = req.offset ?? 0;
     const limit = req.limit ?? ordered.length;
-    const paged = ordered.slice(offset, offset + limit);
+    const paged = applyPage(ordered, offset, limit);
 
     return {
       rows: paged.map((row) => pickFields(row, req.fields)),
