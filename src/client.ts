@@ -6,9 +6,8 @@ import type {
   SqlRow,
   WalrusSqlClientOptions,
 } from "./types.js";
+import { buildMoveCall } from "./onchain.js";
 
-// MVP local engine to simulate pure on-chain semantics before Move contract wiring.
-// Next step: replace this with real transaction builders for Sui Move entry functions.
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
@@ -18,6 +17,44 @@ export class WalrusSqlClient {
   }
 
   async execute(sql: string): Promise<ExecuteResult> {
+    if ((this.opts.mode ?? "simulator") === "onchain") {
+      return this.executeOnchain(sql);
+    }
+    return this.executeSimulator(sql);
+  }
+
+  private async executeOnchain(sql: string): Promise<ExecuteResult> {
+    const moveCall = buildMoveCall({
+      packageId: this.opts.packageId,
+      moduleName: this.opts.moduleName,
+      sql,
+    });
+
+    if (!this.opts.onchainExecutor) {
+      return {
+        txDigest: this.fakeDigest(`planned:${sql}`),
+        statementType: moveCall.statementType,
+        moveCall: {
+          target: moveCall.target,
+          arguments: moveCall.arguments,
+          typeArguments: moveCall.typeArguments,
+        },
+      };
+    }
+
+    const res = await this.opts.onchainExecutor(moveCall);
+    return {
+      txDigest: res.digest,
+      statementType: moveCall.statementType,
+      moveCall: {
+        target: moveCall.target,
+        arguments: moveCall.arguments,
+        typeArguments: moveCall.typeArguments,
+      },
+    };
+  }
+
+  private async executeSimulator(sql: string): Promise<ExecuteResult> {
     const normalized = sql.trim().replace(/\s+/g, " ");
     const upper = normalized.toUpperCase();
 

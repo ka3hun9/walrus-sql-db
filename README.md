@@ -2,43 +2,55 @@
 
 Pure on-chain oriented **Walrus SQL SDK starter**.
 
-## What is included
+## Phase-2 delivered
 
-- TypeScript SDK skeleton (`WalrusSqlClient`)
-- SQL subset methods: `CREATE / INSERT / SELECT / UPDATE / DELETE`
-- `queryWithProof()` + `verify()` API shape
-- Runnable CRUD example
-
-> Current implementation is an in-memory MVP simulator for fast iteration.
-> Next step is wiring each method to real Sui Move entry functions + Walrus manifests.
+- Sui Move contract scaffold at `contracts/walrus_sql`
+  - `Catalog`
+  - `TableMeta`
+  - commit events for insert/update/delete
+- SDK on-chain mode (`mode: "onchain"`)
+  - SQL -> Move call planning
+  - optional executor hook for real chain submission
+- Deploy helper script: `scripts/deploy-testnet.ps1`
 
 ## Quick start
 
 ```bash
 npm install
+npm run build
 npm run dev
 ```
 
-## SDK usage
+## Simulator CRUD example
 
-```ts
-import { WalrusSqlClient } from "walrus-sql-db";
-
-const db = new WalrusSqlClient({
-  packageId: "0xYOUR_MOVE_PACKAGE",
-  network: "sui-mainnet",
-  signerAddress: "0xYOUR_SIGNER",
-});
-
-await db.execute(`CREATE TABLE users (id STRING PRIMARY KEY, name STRING)`);
-await db.execute(`INSERT INTO users (id, name) VALUES ('u1', 'MT')`);
-const row = await db.queryOne(`SELECT id, name FROM users WHERE id = 'u1'`);
+```bash
+npm run dev
 ```
+
+## On-chain planning example
+
+```bash
+npm run onchain:plan
+```
+
+This prints the Move call payloads that your wallet/executor should submit.
+
+## Real testnet publish (your wallet)
+
+1. Install Sui CLI
+2. Ensure your wallet has test SUI (you already have it)
+3. Run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/deploy-testnet.ps1
+```
+
+Then set `packageId` in SDK and execute with your own `onchainExecutor` integration.
 
 ## Planned next milestones
 
-1. Move package scaffold (`catalog`, `table_meta`, `commit_log`, `index_root`)
-2. Transaction builders in SDK
-3. Walrus blob manifest serialization
-4. Proof verification spec (hash chain + merkle root)
-5. Gas budget estimator
+1. Wire SDK default executor with `@mysten/sui` signer
+2. Parse publish output and auto-write `.env` package id
+3. Add table object discovery + table-id aware Move calls
+4. Walrus blob manifest serializer
+5. Query proof verification spec (hash-chain + merkle root)

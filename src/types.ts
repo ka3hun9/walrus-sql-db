@@ -6,6 +6,11 @@ export interface ExecuteResult {
   statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "UNKNOWN";
   affectedRows?: number;
   tableObjectId?: string;
+  moveCall?: {
+    target: string;
+    arguments: string[];
+    typeArguments?: string[];
+  };
 }
 
 export interface QueryResult {
@@ -25,4 +30,7 @@ export interface WalrusSqlClientOptions {
   packageId: string;
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
   signerAddress?: string;
+  mode?: "simulator" | "onchain";
+  moduleName?: string;
+  onchainExecutor?: import("./onchain.js").OnchainExecutor;
 }
