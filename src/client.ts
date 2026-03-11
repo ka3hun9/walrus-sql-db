@@ -20,12 +20,17 @@ type WhereClause = {
   values?: SqlPrimitive[];
 };
 
+type WhereExprNode =
+  | { type: "clause"; clause: WhereClause }
+  | { type: "and" | "or"; left: WhereExprNode; right: WhereExprNode };
+
 type ParsedSelect = {
   explain: boolean;
   table: string;
   fields: string[] | ["*"];
   where?: string;
   whereClauses: WhereClause[];
+  whereTree?: WhereExprNode;
   limit?: number;
   offset?: number;
   orderBy?: string;
@@ -219,7 +224,11 @@ export class WalrusSqlClient {
 
     const bucket = this.requireTable(parsed.table);
     const baseRows = parsed.join ? this.applyJoin(parsed.table, bucket, parsed.join) : bucket;
-    const filtered = parsed.whereClauses.length ? this.applyWhereClauses(baseRows, parsed.whereClauses) : baseRows;
+    const filtered = parsed.whereTree
+      ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!))
+      : parsed.whereClauses.length
+        ? this.applyWhereClauses(baseRows, parsed.whereClauses)
+        : baseRows;
 
     if (parsed.groupBy?.length) {
       const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
@@ -394,7 +403,8 @@ export class WalrusSqlClient {
     const aggregate = aggregateMatch?.[1]?.toUpperCase() as ParsedSelect["aggregate"] | undefined;
     const aggregateField = aggregateMatch?.[2];
 
-    const whereClauses = where ? this.parseWhere(where) : [];
+    const whereClauses = where ? this.tryParseWhere(where) : [];
+    const whereTree = where ? this.parseWhereTree(where) : undefined;
 
     const normalizedFieldList = rawFieldList.map((f) => {
       const aliasMatch = f.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
@@ -414,6 +424,7 @@ export class WalrusSqlClient {
         fields: normalizedFieldList as string[],
         where,
         whereClauses,
+        whereTree,
         limit,
         offset,
         orderBy: orderByList?.[0]?.field,
@@ -435,6 +446,7 @@ export class WalrusSqlClient {
         fields: ["*"],
         where,
         whereClauses,
+        whereTree,
         limit,
         offset,
         orderBy: orderByList?.[0]?.field,
@@ -453,6 +465,7 @@ export class WalrusSqlClient {
       fields: normalizedFieldList as string[],
       where,
       whereClauses,
+      whereTree,
       limit,
       offset,
       orderBy: orderByList?.[0]?.field,
@@ -517,6 +530,68 @@ export class WalrusSqlClient {
     return out;
   }
 
+  private parseWhereTree(whereExpr: string): WhereExprNode {
+    const expr = this.trimOuterParentheses(whereExpr.trim());
+
+    const orSplit = this.findTopLevelLogic(expr, "OR");
+    if (orSplit) {
+      return {
+        type: "or",
+        left: this.parseWhereTree(orSplit.left),
+        right: this.parseWhereTree(orSplit.right),
+      };
+    }
+
+    const andSplit = this.findTopLevelLogic(expr, "AND");
+    if (andSplit) {
+      return {
+        type: "and",
+        left: this.parseWhereTree(andSplit.left),
+        right: this.parseWhereTree(andSplit.right),
+      };
+    }
+
+    return { type: "clause", clause: this.parseWhere(expr)[0]! };
+  }
+
+  private trimOuterParentheses(expr: string): string {
+    let out = expr;
+    while (out.startsWith("(") && out.endsWith(")")) {
+      let depth = 0;
+      let valid = true;
+      for (let i = 0; i < out.length; i++) {
+        const ch = out[i];
+        if (ch === "(") depth++;
+        else if (ch === ")") depth--;
+        if (depth === 0 && i < out.length - 1) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) break;
+      out = out.slice(1, -1).trim();
+    }
+    return out;
+  }
+
+  private findTopLevelLogic(expr: string, op: "AND" | "OR"): { left: string; right: string } | null {
+    let depth = 0;
+    const needle = ` ${op} `;
+    for (let i = 0; i <= expr.length - needle.length; i++) {
+      const ch = expr[i];
+      if (ch === "(") depth++;
+      else if (ch === ")") depth = Math.max(0, depth - 1);
+
+      if (depth === 0 && expr.slice(i, i + needle.length).toUpperCase() === needle) {
+        return {
+          left: expr.slice(0, i).trim(),
+          right: expr.slice(i + needle.length).trim(),
+        };
+      }
+    }
+    return null;
+  }
+
   private splitWhereTokens(whereExpr: string): string[] {
     const src = whereExpr.trim();
     const out: string[] = [];
@@ -549,6 +624,14 @@ export class WalrusSqlClient {
 
     flush();
     return out;
+  }
+
+  private tryParseWhere(whereExpr: string): WhereClause[] {
+    try {
+      return this.parseWhere(whereExpr);
+    } catch {
+      return [];
+    }
   }
 
   private parseWhere(whereExpr: string): WhereClause[] {
@@ -624,6 +707,12 @@ export class WalrusSqlClient {
     }
 
     return out;
+  }
+
+  private evaluateWhereTree(row: SqlRow, node: WhereExprNode): boolean {
+    if (node.type === "clause") return this.evaluateClause(row, node.clause);
+    if (node.type === "and") return this.evaluateWhereTree(row, node.left) && this.evaluateWhereTree(row, node.right);
+    return this.evaluateWhereTree(row, node.left) || this.evaluateWhereTree(row, node.right);
   }
 
   private applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {

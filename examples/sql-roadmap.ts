@@ -37,6 +37,15 @@ async function main() {
     ).rows,
   );
 
+  console.log("M1 precedence AST (AND/OR + parentheses) =>");
+  console.log(
+    (
+      await db.query(
+        "SELECT id, status, amount FROM orders WHERE (status = 'paid' OR status = 'shipped') AND amount >= 25 ORDER BY amount DESC",
+      )
+    ).rows,
+  );
+
   console.log("P2 window-like row number =>");
   console.log((await db.query("SELECT id, amount, ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn FROM orders ORDER BY amount DESC")).rows);
 }
