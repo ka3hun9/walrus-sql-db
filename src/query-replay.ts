@@ -35,7 +35,7 @@ type Payload =
     };
 
 type Cursor = { txDigest: string; eventSeq: string } | null | undefined;
-type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN";
+type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "LIKE" | "IS_NULL" | "IS_NOT_NULL";
 type LogicOp = "AND" | "OR";
 
 type WhereClause = {
@@ -108,7 +108,8 @@ function smartSplit(input: string): string[] {
 }
 
 function parseWhere(whereExpr: string): WhereClause[] {
-  const tokens = whereExpr.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
+  const sanitized = whereExpr.replace(/[()]/g, " ");
+  const tokens = sanitized.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
   const out: WhereClause[] = [];
   let pendingLogic: LogicOp | undefined;
 
@@ -116,6 +117,29 @@ function parseWhere(whereExpr: string): WhereClause[] {
     const upper = token.toUpperCase();
     if (upper === "AND" || upper === "OR") {
       pendingLogic = upper;
+      continue;
+    }
+
+    const nullMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+    if (nullMatch) {
+      out.push({
+        logic: pendingLogic,
+        field: nullMatch[1],
+        op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
+      });
+      pendingLogic = undefined;
+      continue;
+    }
+
+    const likeMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+LIKE\s+(.+)$/i);
+    if (likeMatch) {
+      out.push({
+        logic: pendingLogic,
+        field: likeMatch[1],
+        op: "LIKE",
+        value: castValue(likeMatch[2]),
+      });
+      pendingLogic = undefined;
       continue;
     }
 
@@ -179,6 +203,17 @@ function evaluateClause(row: SqlRow, clause: WhereClause): boolean {
       return compare(left, right) >= 0;
     case "<=":
       return compare(left, right) <= 0;
+    case "LIKE": {
+      const pattern = String(right ?? "")
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        .replace(/%/g, ".*")
+        .replace(/_/g, ".");
+      return new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+    }
+    case "IS_NULL":
+      return left === null || left === undefined;
+    case "IS_NOT_NULL":
+      return left !== null && left !== undefined;
     default:
       return false;
   }
@@ -262,7 +297,8 @@ function groupRows(
   return out;
 }
 
-function innerJoinRows(
+function joinRows(
+  joinType: "INNER" | "LEFT",
   leftTable: string,
   leftRows: SqlRow[],
   rightTable: string,
@@ -275,8 +311,10 @@ function innerJoinRows(
 
   const out: SqlRow[] = [];
   for (const l of leftRows) {
+    let matched = false;
     for (const r of rightRows) {
       if (String(l[leftField]) !== String(r[rightField])) continue;
+      matched = true;
       const merged: SqlRow = {};
       for (const [k, v] of Object.entries(l)) {
         merged[k] = v;
@@ -285,6 +323,15 @@ function innerJoinRows(
       for (const [k, v] of Object.entries(r)) {
         merged[`${rightTable}.${k}`] = v;
         if (!(k in merged)) merged[k] = v;
+      }
+      out.push(merged);
+    }
+
+    if (!matched && joinType === "LEFT") {
+      const merged: SqlRow = {};
+      for (const [k, v] of Object.entries(l)) {
+        merged[k] = v;
+        merged[`${leftTable}.${k}`] = v;
       }
       out.push(merged);
     }
@@ -592,7 +639,15 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
       const rightTableId = await resolveTableId(req.join.table);
       if (!rightTableId) throw new Error(`Joined table not found: ${req.join.table}`);
       const rightRows = await replayRowsIncremental(rightTableId);
-      baseRows = innerJoinRows(req.table, leftRows, req.join.table, rightRows, req.join.leftField, req.join.rightField);
+      baseRows = joinRows(
+        req.join.type,
+        req.table,
+        leftRows,
+        req.join.table,
+        rightRows,
+        req.join.leftField,
+        req.join.rightField,
+      );
     }
 
     const clauses = req.where ? parseWhere(req.where) : [];

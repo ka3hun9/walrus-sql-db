@@ -16,6 +16,7 @@
     "sql:advanced": "tsx examples/sql-advanced.ts",
     "sql:join": "tsx examples/sql-join.ts",
     "onchain:join-replay": "tsx examples/onchain-join-replay.ts",
+    "sql:roadmap": "tsx examples/sql-roadmap.ts",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
   },

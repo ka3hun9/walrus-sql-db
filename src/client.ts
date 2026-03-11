@@ -9,7 +9,7 @@ import type {
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
 
-type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN";
+type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "LIKE" | "IS_NULL" | "IS_NOT_NULL";
 type LogicOp = "AND" | "OR";
 
 type WhereClause = {
@@ -36,11 +36,12 @@ type ParsedSelect = {
   groupBy?: string[];
   having?: string;
   join?: {
-    type: "INNER";
+    type: "INNER" | "LEFT";
     table: string;
     leftField: string;
     rightField: string;
   };
+  rowNumberAlias?: string;
 };
 
 export class WalrusSqlClient {
@@ -160,6 +161,20 @@ export class WalrusSqlClient {
   }
 
   async query(sql: string): Promise<QueryResult> {
+    const unionSplit = this.splitUnion(sql);
+    if (unionSplit) {
+      const left = await this.query(unionSplit.left);
+      const right = await this.query(unionSplit.right);
+      if (unionSplit.all) {
+        return { rows: [...left.rows, ...right.rows] };
+      }
+      const dedup = new Map<string, SqlRow>();
+      for (const row of [...left.rows, ...right.rows]) {
+        dedup.set(JSON.stringify(row), row);
+      }
+      return { rows: [...dedup.values()] };
+    }
+
     const normalized = sql.trim().replace(/\s+/g, " ");
     const parsed = this.parseSelect(normalized, sql);
 
@@ -203,7 +218,7 @@ export class WalrusSqlClient {
     }
 
     const bucket = this.requireTable(parsed.table);
-    const baseRows = parsed.join ? this.applyInnerJoin(parsed.table, bucket, parsed.join) : bucket;
+    const baseRows = parsed.join ? this.applyJoin(parsed.table, bucket, parsed.join) : bucket;
     const filtered = parsed.whereClauses.length ? this.applyWhereClauses(baseRows, parsed.whereClauses) : baseRows;
 
     if (parsed.groupBy?.length) {
@@ -223,7 +238,10 @@ export class WalrusSqlClient {
     }
 
     const ordered = this.applyOrder(filtered, parsed.orderByList);
-    const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
+    const withWindow = parsed.rowNumberAlias
+      ? ordered.map((row, idx) => ({ ...row, [parsed.rowNumberAlias!]: idx + 1 }))
+      : ordered;
+    const paged = this.applyPage(withWindow, parsed.offset, parsed.limit);
 
     return {
       rows: paged.map((row) => this.pickFields(row, parsed.fields)),
@@ -250,6 +268,16 @@ export class WalrusSqlClient {
 
   async verify(result: QueryProofResult): Promise<boolean> {
     return Boolean(result.proof.manifestHash && result.proof.indexRoot && result.proof.txDigest);
+  }
+
+  private splitUnion(sql: string): { left: string; right: string; all: boolean } | null {
+    const mAll = sql.match(/^(.*)\s+UNION\s+ALL\s+(.*)$/i);
+    if (mAll) return { left: mAll[1].trim(), right: mAll[2].trim(), all: true };
+
+    const m = sql.match(/^(.*)\s+UNION\s+(.*)$/i);
+    if (m) return { left: m[1].trim(), right: m[2].trim(), all: false };
+
+    return null;
   }
 
   private fakeDigest(input: string): string {
@@ -310,7 +338,7 @@ export class WalrusSqlClient {
     const explain = /^EXPLAIN\s+/i.test(normalizedSql);
     const base = explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "") : normalizedSql;
 
-    const m = base.match(/^SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(.*)$/i);
+    const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
     if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
 
     const selectFields = m[1].trim();
@@ -319,16 +347,16 @@ export class WalrusSqlClient {
     let join: ParsedSelect["join"];
 
     const joinMatch = tail.match(
-      /^\s+INNER\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+      /^\s+(INNER|LEFT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
     );
     if (joinMatch) {
       join = {
-        type: "INNER",
-        table: joinMatch[1],
-        leftField: joinMatch[2],
-        rightField: joinMatch[3],
+        type: joinMatch[1].toUpperCase() as "INNER" | "LEFT",
+        table: joinMatch[2],
+        leftField: joinMatch[3],
+        rightField: joinMatch[4],
       };
-      tail = joinMatch[4] ?? "";
+      tail = joinMatch[5] ?? "";
     }
 
     const tm = tail.match(
@@ -357,6 +385,9 @@ export class WalrusSqlClient {
       : undefined;
 
     const rawFieldList = selectFields.split(",").map((x) => x.trim());
+    const rowNumberExpr = rawFieldList.find((f) => /^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f));
+    const rowNumberAlias = rowNumberExpr?.match(/\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i)?.[1] ?? "row_number";
+
     const aggregateFieldExpr = rawFieldList.find((f) => /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i.test(f));
 
     const aggregateMatch = aggregateFieldExpr?.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
@@ -367,6 +398,9 @@ export class WalrusSqlClient {
 
     const normalizedFieldList = rawFieldList.map((f) => {
       const aliasMatch = f.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+      if (/^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f)) {
+        return rowNumberAlias;
+      }
       if (aliasMatch) return aliasMatch[2];
       const agg = f.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
       if (agg) return agg[1].toLowerCase();
@@ -390,6 +424,7 @@ export class WalrusSqlClient {
         groupBy,
         having,
         join,
+        rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
       };
     }
 
@@ -408,13 +443,14 @@ export class WalrusSqlClient {
         groupBy,
         having,
         join,
+        rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
       };
     }
 
     return {
       explain,
       table,
-      fields: selectFields.split(",").map((x) => x.trim()),
+      fields: normalizedFieldList as string[],
       where,
       whereClauses,
       limit,
@@ -425,10 +461,11 @@ export class WalrusSqlClient {
       groupBy,
       having,
       join,
+      rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
     };
   }
 
-  private applyInnerJoin(
+  private applyJoin(
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
@@ -439,8 +476,10 @@ export class WalrusSqlClient {
 
     const out: SqlRow[] = [];
     for (const l of leftRows) {
+      let matched = false;
       for (const r of rightRows) {
         if (String(l[leftField]) !== String(r[rightField])) continue;
+        matched = true;
         const merged: SqlRow = {};
 
         for (const [k, v] of Object.entries(l)) {
@@ -454,12 +493,56 @@ export class WalrusSqlClient {
 
         out.push(merged);
       }
+
+      if (!matched && join.type === "LEFT") {
+        const merged: SqlRow = {};
+        for (const [k, v] of Object.entries(l)) {
+          merged[k] = v;
+          merged[`${leftTable}.${k}`] = v;
+        }
+        merged[`__left_only__`] = true;
+        out.push(merged);
+      }
     }
     return out;
   }
 
+  private splitWhereTokens(whereExpr: string): string[] {
+    const src = whereExpr.trim();
+    const out: string[] = [];
+    let buf = "";
+    let depth = 0;
+
+    const flush = () => {
+      const t = buf.trim();
+      if (t) out.push(t);
+      buf = "";
+    };
+
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === "(") depth++;
+      if (ch === ")") depth = Math.max(0, depth - 1);
+
+      if (depth === 0) {
+        const rest = src.slice(i).toUpperCase();
+        if (rest.startsWith(" AND ") || rest.startsWith(" OR ")) {
+          flush();
+          out.push(rest.startsWith(" AND ") ? "AND" : "OR");
+          i += rest.startsWith(" AND ") ? 4 : 3;
+          continue;
+        }
+      }
+
+      buf += ch;
+    }
+
+    flush();
+    return out;
+  }
+
   private parseWhere(whereExpr: string): WhereClause[] {
-    const tokens = whereExpr.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
+    const tokens = this.splitWhereTokens(whereExpr);
     const out: WhereClause[] = [];
     let pendingLogic: LogicOp | undefined;
 
@@ -467,6 +550,42 @@ export class WalrusSqlClient {
       const upper = token.toUpperCase();
       if (upper === "AND" || upper === "OR") {
         pendingLogic = upper;
+        continue;
+      }
+
+      const nullMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+      if (nullMatch) {
+        out.push({
+          logic: pendingLogic,
+          field: nullMatch[1],
+          op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
+        });
+        pendingLogic = undefined;
+        continue;
+      }
+
+      const likeMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+LIKE\s+(.+)$/i);
+      if (likeMatch) {
+        out.push({
+          logic: pendingLogic,
+          field: likeMatch[1],
+          op: "LIKE",
+          value: this.castValue(likeMatch[2]),
+        });
+        pendingLogic = undefined;
+        continue;
+      }
+
+      const inSubqueryMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IN\s*\(\s*SELECT\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/i);
+      if (inSubqueryMatch) {
+        const subRows = this.requireTable(inSubqueryMatch[3]);
+        out.push({
+          logic: pendingLogic,
+          field: inSubqueryMatch[1],
+          op: "IN",
+          values: subRows.map((r) => r[inSubqueryMatch[2]] ?? null),
+        });
+        pendingLogic = undefined;
         continue;
       }
 
@@ -535,6 +654,17 @@ export class WalrusSqlClient {
         return this.compare(left, right) >= 0;
       case "<=":
         return this.compare(left, right) <= 0;
+      case "LIKE": {
+        const pattern = String(right ?? "")
+          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          .replace(/%/g, ".*")
+          .replace(/_/g, ".");
+        return new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+      }
+      case "IS_NULL":
+        return left === null || left === undefined;
+      case "IS_NOT_NULL":
+        return left !== null && left !== undefined;
       default:
         return false;
     }
