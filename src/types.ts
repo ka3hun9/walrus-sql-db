@@ -28,6 +28,15 @@ export interface QueryProofResult extends QueryResult {
   };
 }
 
+export interface OnchainQueryRequest {
+  sql: string;
+  table: string;
+  fields: string[] | ["*"];
+  where?: string;
+}
+
+export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;
+
 export interface WalrusSqlClientOptions {
   packageId: string;
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
@@ -35,4 +44,5 @@ export interface WalrusSqlClientOptions {
   mode?: "simulator" | "onchain";
   moduleName?: string;
   onchainExecutor?: import("./onchain.js").OnchainExecutor;
+  onchainQueryExecutor?: OnchainQueryExecutor;
 }

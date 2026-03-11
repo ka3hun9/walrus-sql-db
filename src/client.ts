@@ -126,22 +126,25 @@ export class WalrusSqlClient {
 
   async query(sql: string): Promise<QueryResult> {
     const normalized = sql.trim().replace(/\s+/g, " ");
-    const m = normalized.match(/SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?/i);
-    if (!m) throw new Error(`Unsupported SELECT: ${sql}`);
+    const parsed = this.parseSelect(normalized, sql);
 
-    const selectFields = m[1].trim();
-    const table = m[2];
-    const where = m[3];
+    if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor) {
+      return this.opts.onchainQueryExecutor({
+        sql,
+        table: parsed.table,
+        fields: parsed.fields,
+        where: parsed.where,
+      });
+    }
 
-    const bucket = this.requireTable(table);
-    const filtered = where ? this.applyWhere(bucket, where) : bucket;
+    const bucket = this.requireTable(parsed.table);
+    const filtered = parsed.where ? this.applyWhere(bucket, parsed.where) : bucket;
 
-    if (selectFields === "*") return { rows: filtered };
+    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return { rows: filtered };
 
-    const fields = selectFields.split(",").map((x) => x.trim());
     const rows = filtered.map((row) => {
       const out: SqlRow = {};
-      for (const f of fields) out[f] = row[f] ?? null;
+      for (const f of parsed.fields) out[f] = row[f] ?? null;
       return out;
     });
     return { rows };
@@ -216,6 +219,25 @@ export class WalrusSqlClient {
     return {
       whereField: m[1].trim(),
       whereValue: this.trimQuoted(m[2].trim()),
+    };
+  }
+
+  private parseSelect(normalizedSql: string, rawSql: string): { table: string; fields: string[] | ["*"]; where?: string } {
+    const m = normalizedSql.match(/SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?/i);
+    if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
+
+    const selectFields = m[1].trim();
+    const table = m[2];
+    const where = m[3]?.trim();
+
+    if (selectFields === "*") {
+      return { table, fields: ["*"], where };
+    }
+
+    return {
+      table,
+      fields: selectFields.split(",").map((x) => x.trim()),
+      where,
     };
   }
 

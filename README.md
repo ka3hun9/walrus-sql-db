@@ -13,6 +13,14 @@ Pure on-chain oriented **Walrus SQL SDK starter**.
 npm install
 ```
 
+## RPC endpoints (for quick failover)
+
+If one endpoint times out, switch `SUI_RPC_URL` immediately.
+
+- `https://fullnode.testnet.sui.io:443`
+- `https://rpc-testnet.suiscan.xyz:443` ✅ (validated in this project)
+- `https://testnet.suiet.app:443`
+
 ## 1) Simulator demo
 
 ```bash
@@ -25,7 +33,7 @@ npm run dev
 npm run onchain:plan
 ```
 
-## 3) Real on-chain CRUD smoke test
+## 3) Real on-chain CRUD smoke test (Phase-3)
 
 1. Create `.env`:
 
@@ -38,10 +46,9 @@ copy .env.example .env
 ```env
 SUI_PRIVATE_KEY=suiprivkey1...
 SUI_NETWORK=testnet
-SUI_RPC_URL=https://fullnode.testnet.sui.io:443
-# If timeout, switch to another public RPC endpoint in your region
+SUI_RPC_URL=https://rpc-testnet.suiscan.xyz:443
 WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
-WALRUS_SQL_CATALOG_ID=<Catalog object id from publish-output.txt>
+WALRUS_SQL_CATALOG_ID=<Catalog object id>
 ```
 
 3. Run full CREATE/INSERT/UPDATE/DELETE on-chain test:
@@ -52,20 +59,44 @@ npm run onchain:exec
 npm run onchain:smoke
 ```
 
-What phase-3 now does:
-- uses your existing `Catalog` object for `create_table(catalog, name, schema)`
-- captures created `TableMeta` object id from transaction result
+What Phase-3 does:
+- uses existing `Catalog` for `create_table(catalog, name, schema)`
+- captures created `TableMeta` object id
 - maps table name -> object id in-process
 - sends real insert/update/delete tx with object args
-- checks tx success status (not just digest)
+- checks tx success status
 
-## Where to find WALRUS_SQL_CATALOG_ID
+## 4) SELECT query layer (Phase-4 MVP)
 
-In `publish-output.txt`, search for object type ending with:
+This phase adds on-chain read support through `onchainQueryExecutor`.
+Current MVP reads `TableMeta` object fields and supports:
+- `SELECT * FROM <table>`
+- `SELECT id, name, schema, commit_count FROM <table> WHERE id = '...'`
 
-`::walrus_sql::Catalog`
+Set in `.env`:
 
-Use that object id as `WALRUS_SQL_CATALOG_ID`.
+```env
+WALRUS_SQL_TABLE_NAME=orders
+WALRUS_SQL_TABLE_ID=<TableMeta object id>
+```
+
+Run:
+
+```bash
+npm run onchain:select
+```
+
+## Where to find IDs
+
+### `WALRUS_SQL_CATALOG_ID`
+Use `sui client objects --address <your address>` and find object type:
+
+`<PACKAGE_ID>::walrus_sql::Catalog`
+
+### `WALRUS_SQL_TABLE_ID`
+Take it from CREATE output (`tableId: ...`) or find object type:
+
+`<PACKAGE_ID>::walrus_sql::TableMeta`
 
 ## Publish again (if contract changed)
 
