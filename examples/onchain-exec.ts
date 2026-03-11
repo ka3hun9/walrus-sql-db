@@ -11,6 +11,7 @@ const PACKAGE_ID =
 
 const NETWORK = process.env.SUI_NETWORK ?? "testnet";
 const SUI_PRIVATE_KEY = process.env.SUI_PRIVATE_KEY;
+const CATALOG_OBJECT_ID = process.env.WALRUS_SQL_CATALOG_ID;
 
 if (!SUI_PRIVATE_KEY) {
   throw new Error("Missing SUI_PRIVATE_KEY in environment.");
@@ -29,9 +30,20 @@ async function executeMove(req: MoveCallRequest): Promise<{ digest: string; crea
   tx.setGasBudget(100_000_000);
 
   if (req.statementType === "CREATE") {
+    if (!CATALOG_OBJECT_ID) {
+      throw new Error(
+        "Missing WALRUS_SQL_CATALOG_ID. Your deployed package expects create_table(catalog, name, schema). " +
+          "Find Catalog object id from publish-output.txt and set it in .env.",
+      );
+    }
+
     tx.moveCall({
       target: req.target,
-      arguments: [tx.pure.string(req.arguments[0]), tx.pure.string(req.arguments[1])],
+      arguments: [
+        tx.object(CATALOG_OBJECT_ID),
+        tx.pure.string(req.arguments[0]),
+        tx.pure.string(req.arguments[1]),
+      ],
       typeArguments: req.typeArguments ?? [],
     });
   } else {
