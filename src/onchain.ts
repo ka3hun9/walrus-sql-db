@@ -1,10 +1,11 @@
-﻿import { createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 
 export type OnchainStatementType = "CREATE" | "INSERT" | "UPDATE" | "DELETE";
 
 export interface MoveCallRequest {
   target: string;
   arguments: string[];
+  tableName?: string;
   typeArguments?: string[];
   gasBudget?: number;
   statementType: OnchainStatementType;
@@ -13,6 +14,7 @@ export interface MoveCallRequest {
 export interface OnchainExecutionResult {
   digest: string;
   raw?: unknown;
+  createdTableId?: string;
 }
 
 export type OnchainExecutor = (req: MoveCallRequest) => Promise<OnchainExecutionResult>;
@@ -34,10 +36,12 @@ export function buildMoveCall(params: {
     return {
       target: `${params.packageId}::${moduleName}::create_table`,
       arguments: [table, schema],
+      tableName: table,
       statementType: "CREATE",
     };
   }
 
+  const table = extractTableName(sql);
   const fakeRowHash = hashHex(`row:${sql}`);
   const fakeManifest = hashHex(`manifest:${sql}`);
   const fakeIndex = hashHex(`index:${sql}`);
@@ -46,6 +50,7 @@ export function buildMoveCall(params: {
     return {
       target: `${params.packageId}::${moduleName}::insert`,
       arguments: [fakeRowHash, fakeManifest, fakeIndex],
+      tableName: table,
       statementType: "INSERT",
     };
   }
@@ -54,6 +59,7 @@ export function buildMoveCall(params: {
     return {
       target: `${params.packageId}::${moduleName}::update`,
       arguments: [fakeRowHash, fakeManifest, fakeIndex],
+      tableName: table,
       statementType: "UPDATE",
     };
   }
@@ -62,6 +68,7 @@ export function buildMoveCall(params: {
     return {
       target: `${params.packageId}::${moduleName}::delete`,
       arguments: [fakeRowHash, fakeManifest, fakeIndex],
+      tableName: table,
       statementType: "DELETE",
     };
   }
@@ -71,4 +78,28 @@ export function buildMoveCall(params: {
 
 function hashHex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+function extractTableName(sql: string): string {
+  const upper = sql.toUpperCase();
+
+  if (upper.startsWith("INSERT INTO")) {
+    const m = sql.match(/INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+    if (!m) throw new Error(`Unsupported INSERT syntax: ${sql}`);
+    return m[1];
+  }
+
+  if (upper.startsWith("UPDATE")) {
+    const m = sql.match(/UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+    if (!m) throw new Error(`Unsupported UPDATE syntax: ${sql}`);
+    return m[1];
+  }
+
+  if (upper.startsWith("DELETE FROM")) {
+    const m = sql.match(/DELETE FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+    if (!m) throw new Error(`Unsupported DELETE syntax: ${sql}`);
+    return m[1];
+  }
+
+  throw new Error(`Unable to extract table name from SQL: ${sql}`);
 }

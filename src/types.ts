@@ -1,4 +1,4 @@
-﻿export type SqlPrimitive = string | number | boolean | null;
+export type SqlPrimitive = string | number | boolean | null;
 export type SqlRow = Record<string, SqlPrimitive>;
 
 export interface ExecuteResult {
@@ -6,10 +6,12 @@ export interface ExecuteResult {
   statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "UNKNOWN";
   affectedRows?: number;
   tableObjectId?: string;
+  raw?: unknown;
   moveCall?: {
     target: string;
     arguments: string[];
     typeArguments?: string[];
+    tableName?: string;
   };
 }
 

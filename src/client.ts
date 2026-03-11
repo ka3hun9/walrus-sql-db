@@ -38,6 +38,7 @@ export class WalrusSqlClient {
           target: moveCall.target,
           arguments: moveCall.arguments,
           typeArguments: moveCall.typeArguments,
+          tableName: moveCall.tableName,
         },
       };
     }
@@ -45,11 +46,14 @@ export class WalrusSqlClient {
     const res = await this.opts.onchainExecutor(moveCall);
     return {
       txDigest: res.digest,
+      raw: res.raw,
+      tableObjectId: res.createdTableId,
       statementType: moveCall.statementType,
       moveCall: {
         target: moveCall.target,
         arguments: moveCall.arguments,
         typeArguments: moveCall.typeArguments,
+        tableName: moveCall.tableName,
       },
     };
   }

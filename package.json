@@ -1,6 +1,6 @@
 {
   "name": "walrus-sql-db",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Pure on-chain oriented Walrus SQL SDK starter",
   "type": "module",
   "main": "dist/index.js",
@@ -10,6 +10,7 @@
     "dev": "tsx examples/crud.ts",
     "onchain:plan": "tsx examples/onchain-plan.ts",
     "onchain:exec": "tsx examples/onchain-exec.ts",
+    "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
   },
   "keywords": [

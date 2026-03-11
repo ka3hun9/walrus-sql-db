@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import { getFullnodeUrl, SuiClient } from "@mysten/sui/client";
 import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
@@ -18,28 +18,127 @@ if (!SUI_PRIVATE_KEY) {
 
 const { secretKey } = decodeSuiPrivateKey(SUI_PRIVATE_KEY);
 const signer = Ed25519Keypair.fromSecretKey(secretKey);
+const signerAddress = signer.toSuiAddress();
 const client = new SuiClient({
   url: NETWORK === "mainnet" ? getFullnodeUrl("mainnet") : getFullnodeUrl("testnet"),
 });
 
-async function executeMove(req: MoveCallRequest): Promise<{ digest: string }> {
+const tableByName = new Map<string, string>();
+let catalogObjectId: string | null = null;
+
+async function findOwnedObjectId(typeSuffix: string): Promise<string | null> {
+  const res = await client.getOwnedObjects({
+    owner: signerAddress,
+    filter: {
+      StructType: `${PACKAGE_ID}::walrus_sql::${typeSuffix}`,
+    },
+    options: { showType: true },
+    limit: 50,
+  });
+
+  return res.data[0]?.data?.objectId ?? null;
+}
+
+async function ensureCatalog(): Promise<string> {
+  if (catalogObjectId) return catalogObjectId;
+
+  const existing = await findOwnedObjectId("Catalog");
+  if (existing) {
+    catalogObjectId = existing;
+    return existing;
+  }
+
   const tx = new Transaction();
   tx.setGasBudget(100_000_000);
-
-  // NOTE: This MVP sends pure-string args; next step will resolve object IDs (Catalog/TableMeta) automatically.
   tx.moveCall({
-    target: req.target,
-    arguments: req.arguments.map((a) => tx.pure.string(a)),
-    typeArguments: req.typeArguments ?? [],
+    target: `${PACKAGE_ID}::walrus_sql::init`,
+    arguments: [],
+    typeArguments: [],
   });
 
   const result = await client.signAndExecuteTransaction({
     signer,
     transaction: tx,
-    options: { showEffects: true, showEvents: true },
+    options: { showEffects: true, showObjectChanges: true, showEvents: true },
   });
 
-  return { digest: result.digest };
+  const status = result.effects?.status?.status;
+  if (status !== "success") {
+    throw new Error(`init failed: ${JSON.stringify(result.effects?.status)}`);
+  }
+
+  const createdCatalog = result.objectChanges?.find(
+    (c) => c.type === "created" && c.objectType.endsWith("::walrus_sql::Catalog"),
+  );
+
+  if (!createdCatalog || createdCatalog.type !== "created") {
+    throw new Error(`init succeeded but Catalog object not found in changes.`);
+  }
+
+  catalogObjectId = createdCatalog.objectId;
+  return catalogObjectId;
+}
+
+async function executeMove(req: MoveCallRequest): Promise<{ digest: string; createdTableId?: string; raw?: unknown }> {
+  const tx = new Transaction();
+  tx.setGasBudget(100_000_000);
+
+  if (req.statementType === "CREATE") {
+    const catalogId = await ensureCatalog();
+    tx.moveCall({
+      target: req.target,
+      arguments: [tx.object(catalogId), tx.pure.string(req.arguments[0]), tx.pure.string(req.arguments[1])],
+      typeArguments: req.typeArguments ?? [],
+    });
+  } else {
+    const tableName = req.tableName;
+    if (!tableName) {
+      throw new Error(`Missing tableName for ${req.statementType}`);
+    }
+    const tableId = tableByName.get(tableName);
+    if (!tableId) {
+      throw new Error(`Missing table object for '${tableName}'. Run CREATE TABLE in this session first.`);
+    }
+
+    tx.moveCall({
+      target: req.target,
+      arguments: [
+        tx.object(tableId),
+        tx.pure.string(req.arguments[0]),
+        tx.pure.string(req.arguments[1]),
+        tx.pure.string(req.arguments[2]),
+      ],
+      typeArguments: req.typeArguments ?? [],
+    });
+  }
+
+  const result = await client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true, showObjectChanges: true, showEvents: true },
+  });
+
+  const status = result.effects?.status?.status;
+  if (status !== "success") {
+    throw new Error(`tx failed(${req.statementType}): ${JSON.stringify(result.effects?.status)}`);
+  }
+
+  let createdTableId: string | undefined;
+  if (req.statementType === "CREATE") {
+    const createdTable = result.objectChanges?.find(
+      (c) => c.type === "created" && c.objectType.endsWith("::walrus_sql::TableMeta"),
+    );
+    if (createdTable && createdTable.type === "created") {
+      createdTableId = createdTable.objectId;
+      if (req.tableName) tableByName.set(req.tableName, createdTableId);
+    }
+  }
+
+  return {
+    digest: result.digest,
+    createdTableId,
+    raw: result,
+  };
 }
 
 async function main() {
@@ -50,14 +149,25 @@ async function main() {
     onchainExecutor: executeMove,
   });
 
-  // Planning + real send demo
-  const createRes = await db.execute(`CREATE TABLE orders (id STRING PRIMARY KEY, status STRING, amount U64)`);
-  console.log("CREATE tx:", createRes.txDigest, createRes.moveCall);
+  const tableName = `orders_${Date.now()}`;
 
-  // insert/update/delete require passing real TableMeta object in next phase.
-  // For now we keep using plan output to verify SQL->Move mapping.
-  const insertPlan = await db.execute(`INSERT INTO orders (id, status, amount) VALUES ('ord_1', 'paid', 99)`);
-  console.log("INSERT plan tx:", insertPlan.txDigest, insertPlan.moveCall);
+  const createRes = await db.execute(
+    `CREATE TABLE ${tableName} (id STRING PRIMARY KEY, status STRING, amount U64)`,
+  );
+  console.log("CREATE tx:", createRes.txDigest, "tableId:", createRes.tableObjectId);
+
+  const insertRes = await db.execute(
+    `INSERT INTO ${tableName} (id, status, amount) VALUES ('ord_1', 'paid', 99)`,
+  );
+  console.log("INSERT tx:", insertRes.txDigest);
+
+  const updateRes = await db.execute(`UPDATE ${tableName} SET status = 'shipped' WHERE id = 'ord_1'`);
+  console.log("UPDATE tx:", updateRes.txDigest);
+
+  const deleteRes = await db.execute(`DELETE FROM ${tableName} WHERE id = 'ord_1'`);
+  console.log("DELETE tx:", deleteRes.txDigest);
+
+  console.log("CRUD on-chain smoke test completed ✅");
 }
 
 main().catch((e) => {
