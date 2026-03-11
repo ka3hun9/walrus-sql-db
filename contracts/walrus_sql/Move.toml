@@ -2,6 +2,7 @@
 name = "walrus_sql"
 version = "0.0.1"
 published-at = "0x0"
+edition = "legacy"
 
 [addresses]
 walrus_sql = "0x0"

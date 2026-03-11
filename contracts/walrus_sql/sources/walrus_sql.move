@@ -1,16 +1,17 @@
 module walrus_sql::walrus_sql {
+    use std::string;
     use std::string::String;
     use sui::event;
     use sui::object::{Self, ID, UID};
-    use sui::tx_context::{Self, TxContext};
     use sui::transfer;
+    use sui::tx_context::{Self, TxContext};
 
-    public struct Catalog has key {
+    struct Catalog has key {
         id: UID,
         owner: address,
     }
 
-    public struct TableMeta has key {
+    struct TableMeta has key {
         id: UID,
         name: String,
         schema: String,
@@ -19,20 +20,17 @@ module walrus_sql::walrus_sql {
         latest_index_root: String,
     }
 
-    public struct TableCreated has copy, drop {
+    struct TableCreated has copy, drop {
         table_id: ID,
     }
 
-    public struct CommitWritten has copy, drop {
+    struct CommitWritten has copy, drop {
         table_id: ID,
         op: u8, // 1=insert,2=update,3=delete
         commit_no: u64,
-        manifest_hash: String,
-        index_root: String,
-        row_blob_hash: String,
     }
 
-    entry fun init(ctx: &mut TxContext) {
+    fun init(ctx: &mut TxContext) {
         let catalog = Catalog {
             id: object::new(ctx),
             owner: tx_context::sender(ctx),
@@ -40,7 +38,7 @@ module walrus_sql::walrus_sql {
         transfer::share_object(catalog);
     }
 
-    entry fun create_table(
+    public entry fun create_table(
         _catalog: &mut Catalog,
         name: String,
         schema: String,
@@ -51,22 +49,18 @@ module walrus_sql::walrus_sql {
             name,
             schema,
             commit_count: 0,
-            latest_manifest_hash: b"".to_string(),
-            latest_index_root: b"".to_string(),
+            latest_manifest_hash: string::utf8(b""),
+            latest_index_root: string::utf8(b""),
         };
 
         let table_id = object::id(&table);
-
-        event::emit(TableCreated {
-            table_id,
-        });
-
+        event::emit(TableCreated { table_id });
         transfer::share_object(table);
     }
 
-    entry fun insert(
+    public entry fun insert(
         table: &mut TableMeta,
-        row_blob_hash: String,
+        _row_blob_hash: String,
         manifest_hash: String,
         index_root: String,
     ) {
@@ -78,15 +72,12 @@ module walrus_sql::walrus_sql {
             table_id: object::id(table),
             op: 1,
             commit_no: table.commit_count,
-            manifest_hash: table.latest_manifest_hash,
-            index_root: table.latest_index_root,
-            row_blob_hash,
         });
     }
 
-    entry fun update(
+    public entry fun update(
         table: &mut TableMeta,
-        row_blob_hash: String,
+        _row_blob_hash: String,
         manifest_hash: String,
         index_root: String,
     ) {
@@ -98,15 +89,12 @@ module walrus_sql::walrus_sql {
             table_id: object::id(table),
             op: 2,
             commit_no: table.commit_count,
-            manifest_hash: table.latest_manifest_hash,
-            index_root: table.latest_index_root,
-            row_blob_hash,
         });
     }
 
-    entry fun delete(
+    public entry fun delete(
         table: &mut TableMeta,
-        row_blob_hash: String,
+        _row_blob_hash: String,
         manifest_hash: String,
         index_root: String,
     ) {
@@ -118,9 +106,6 @@ module walrus_sql::walrus_sql {
             table_id: object::id(table),
             op: 3,
             commit_no: table.commit_count,
-            manifest_hash: table.latest_manifest_hash,
-            index_root: table.latest_index_root,
-            row_blob_hash,
         });
     }
 }
