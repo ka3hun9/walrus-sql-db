@@ -19,6 +19,8 @@ export interface OnchainExecutionResult {
 
 export type OnchainExecutor = (req: MoveCallRequest) => Promise<OnchainExecutionResult>;
 
+const lastCommitHashByTable = new Map<string, string>();
+
 export function buildMoveCall(params: {
   packageId: string;
   moduleName?: string;
@@ -45,7 +47,19 @@ export function buildMoveCall(params: {
 
   if (upper.startsWith("INSERT INTO")) {
     const row = parseInsert(sql);
-    const payload = JSON.stringify({ v: 1, op: "INSERT", table, row });
+    const previousCommitHash = lastCommitHashByTable.get(table) ?? "GENESIS";
+    const payloadBase = {
+      v: 2,
+      op: "INSERT",
+      table,
+      row,
+      previousCommitHash,
+      ts: Date.now(),
+    };
+    const currentCommitHash = hashHex(JSON.stringify(payloadBase));
+    const payload = JSON.stringify({ ...payloadBase, currentCommitHash });
+    lastCommitHashByTable.set(table, currentCommitHash);
+
     return {
       target: `${params.packageId}::${moduleName}::insert`,
       arguments: [hashHex(`row:${payload}`), payload, hashHex(`index:${table}:${row.id ?? ""}`)],
@@ -56,13 +70,20 @@ export function buildMoveCall(params: {
 
   if (upper.startsWith("UPDATE")) {
     const { setField, setValue, whereField, whereValue } = parseUpdate(sql);
-    const payload = JSON.stringify({
-      v: 1,
+    const previousCommitHash = lastCommitHashByTable.get(table) ?? "GENESIS";
+    const payloadBase = {
+      v: 2,
       op: "UPDATE",
       table,
       set: { [setField]: setValue },
       where: { field: whereField, value: whereValue },
-    });
+      previousCommitHash,
+      ts: Date.now(),
+    };
+    const currentCommitHash = hashHex(JSON.stringify(payloadBase));
+    const payload = JSON.stringify({ ...payloadBase, currentCommitHash });
+    lastCommitHashByTable.set(table, currentCommitHash);
+
     return {
       target: `${params.packageId}::${moduleName}::update`,
       arguments: [hashHex(`row:${payload}`), payload, hashHex(`index:${table}:${whereField}:${whereValue}`)],
@@ -73,12 +94,19 @@ export function buildMoveCall(params: {
 
   if (upper.startsWith("DELETE FROM")) {
     const { whereField, whereValue } = parseDelete(sql);
-    const payload = JSON.stringify({
-      v: 1,
+    const previousCommitHash = lastCommitHashByTable.get(table) ?? "GENESIS";
+    const payloadBase = {
+      v: 2,
       op: "DELETE",
       table,
       where: { field: whereField, value: whereValue },
-    });
+      previousCommitHash,
+      ts: Date.now(),
+    };
+    const currentCommitHash = hashHex(JSON.stringify(payloadBase));
+    const payload = JSON.stringify({ ...payloadBase, currentCommitHash });
+    lastCommitHashByTable.set(table, currentCommitHash);
+
     return {
       target: `${params.packageId}::${moduleName}::delete`,
       arguments: [hashHex(`row:${payload}`), payload, hashHex(`index:${table}:${whereField}:${whereValue}`)],
