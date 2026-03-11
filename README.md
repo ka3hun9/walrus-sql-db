@@ -98,6 +98,16 @@ Example:
 - `SELECT * FROM orders LIMIT 20 OFFSET 0`
 - `SELECT id, status FROM orders WHERE id = 'ord_1' LIMIT 10 OFFSET 0`
 
+### 4.3 SDK built-in replay module
+
+Replay query logic is now reusable via:
+- `src/query-replay.ts`
+- `createReplayQueryExecutor(...)`
+
+So downstream apps can do:
+- `import { createReplayQueryExecutor } from "walrus-sql-db"`
+- inject it into `WalrusSqlClient({ onchainQueryExecutor: ... })`
+
 Set in `.env`:
 
 ```env
