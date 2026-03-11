@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 if (-not (Get-Command sui -ErrorAction SilentlyContinue)) {
   throw "sui CLI not found in PATH. Run scripts/install-sui-cli.ps1 first."
@@ -32,7 +33,8 @@ sui client active-address
 
 Write-Host "[5/6] Publish Move package"
 Set-Location (Join-Path $PSScriptRoot "..")
-sui client publish --gas-budget $GasBudget contracts/walrus_sql 2>&1 | Tee-Object -FilePath publish-output.txt
+$publishOutput = & sui client publish --gas-budget $GasBudget contracts/walrus_sql 2>&1
+$publishOutput | Tee-Object -FilePath publish-output.txt
 if ($LASTEXITCODE -ne 0) { throw "Publish failed. See publish-output.txt" }
 
 Write-Host "[6/6] Done. Parse publish-output.txt for package ID and created objects."
