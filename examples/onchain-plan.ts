@@ -2,7 +2,7 @@
 
 async function main() {
   const db = new WalrusSqlClient({
-    packageId: "0xYOUR_PACKAGE_ID",
+    packageId: "0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95",
     network: "sui-testnet",
     mode: "onchain",
   });

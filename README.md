@@ -2,14 +2,12 @@
 
 Pure on-chain oriented **Walrus SQL SDK starter**.
 
-## Phase-2 delivered
+## Current package (testnet)
 
-- Sui Move contract scaffold at `contracts/walrus_sql`
-- SDK on-chain mode (`mode: "onchain"`)
-- SQL -> Move call planning
-- Windows scripts for installing and publishing with Sui CLI
+- `PackageID`: `0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95`
+- `Module`: `walrus_sql`
 
-## Install dependencies
+## Install
 
 ```bash
 npm install
@@ -21,24 +19,32 @@ npm install
 npm run dev
 ```
 
-## On-chain call planning demo
+## On-chain planning demo
 
 ```bash
 npm run onchain:plan
 ```
 
-## Install Sui CLI (Windows)
+## Real on-chain execute demo (CREATE TABLE)
+
+1) Create `.env` from template:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install-sui-cli.ps1
+copy .env.example .env
 ```
 
-## Publish to Sui testnet
+2) Fill `SUI_PRIVATE_KEY` in `.env`.
+
+3) Run:
+
+```bash
+npm run onchain:exec
+```
+
+> Note: `INSERT/UPDATE/DELETE` will be fully wired in next phase after table object ID discovery is added.
+
+## Publish to testnet
 
 ```powershell
-# optional: pass your address
-powershell -ExecutionPolicy Bypass -File scripts/publish-testnet.ps1 -Address "0x2dcb94eb47ef5345f8a5dc1607215b92c20bc12c4968278b6e3ab783905df9d5"
+powershell -ExecutionPolicy Bypass -File scripts/publish-testnet.ps1 -Address "<your address>"
 ```
-
-Publish output is saved to `publish-output.txt`.
-Send it to me and I’ll wire the package ID into SDK config and generate real transaction executor code.
