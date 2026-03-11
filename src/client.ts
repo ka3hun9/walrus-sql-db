@@ -35,6 +35,12 @@ type ParsedSelect = {
   aggregateField?: string;
   groupBy?: string[];
   having?: string;
+  join?: {
+    type: "INNER";
+    table: string;
+    leftField: string;
+    rightField: string;
+  };
 };
 
 export class WalrusSqlClient {
@@ -170,6 +176,7 @@ export class WalrusSqlClient {
             limit: parsed.limit ?? null,
             offset: parsed.offset ?? null,
             mode: this.opts.mode ?? "simulator",
+            join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
           },
         ],
       };
@@ -191,11 +198,13 @@ export class WalrusSqlClient {
         groupBy: parsed.groupBy,
         having: parsed.having,
         explain: parsed.explain,
+        join: parsed.join,
       });
     }
 
     const bucket = this.requireTable(parsed.table);
-    const filtered = parsed.whereClauses.length ? this.applyWhereClauses(bucket, parsed.whereClauses) : bucket;
+    const baseRows = parsed.join ? this.applyInnerJoin(parsed.table, bucket, parsed.join) : bucket;
+    const filtered = parsed.whereClauses.length ? this.applyWhereClauses(baseRows, parsed.whereClauses) : baseRows;
 
     if (parsed.groupBy?.length) {
       const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
@@ -306,10 +315,24 @@ export class WalrusSqlClient {
 
     const selectFields = m[1].trim();
     const table = m[2];
-    const tail = m[3] ?? "";
+    let tail = m[3] ?? "";
+    let join: ParsedSelect["join"];
+
+    const joinMatch = tail.match(
+      /^\s+INNER\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+    );
+    if (joinMatch) {
+      join = {
+        type: "INNER",
+        table: joinMatch[1],
+        leftField: joinMatch[2],
+        rightField: joinMatch[3],
+      };
+      tail = joinMatch[4] ?? "";
+    }
 
     const tm = tail.match(
-      /^(?:\s+WHERE\s+(.+?))?(?:\s+GROUP BY\s+(.+?))?(?:\s+HAVING\s+(.+?))?(?:\s+ORDER BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$/i,
+      /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?\s*$/i,
     );
     if (!tm) throw new Error(`Unsupported SELECT clauses: ${rawSql}`);
 
@@ -326,9 +349,10 @@ export class WalrusSqlClient {
           .map((x) => x.trim())
           .filter(Boolean)
           .map((part) => {
-            const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(ASC|DESC))?$/i);
+            const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)((?:\s+(?:ASC|DESC))?)$/i);
             if (!om) throw new Error(`Unsupported ORDER BY segment: ${part}`);
-            return { field: om[1], direction: (om[2]?.toUpperCase() as "ASC" | "DESC" | undefined) ?? "ASC" };
+            const dir = om[2]?.trim().toUpperCase() as "ASC" | "DESC" | "";
+            return { field: om[1], direction: (dir || "ASC") as "ASC" | "DESC" };
           })
       : undefined;
 
@@ -365,6 +389,7 @@ export class WalrusSqlClient {
         aggregateField,
         groupBy,
         having,
+        join,
       };
     }
 
@@ -382,6 +407,7 @@ export class WalrusSqlClient {
         orderByList,
         groupBy,
         having,
+        join,
       };
     }
 
@@ -398,7 +424,38 @@ export class WalrusSqlClient {
       orderByList,
       groupBy,
       having,
+      join,
     };
+  }
+
+  private applyInnerJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+  ): SqlRow[] {
+    const rightRows = this.requireTable(join.table);
+    const leftField = join.leftField.includes(".") ? join.leftField.split(".")[1] : join.leftField;
+    const rightField = join.rightField.includes(".") ? join.rightField.split(".")[1] : join.rightField;
+
+    const out: SqlRow[] = [];
+    for (const l of leftRows) {
+      for (const r of rightRows) {
+        if (String(l[leftField]) !== String(r[rightField])) continue;
+        const merged: SqlRow = {};
+
+        for (const [k, v] of Object.entries(l)) {
+          merged[k] = v;
+          merged[`${leftTable}.${k}`] = v;
+        }
+        for (const [k, v] of Object.entries(r)) {
+          merged[`${join.table}.${k}`] = v;
+          if (!(k in merged)) merged[k] = v;
+        }
+
+        out.push(merged);
+      }
+    }
+    return out;
   }
 
   private parseWhere(whereExpr: string): WhereClause[] {
@@ -413,7 +470,7 @@ export class WalrusSqlClient {
         continue;
       }
 
-      const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+IN\s*\((.+)\)$/i);
+      const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]+)\s+IN\s*\((.+)\)$/i);
       if (inMatch) {
         out.push({
           logic: pendingLogic,
@@ -425,7 +482,7 @@ export class WalrusSqlClient {
         continue;
       }
 
-      const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
+      const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
       if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
 
       out.push({

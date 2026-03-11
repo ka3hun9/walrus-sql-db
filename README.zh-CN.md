@@ -33,6 +33,9 @@
 npm install
 npm run build
 npm run sql:advanced
+npm run sql:join
 npm run onchain:select-replay
 npm run onchain:benchmark-replay
 ```
+
+> 说明：`INNER JOIN` 当前先支持 simulator 侧；onchain replay 目前仅支持单表查询。

@@ -43,6 +43,12 @@ export interface OnchainQueryRequest {
   groupBy?: string[];
   having?: string;
   explain?: boolean;
+  join?: {
+    type: "INNER";
+    table: string;
+    leftField: string;
+    rightField: string;
+  };
 }
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;

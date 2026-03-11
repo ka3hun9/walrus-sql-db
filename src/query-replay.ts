@@ -532,6 +532,10 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
   }
 
   return async (req: OnchainQueryRequest): Promise<QueryResult> => {
+    if (req.join) {
+      throw new Error("JOIN is currently supported in simulator only; onchain replay JOIN is not yet implemented.");
+    }
+
     if (req.explain) {
       return {
         rows: [

@@ -33,6 +33,9 @@ Back to hub: [README.md](./README.md) | 中文: [README.zh-CN.md](./README.zh-CN
 npm install
 npm run build
 npm run sql:advanced
+npm run sql:join
 npm run onchain:select-replay
 npm run onchain:benchmark-replay
 ```
+
+> Note: `INNER JOIN` is currently simulator-side. On-chain replay executor currently supports single-table queries.

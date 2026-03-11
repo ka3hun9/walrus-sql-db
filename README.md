@@ -30,5 +30,6 @@ This README is bilingual-enabled. Pick your preferred doc:
 npm install
 npm run build
 npm run sql:advanced
+npm run sql:join
 npm run onchain:select-replay
 ```
