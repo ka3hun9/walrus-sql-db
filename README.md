@@ -5,52 +5,40 @@ Pure on-chain oriented **Walrus SQL SDK starter**.
 ## Phase-2 delivered
 
 - Sui Move contract scaffold at `contracts/walrus_sql`
-  - `Catalog`
-  - `TableMeta`
-  - commit events for insert/update/delete
 - SDK on-chain mode (`mode: "onchain"`)
-  - SQL -> Move call planning
-  - optional executor hook for real chain submission
-- Deploy helper script: `scripts/deploy-testnet.ps1`
+- SQL -> Move call planning
+- Windows scripts for installing and publishing with Sui CLI
 
-## Quick start
+## Install dependencies
 
 ```bash
 npm install
-npm run build
-npm run dev
 ```
 
-## Simulator CRUD example
+## Local simulator demo
 
 ```bash
 npm run dev
 ```
 
-## On-chain planning example
+## On-chain call planning demo
 
 ```bash
 npm run onchain:plan
 ```
 
-This prints the Move call payloads that your wallet/executor should submit.
-
-## Real testnet publish (your wallet)
-
-1. Install Sui CLI
-2. Ensure your wallet has test SUI (you already have it)
-3. Run:
+## Install Sui CLI (Windows)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/deploy-testnet.ps1
+powershell -ExecutionPolicy Bypass -File scripts/install-sui-cli.ps1
 ```
 
-Then set `packageId` in SDK and execute with your own `onchainExecutor` integration.
+## Publish to Sui testnet
 
-## Planned next milestones
+```powershell
+# optional: pass your address
+powershell -ExecutionPolicy Bypass -File scripts/publish-testnet.ps1 -Address "0x2dcb94eb47ef5345f8a5dc1607215b92c20bc12c4968278b6e3ab783905df9d5"
+```
 
-1. Wire SDK default executor with `@mysten/sui` signer
-2. Parse publish output and auto-write `.env` package id
-3. Add table object discovery + table-id aware Move calls
-4. Walrus blob manifest serializer
-5. Query proof verification spec (hash-chain + merkle root)
+Publish output is saved to `publish-output.txt`.
+Send it to me and I’ll wire the package ID into SDK config and generate real transaction executor code.
