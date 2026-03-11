@@ -1,15 +1,13 @@
-﻿module walrus_sql::walrus_sql {
+module walrus_sql::walrus_sql {
     use std::string::String;
     use sui::event;
     use sui::object::{Self, ID, UID};
-    use sui::tx_context::TxContext;
+    use sui::tx_context::{Self, TxContext};
     use sui::transfer;
-    use sui::vec_map::{Self, VecMap};
 
     public struct Catalog has key {
         id: UID,
         owner: address,
-        tables: VecMap<String, ID>,
     }
 
     public struct TableMeta has key {
@@ -23,7 +21,6 @@
 
     public struct TableCreated has copy, drop {
         table_id: ID,
-        name: String,
     }
 
     public struct CommitWritten has copy, drop {
@@ -35,25 +32,20 @@
         row_blob_hash: String,
     }
 
-    const E_TABLE_EXISTS: u64 = 1;
-
     entry fun init(ctx: &mut TxContext) {
         let catalog = Catalog {
             id: object::new(ctx),
             owner: tx_context::sender(ctx),
-            tables: vec_map::empty(),
         };
         transfer::share_object(catalog);
     }
 
     entry fun create_table(
-        catalog: &mut Catalog,
+        _catalog: &mut Catalog,
         name: String,
         schema: String,
         ctx: &mut TxContext,
     ) {
-        assert!(!vec_map::contains(&catalog.tables, &name), E_TABLE_EXISTS);
-
         let table = TableMeta {
             id: object::new(ctx),
             name,
@@ -64,11 +56,9 @@
         };
 
         let table_id = object::id(&table);
-        vec_map::insert(&mut catalog.tables, table.name, table_id);
 
         event::emit(TableCreated {
             table_id,
-            name: table.name,
         });
 
         transfer::share_object(table);

@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$Address = "",
   [string]$Network = "testnet",
   [string]$GasBudget = "100000000"
@@ -32,7 +32,8 @@ sui client active-address
 
 Write-Host "[5/6] Publish Move package"
 Set-Location (Join-Path $PSScriptRoot "..")
-sui client publish --gas-budget $GasBudget contracts/walrus_sql | Tee-Object -FilePath publish-output.txt
+sui client publish --gas-budget $GasBudget contracts/walrus_sql 2>&1 | Tee-Object -FilePath publish-output.txt
+if ($LASTEXITCODE -ne 0) { throw "Publish failed. See publish-output.txt" }
 
 Write-Host "[6/6] Done. Parse publish-output.txt for package ID and created objects."
 Write-Host "Tip: send me publish-output.txt and I will wire SDK packageId immediately."
