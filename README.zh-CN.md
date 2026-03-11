@@ -1,33 +1,24 @@
 # walrus-sql-db（中文）
 
-返回总览：[README.md](./README.md) | English: [README.en.md](./README.en.md)
+总览：[README.md](./README.md) | English: [README.en.md](./README.en.md)
 
-## 阶段状态
+面向链上回放查询的 Walrus SQL SDK。
 
-- Phase-3 ✅ 链上 CRUD
-- Phase-4.0~4.6 ✅ 查询回放基础能力
-- Phase-5 ✅ 持久化缓存 + 性能基准
-- Phase-6 ✅ payload v2 哈希链校验
-- Phase-7 ✅ SQL 能力增强 + 可运行示例
-- Phase-8 ✅ 交付文档 + 中英文切换
+## 功能
 
-## 已实现的 SQL 增强（13项）
+- SQL 能力：`WHERE(AND/OR/IN/比较符)`、多字段排序、GROUP BY/HAVING、聚合、EXPLAIN
+- Simulator INNER JOIN（`npm run sql:join`）
+- On-chain replay 查询 + 持久化缓存（`WALRUS_SQL_REPLAY_CACHE_FILE`）
+- On-chain replay INNER JOIN（两表回放 + 本地 join）
+- 基于 `TableCreated` 事件的自动发现表
 
-1. WHERE 扩展：`AND/OR/IN/!=/>/<,>=,<=`
-2. ORDER BY 多字段排序
-3. 聚合：`COUNT/SUM/AVG/MIN/MAX`
-4. 分页：`LIMIT/OFFSET` + keyset 风格（`WHERE id > ... ORDER BY id`）
-5. 别名基础支持（`AS`）
-6. GROUP BY
-7. HAVING
-8. Replay 执行器与高级查询字段对齐
-9. Replay 缓存持久化（`WALRUS_SQL_REPLAY_CACHE_FILE`）
-10. EXPLAIN（`EXPLAIN SELECT ...`）
-11. Parser 结构化改造
-12. 高级 SQL 示例脚本（`npm run sql:advanced`）
-13. README 中英文切换
+## Testnet RPC（故障切换）
 
-## 运行方式
+- `https://fullnode.testnet.sui.io:443`
+- `https://rpc-testnet.suiscan.xyz:443`
+- `https://testnet.suiet.app:443`
+
+## 运行
 
 ```bash
 npm install
@@ -35,7 +26,22 @@ npm run build
 npm run sql:advanced
 npm run sql:join
 npm run onchain:select-replay
+npm run onchain:join-replay
 npm run onchain:benchmark-replay
 ```
 
-> 说明：`INNER JOIN` 当前先支持 simulator 侧；onchain replay 目前仅支持单表查询。
+## 环境变量
+
+```env
+SUI_NETWORK=testnet
+SUI_RPC_URL=https://rpc-testnet.suiscan.xyz:443
+SUI_OWNER_ADDRESS=0x...
+WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
+WALRUS_SQL_TABLE_NAME=orders
+WALRUS_SQL_TABLE_ID=
+WALRUS_SQL_LEFT_TABLE=orders
+WALRUS_SQL_RIGHT_TABLE=users
+WALRUS_SQL_LEFT_TABLE_ID=
+WALRUS_SQL_RIGHT_TABLE_ID=
+WALRUS_SQL_REPLAY_CACHE_FILE=.cache/replay-cache.json
+```

@@ -1,31 +1,22 @@
 # walrus-sql-db (English)
 
-Back to hub: [README.md](./README.md) | 中文: [README.zh-CN.md](./README.zh-CN.md)
+Hub: [README.md](./README.md) | 中文: [README.zh-CN.md](./README.zh-CN.md)
 
-## Phase status
+Pure on-chain oriented Walrus SQL SDK starter.
 
-- Phase-3 ✅ on-chain CRUD
-- Phase-4.0~4.6 ✅ query replay baseline
-- Phase-5 ✅ persistent replay cache + benchmark
-- Phase-6 ✅ payload v2 hash-chain verification
-- Phase-7 ✅ advanced SQL capability + runnable example
-- Phase-8 ✅ delivery docs + bilingual README switch
+## Features
 
-## SQL enhancements implemented
+- SQL capability: `WHERE(AND/OR/IN/comparators)`, multi-order, group/having, aggregates, explain
+- Simulator INNER JOIN (`npm run sql:join`)
+- On-chain replay SELECT with persistent cache (`WALRUS_SQL_REPLAY_CACHE_FILE`)
+- On-chain replay INNER JOIN (replay left+right tables then local join)
+- Auto table discovery by `TableCreated` events
 
-1. WHERE: `AND/OR/IN/!=/>/<,>=,<=`
-2. ORDER BY: multi-column sorting
-3. Aggregates: `COUNT/SUM/AVG/MIN/MAX`
-4. Pagination: `LIMIT/OFFSET` + keyset-style (`WHERE id > ... ORDER BY id`)
-5. Alias baseline (`AS`) in parser outputs
-6. GROUP BY
-7. HAVING
-8. Replay executor alignment with advanced query fields
-9. Persistent replay cache (`WALRUS_SQL_REPLAY_CACHE_FILE`)
-10. EXPLAIN support (`EXPLAIN SELECT ...`)
-11. Parser structure modularization
-12. Advanced SQL demo script (`npm run sql:advanced`)
-13. Bilingual docs switch
+## RPC failover (testnet)
+
+- `https://fullnode.testnet.sui.io:443`
+- `https://rpc-testnet.suiscan.xyz:443`
+- `https://testnet.suiet.app:443`
 
 ## Run
 
@@ -35,7 +26,22 @@ npm run build
 npm run sql:advanced
 npm run sql:join
 npm run onchain:select-replay
+npm run onchain:join-replay
 npm run onchain:benchmark-replay
 ```
 
-> Note: `INNER JOIN` is currently simulator-side. On-chain replay executor currently supports single-table queries.
+## Env
+
+```env
+SUI_NETWORK=testnet
+SUI_RPC_URL=https://rpc-testnet.suiscan.xyz:443
+SUI_OWNER_ADDRESS=0x...
+WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
+WALRUS_SQL_TABLE_NAME=orders
+WALRUS_SQL_TABLE_ID=
+WALRUS_SQL_LEFT_TABLE=orders
+WALRUS_SQL_RIGHT_TABLE=users
+WALRUS_SQL_LEFT_TABLE_ID=
+WALRUS_SQL_RIGHT_TABLE_ID=
+WALRUS_SQL_REPLAY_CACHE_FILE=.cache/replay-cache.json
+```

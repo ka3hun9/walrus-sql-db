@@ -119,7 +119,7 @@ function parseWhere(whereExpr: string): WhereClause[] {
       continue;
     }
 
-    const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+IN\s*\((.+)\)$/i);
+    const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IN\s*\((.+)\)$/i);
     if (inMatch) {
       out.push({
         logic: pendingLogic,
@@ -131,7 +131,7 @@ function parseWhere(whereExpr: string): WhereClause[] {
       continue;
     }
 
-    const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
+    const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
     if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
 
     out.push({
@@ -259,6 +259,37 @@ function groupRows(
     if (aggregate) Object.assign(row, computeAggregateRow(bucketRows, aggregate, aggregateField));
     out.push(row);
   }
+  return out;
+}
+
+function innerJoinRows(
+  leftTable: string,
+  leftRows: SqlRow[],
+  rightTable: string,
+  rightRows: SqlRow[],
+  leftFieldExpr: string,
+  rightFieldExpr: string,
+): SqlRow[] {
+  const leftField = leftFieldExpr.includes(".") ? leftFieldExpr.split(".")[1] : leftFieldExpr;
+  const rightField = rightFieldExpr.includes(".") ? rightFieldExpr.split(".")[1] : rightFieldExpr;
+
+  const out: SqlRow[] = [];
+  for (const l of leftRows) {
+    for (const r of rightRows) {
+      if (String(l[leftField]) !== String(r[rightField])) continue;
+      const merged: SqlRow = {};
+      for (const [k, v] of Object.entries(l)) {
+        merged[k] = v;
+        merged[`${leftTable}.${k}`] = v;
+      }
+      for (const [k, v] of Object.entries(r)) {
+        merged[`${rightTable}.${k}`] = v;
+        if (!(k in merged)) merged[k] = v;
+      }
+      out.push(merged);
+    }
+  }
+
   return out;
 }
 
@@ -532,10 +563,6 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
   }
 
   return async (req: OnchainQueryRequest): Promise<QueryResult> => {
-    if (req.join) {
-      throw new Error("JOIN is currently supported in simulator only; onchain replay JOIN is not yet implemented.");
-    }
-
     if (req.explain) {
       return {
         rows: [
@@ -549,19 +576,27 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
             orderBy: req.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
             limit: req.limit ?? null,
             offset: req.offset ?? null,
+            join: req.join ? `${req.join.type} ${req.join.table} ON ${req.join.leftField}=${req.join.rightField}` : null,
             keysetHint: "Use WHERE id > '<last_id>' ORDER BY id ASC LIMIT n",
           },
         ],
       };
     }
 
-    const tableId = await resolveTableId(req.table);
-    if (!tableId) throw new Error(`Table not found: ${req.table}`);
+    const leftTableId = await resolveTableId(req.table);
+    if (!leftTableId) throw new Error(`Table not found: ${req.table}`);
+    const leftRows = await replayRowsIncremental(leftTableId);
 
-    const replayed = await replayRowsIncremental(tableId);
+    let baseRows = leftRows;
+    if (req.join) {
+      const rightTableId = await resolveTableId(req.join.table);
+      if (!rightTableId) throw new Error(`Joined table not found: ${req.join.table}`);
+      const rightRows = await replayRowsIncremental(rightTableId);
+      baseRows = innerJoinRows(req.table, leftRows, req.join.table, rightRows, req.join.leftField, req.join.rightField);
+    }
 
     const clauses = req.where ? parseWhere(req.where) : [];
-    const filtered = clauses.length ? applyWhereClauses(replayed, clauses) : replayed;
+    const filtered = clauses.length ? applyWhereClauses(baseRows, clauses) : baseRows;
 
     let materialized: SqlRow[];
     if (req.groupBy?.length) {
