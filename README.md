@@ -66,24 +66,33 @@ What Phase-3 does:
 - sends real insert/update/delete tx with object args
 - checks tx success status
 
-## 4) SELECT query layer (Phase-4 MVP)
+## 4) SELECT query layer (Phase-4)
 
-This phase adds on-chain read support through `onchainQueryExecutor`.
-Current MVP reads `TableMeta` object fields and supports:
+### 4.0 Metadata read (TableMeta)
+
+```bash
+npm run onchain:select
+```
+
+Reads TableMeta object fields (`name/schema/commit_count/latest_*`).
+
+### 4.1 Event replay row view (MVP)
+
+```bash
+npm run onchain:select-replay
+```
+
+This replays on-chain `CommitWritten` events for the target table and reconstructs row state by decoding JSON payload carried in transaction input strings.
+
+Supported query subset:
 - `SELECT * FROM <table>`
-- `SELECT id, name, schema, commit_count FROM <table> WHERE id = '...'`
+- `SELECT <fields> FROM <table> WHERE id = '...'`
 
 Set in `.env`:
 
 ```env
 WALRUS_SQL_TABLE_NAME=orders
 WALRUS_SQL_TABLE_ID=<TableMeta object id>
-```
-
-Run:
-
-```bash
-npm run onchain:select
 ```
 
 ## Where to find IDs
