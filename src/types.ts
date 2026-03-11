@@ -35,6 +35,9 @@ export interface OnchainQueryRequest {
   where?: string;
   limit?: number;
   offset?: number;
+  orderBy?: string;
+  orderDirection?: "ASC" | "DESC";
+  aggregate?: "COUNT";
 }
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;

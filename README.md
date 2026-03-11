@@ -59,14 +59,7 @@ npm run onchain:exec
 npm run onchain:smoke
 ```
 
-What Phase-3 does:
-- uses existing `Catalog` for `create_table(catalog, name, schema)`
-- captures created `TableMeta` object id
-- maps table name -> object id in-process
-- sends real insert/update/delete tx with object args
-- checks tx success status
-
-## 4) SELECT query layer (Phase-4)
+## 4) Query layer roadmap completion
 
 ### 4.0 Metadata read (TableMeta)
 
@@ -82,50 +75,60 @@ Reads TableMeta object fields (`name/schema/commit_count/latest_*`).
 npm run onchain:select-replay
 ```
 
-This replays on-chain `CommitWritten` events for the target table and reconstructs row state by decoding JSON payload carried in transaction input strings.
-
-Supported query subset:
-- `SELECT * FROM <table>`
-- `SELECT <fields> FROM <table> WHERE id = '...'`
+Replays `CommitWritten` events and reconstructs row state from structured payloads.
 
 ### 4.2 Pagination + incremental cache
 
-`select-replay` now supports:
+Supported in replay executor:
 - `LIMIT <n> OFFSET <m>`
-- incremental event sync cache (per table object id) so repeated queries avoid full replay from genesis.
-
-Example:
-- `SELECT * FROM orders LIMIT 20 OFFSET 0`
-- `SELECT id, status FROM orders WHERE id = 'ord_1' LIMIT 10 OFFSET 0`
+- incremental cache (`cursor + seenDigests + rows`) per table object id
 
 ### 4.3 SDK built-in replay module
 
-Replay query logic is now reusable via:
+Reusable API:
 - `src/query-replay.ts`
 - `createReplayQueryExecutor(...)`
 
-So downstream apps can do:
-- `import { createReplayQueryExecutor } from "walrus-sql-db"`
-- inject it into `WalrusSqlClient({ onchainQueryExecutor: ... })`
+### 4.4 Multi-table auto discovery
 
-Set in `.env`:
+If `WALRUS_SQL_TABLE_ID` is omitted, replay executor can auto-discover by scanning owner `TableMeta` objects.
+
+Required for auto-discovery:
 
 ```env
-WALRUS_SQL_TABLE_NAME=orders
-WALRUS_SQL_TABLE_ID=<TableMeta object id>
+SUI_OWNER_ADDRESS=0x...
+WALRUS_SQL_TABLE_NAME=<table name>
 ```
 
-## Where to find IDs
+### 4.5 Query capability upgrades
 
-### `WALRUS_SQL_CATALOG_ID`
-Use `sui client objects --address <your address>` and find object type:
+Replay path now supports:
+- `WHERE a='x' AND b='y'`
+- `ORDER BY <field> ASC|DESC`
+- `SELECT COUNT(*) ...`
 
-`<PACKAGE_ID>::walrus_sql::Catalog`
+### 4.6 Delivery/stability baseline
 
-### `WALRUS_SQL_TABLE_ID`
-Take it from CREATE output (`tableId: ...`) or find object type:
+- replay logic moved to SDK module (not example-only)
+- configurable page size (`pageSize`)
+- example wired to auto-discovery + advanced query cases
 
-`<PACKAGE_ID>::walrus_sql::TableMeta`
+## Example Phase-4.4~4.6 env
+
+```env
+SUI_NETWORK=testnet
+SUI_RPC_URL=https://rpc-testnet.suiscan.xyz:443
+SUI_OWNER_ADDRESS=0x2dcb94eb47ef5345f8a5dc1607215b92c20bc12c4968278b6e3ab783905df9d5
+WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
+WALRUS_SQL_TABLE_NAME=orders_1773231191643
+# WALRUS_SQL_TABLE_ID optional when auto-discovery is enabled
+```
+
+Run:
+
+```bash
+npm run onchain:select-replay
+```
 
 ## Publish again (if contract changed)
 

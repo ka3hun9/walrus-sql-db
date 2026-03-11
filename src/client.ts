@@ -136,12 +136,29 @@ export class WalrusSqlClient {
         where: parsed.where,
         limit: parsed.limit,
         offset: parsed.offset,
+        orderBy: parsed.orderBy,
+        orderDirection: parsed.orderDirection,
+        aggregate: parsed.aggregate,
       });
     }
 
     const bucket = this.requireTable(parsed.table);
     const filtered = parsed.where ? this.applyWhere(bucket, parsed.where) : bucket;
-    const paged = filtered.slice(parsed.offset ?? 0, (parsed.offset ?? 0) + (parsed.limit ?? filtered.length));
+
+    if (parsed.aggregate === "COUNT") {
+      return { rows: [{ count: filtered.length }] };
+    }
+
+    const ordered = parsed.orderBy
+      ? [...filtered].sort((a, b) => {
+          const av = a[parsed.orderBy!];
+          const bv = b[parsed.orderBy!];
+          const cmp = String(av ?? "").localeCompare(String(bv ?? ""), undefined, { numeric: true });
+          return parsed.orderDirection === "DESC" ? -cmp : cmp;
+        })
+      : filtered;
+
+    const paged = ordered.slice(parsed.offset ?? 0, (parsed.offset ?? 0) + (parsed.limit ?? ordered.length));
 
     if (parsed.fields.length === 1 && parsed.fields[0] === "*") return { rows: paged };
 
@@ -228,20 +245,46 @@ export class WalrusSqlClient {
   private parseSelect(
     normalizedSql: string,
     rawSql: string,
-  ): { table: string; fields: string[] | ["*"]; where?: string; limit?: number; offset?: number } {
+  ): {
+    table: string;
+    fields: string[] | ["*"];
+    where?: string;
+    limit?: number;
+    offset?: number;
+    orderBy?: string;
+    orderDirection?: "ASC" | "DESC";
+    aggregate?: "COUNT";
+  } {
     const m = normalizedSql.match(
-      /SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?$/i,
+      /SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+?))?(?:\s+ORDER BY\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(ASC|DESC))?)?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?$/i,
     );
     if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
 
     const selectFields = m[1].trim();
     const table = m[2];
     const where = m[3]?.trim();
-    const limit = m[4] ? Number(m[4]) : undefined;
-    const offset = m[5] ? Number(m[5]) : undefined;
+    const orderBy = m[4]?.trim();
+    const orderDirection = (m[5]?.toUpperCase() as "ASC" | "DESC" | undefined) ?? "ASC";
+    const limit = m[6] ? Number(m[6]) : undefined;
+    const offset = m[7] ? Number(m[7]) : undefined;
+
+    const aggregate = /^COUNT\(\*\)$/i.test(selectFields) ? "COUNT" : undefined;
+
+    if (aggregate === "COUNT") {
+      return {
+        table,
+        fields: ["count"],
+        where,
+        limit,
+        offset,
+        orderBy,
+        orderDirection,
+        aggregate,
+      };
+    }
 
     if (selectFields === "*") {
-      return { table, fields: ["*"], where, limit, offset };
+      return { table, fields: ["*"], where, limit, offset, orderBy, orderDirection };
     }
 
     return {
@@ -250,6 +293,8 @@ export class WalrusSqlClient {
       where,
       limit,
       offset,
+      orderBy,
+      orderDirection,
     };
   }
 

@@ -24,19 +24,26 @@ type ReplayCache = {
 export interface ReplayQueryExecutorOptions {
   client: SuiClient;
   packageId: string;
-  tableRegistry: Map<string, string> | Record<string, string>;
+  tableRegistry?: Map<string, string> | Record<string, string>;
+  ownerAddress?: string;
+  autoDiscoverTables?: boolean;
   pageSize?: number;
 }
 
-function parseWhere(whereExpr: string): { field: string; value: string } {
-  const m = whereExpr.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
-  if (!m) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
-  const raw = m[2].trim();
-  const value =
-    (raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith('"') && raw.endsWith('"'))
-      ? raw.slice(1, -1)
-      : raw;
-  return { field: m[1].trim(), value };
+function trimQuoted(raw: string): string {
+  if ((raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith('"') && raw.endsWith('"'))) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+function parseWhere(whereExpr: string): Array<{ field: string; value: string }> {
+  const parts = whereExpr.split(/\s+AND\s+/i).map((x) => x.trim());
+  return parts.map((part) => {
+    const m = part.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
+    if (!m) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
+    return { field: m[1].trim(), value: trimQuoted(m[2].trim()) };
+  });
 }
 
 function pickFields(row: SqlRow, fields: string[] | ["*"]): SqlRow {
@@ -70,14 +77,31 @@ function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
   return rows.filter((row) => String(row[payload.where.field]) !== payload.where.value);
 }
 
-function resolveTableId(registry: Map<string, string> | Record<string, string>, table: string): string | undefined {
-  if (registry instanceof Map) return registry.get(table);
-  return registry[table];
+async function discoverTableId(options: ReplayQueryExecutorOptions, table: string): Promise<string | undefined> {
+  if (!options.autoDiscoverTables || !options.ownerAddress) return undefined;
+
+  const scan = await options.client.getOwnedObjects({
+    owner: options.ownerAddress,
+    filter: { StructType: `${options.packageId}::walrus_sql::TableMeta` },
+    options: { showContent: true, showType: true },
+    limit: 100,
+  });
+
+  for (const item of scan.data) {
+    const id = item.data?.objectId;
+    const content = item.data?.content;
+    if (!id || !content || content.dataType !== "moveObject") continue;
+    const nameValue = String((content.fields as Record<string, unknown>)?.name ?? "");
+    if (nameValue === table) return id;
+  }
+
+  return undefined;
 }
 
 export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): OnchainQueryExecutor {
   const pageSize = options.pageSize ?? 50;
   const cacheByTableId = new Map<string, ReplayCache>();
+  const discoveredRegistry = new Map<string, string>();
 
   function getCache(tableId: string): ReplayCache {
     const hit = cacheByTableId.get(tableId);
@@ -91,6 +115,25 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
     };
     cacheByTableId.set(tableId, init);
     return init;
+  }
+
+  function resolveFromRegistry(table: string): string | undefined {
+    const registry = options.tableRegistry;
+    if (!registry) return undefined;
+    if (registry instanceof Map) return registry.get(table);
+    return registry[table];
+  }
+
+  async function resolveTableId(table: string): Promise<string | undefined> {
+    const fromDiscovered = discoveredRegistry.get(table);
+    if (fromDiscovered) return fromDiscovered;
+
+    const fromRegistry = resolveFromRegistry(table);
+    if (fromRegistry) return fromRegistry;
+
+    const discovered = await discoverTableId(options, table);
+    if (discovered) discoveredRegistry.set(table, discovered);
+    return discovered;
   }
 
   async function decodePayloadFromDigest(digest: string): Promise<Payload | null> {
@@ -163,16 +206,32 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
   }
 
   return async (req: OnchainQueryRequest): Promise<QueryResult> => {
-    const tableId = resolveTableId(options.tableRegistry, req.table);
+    const tableId = await resolveTableId(req.table);
     if (!tableId) throw new Error(`Table not found: ${req.table}`);
 
     const replayed = await replayRowsIncremental(tableId);
-    const where = req.where ? parseWhere(req.where) : undefined;
-    const filtered = where ? replayed.filter((row) => String(row[where.field]) === where.value) : replayed;
+
+    const clauses = req.where ? parseWhere(req.where) : [];
+    const filtered = clauses.length
+      ? replayed.filter((row) => clauses.every((c) => String(row[c.field]) === c.value))
+      : replayed;
+
+    if (req.aggregate === "COUNT") {
+      return { rows: [{ count: filtered.length }] };
+    }
+
+    const ordered = req.orderBy
+      ? [...filtered].sort((a, b) => {
+          const av = a[req.orderBy!];
+          const bv = b[req.orderBy!];
+          const cmp = String(av ?? "").localeCompare(String(bv ?? ""), undefined, { numeric: true });
+          return req.orderDirection === "DESC" ? -cmp : cmp;
+        })
+      : filtered;
 
     const offset = req.offset ?? 0;
-    const limit = req.limit ?? filtered.length;
-    const paged = filtered.slice(offset, offset + limit);
+    const limit = req.limit ?? ordered.length;
+    const paged = ordered.slice(offset, offset + limit);
 
     return {
       rows: paged.map((row) => pickFields(row, req.fields)),
