@@ -18,76 +18,20 @@ if (!SUI_PRIVATE_KEY) {
 
 const { secretKey } = decodeSuiPrivateKey(SUI_PRIVATE_KEY);
 const signer = Ed25519Keypair.fromSecretKey(secretKey);
-const signerAddress = signer.toSuiAddress();
 const client = new SuiClient({
   url: NETWORK === "mainnet" ? getFullnodeUrl("mainnet") : getFullnodeUrl("testnet"),
 });
 
 const tableByName = new Map<string, string>();
-let catalogObjectId: string | null = null;
-
-async function findOwnedObjectId(typeSuffix: string): Promise<string | null> {
-  const res = await client.getOwnedObjects({
-    owner: signerAddress,
-    filter: {
-      StructType: `${PACKAGE_ID}::walrus_sql::${typeSuffix}`,
-    },
-    options: { showType: true },
-    limit: 50,
-  });
-
-  return res.data[0]?.data?.objectId ?? null;
-}
-
-async function ensureCatalog(): Promise<string> {
-  if (catalogObjectId) return catalogObjectId;
-
-  const existing = await findOwnedObjectId("Catalog");
-  if (existing) {
-    catalogObjectId = existing;
-    return existing;
-  }
-
-  const tx = new Transaction();
-  tx.setGasBudget(100_000_000);
-  tx.moveCall({
-    target: `${PACKAGE_ID}::walrus_sql::init`,
-    arguments: [],
-    typeArguments: [],
-  });
-
-  const result = await client.signAndExecuteTransaction({
-    signer,
-    transaction: tx,
-    options: { showEffects: true, showObjectChanges: true, showEvents: true },
-  });
-
-  const status = result.effects?.status?.status;
-  if (status !== "success") {
-    throw new Error(`init failed: ${JSON.stringify(result.effects?.status)}`);
-  }
-
-  const createdCatalog = result.objectChanges?.find(
-    (c) => c.type === "created" && c.objectType.endsWith("::walrus_sql::Catalog"),
-  );
-
-  if (!createdCatalog || createdCatalog.type !== "created") {
-    throw new Error(`init succeeded but Catalog object not found in changes.`);
-  }
-
-  catalogObjectId = createdCatalog.objectId;
-  return catalogObjectId;
-}
 
 async function executeMove(req: MoveCallRequest): Promise<{ digest: string; createdTableId?: string; raw?: unknown }> {
   const tx = new Transaction();
   tx.setGasBudget(100_000_000);
 
   if (req.statementType === "CREATE") {
-    const catalogId = await ensureCatalog();
     tx.moveCall({
       target: req.target,
-      arguments: [tx.object(catalogId), tx.pure.string(req.arguments[0]), tx.pure.string(req.arguments[1])],
+      arguments: [tx.pure.string(req.arguments[0]), tx.pure.string(req.arguments[1])],
       typeArguments: req.typeArguments ?? [],
     });
   } else {
@@ -131,6 +75,8 @@ async function executeMove(req: MoveCallRequest): Promise<{ digest: string; crea
     if (createdTable && createdTable.type === "created") {
       createdTableId = createdTable.objectId;
       if (req.tableName) tableByName.set(req.tableName, createdTableId);
+    } else {
+      throw new Error("CREATE succeeded but no TableMeta object found in changes.");
     }
   }
 
