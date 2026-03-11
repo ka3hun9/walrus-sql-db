@@ -134,15 +134,18 @@ export class WalrusSqlClient {
         table: parsed.table,
         fields: parsed.fields,
         where: parsed.where,
+        limit: parsed.limit,
+        offset: parsed.offset,
       });
     }
 
     const bucket = this.requireTable(parsed.table);
     const filtered = parsed.where ? this.applyWhere(bucket, parsed.where) : bucket;
+    const paged = filtered.slice(parsed.offset ?? 0, (parsed.offset ?? 0) + (parsed.limit ?? filtered.length));
 
-    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return { rows: filtered };
+    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return { rows: paged };
 
-    const rows = filtered.map((row) => {
+    const rows = paged.map((row) => {
       const out: SqlRow = {};
       for (const f of parsed.fields) out[f] = row[f] ?? null;
       return out;
@@ -222,22 +225,31 @@ export class WalrusSqlClient {
     };
   }
 
-  private parseSelect(normalizedSql: string, rawSql: string): { table: string; fields: string[] | ["*"]; where?: string } {
-    const m = normalizedSql.match(/SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?/i);
+  private parseSelect(
+    normalizedSql: string,
+    rawSql: string,
+  ): { table: string; fields: string[] | ["*"]; where?: string; limit?: number; offset?: number } {
+    const m = normalizedSql.match(
+      /SELECT\s+(.+)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?$/i,
+    );
     if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
 
     const selectFields = m[1].trim();
     const table = m[2];
     const where = m[3]?.trim();
+    const limit = m[4] ? Number(m[4]) : undefined;
+    const offset = m[5] ? Number(m[5]) : undefined;
 
     if (selectFields === "*") {
-      return { table, fields: ["*"], where };
+      return { table, fields: ["*"], where, limit, offset };
     }
 
     return {
       table,
       fields: selectFields.split(",").map((x) => x.trim()),
       where,
+      limit,
+      offset,
     };
   }
 

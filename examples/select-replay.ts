@@ -28,6 +28,31 @@ type Payload =
     }
   | { v: number; op: "DELETE"; table: string; where: { field: string; value: string } };
 
+type Cursor = { txDigest: string; eventSeq: string } | null | undefined;
+
+type ReplayCache = {
+  cursor: Cursor;
+  rows: SqlRow[];
+  seenDigests: Set<string>;
+  initialized: boolean;
+};
+
+const replayCacheByTable = new Map<string, ReplayCache>();
+
+function getCache(tableId: string): ReplayCache {
+  const hit = replayCacheByTable.get(tableId);
+  if (hit) return hit;
+
+  const init: ReplayCache = {
+    cursor: null,
+    rows: [],
+    seenDigests: new Set<string>(),
+    initialized: false,
+  };
+  replayCacheByTable.set(tableId, init);
+  return init;
+}
+
 function parseWhere(whereExpr: string): { field: string; value: string } {
   const m = whereExpr.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i);
   if (!m) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
@@ -58,9 +83,7 @@ function parsePayload(maybeJson: string): Payload | null {
 }
 
 function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
-  if (payload.op === "INSERT") {
-    return [...rows, payload.row];
-  }
+  if (payload.op === "INSERT") return [...rows, payload.row];
 
   if (payload.op === "UPDATE") {
     return rows.map((row) => {
@@ -72,10 +95,40 @@ function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
   return rows.filter((row) => String(row[payload.where.field]) !== payload.where.value);
 }
 
-async function replayRows(tableId: string): Promise<SqlRow[]> {
-  let cursor: { txDigest: string; eventSeq: string } | null | undefined = null;
+async function decodePayloadFromDigest(digest: string): Promise<Payload | null> {
+  const tx = await client.getTransactionBlock({
+    digest,
+    options: { showInput: true },
+  });
+
+  const programmable = tx.transaction?.data?.transaction;
+  if (!programmable || programmable.kind !== "ProgrammableTransaction") return null;
+
+  const firstTx = programmable.transactions[0] as Record<string, unknown> | undefined;
+  const move = (firstTx?.MoveCall as { function?: string; arguments?: Array<{ Input?: number }> } | undefined) ?? undefined;
+  if (!move || !move.arguments || move.arguments.length < 3) return null;
+
+  const fn = move.function;
+  if (fn !== "insert" && fn !== "update" && fn !== "delete") return null;
+
+  const arg2 = move.arguments[2];
+  if (!arg2 || typeof arg2 !== "object" || !("Input" in arg2)) return null;
+
+  const inputIdx = arg2.Input;
+  if (typeof inputIdx !== "number") return null;
+
+  const payloadInput = programmable.inputs[inputIdx];
+  if (!payloadInput || payloadInput.type !== "pure") return null;
+
+  return parsePayload(String(payloadInput.value));
+}
+
+async function replayRowsIncremental(tableId: string): Promise<SqlRow[]> {
+  const cache = getCache(tableId);
   const commitEventType = `${PACKAGE_ID}::walrus_sql::CommitWritten`;
-  const digests: string[] = [];
+
+  let cursor = cache.initialized ? cache.cursor : null;
+  let lastCursor = cursor;
 
   for (;;) {
     const page = await client.queryEvents({
@@ -87,62 +140,42 @@ async function replayRows(tableId: string): Promise<SqlRow[]> {
 
     for (const event of page.data) {
       const table = (event.parsedJson as { table_id?: string } | null)?.table_id;
-      if (table === tableId) digests.push(event.id.txDigest);
+      if (table !== tableId) continue;
+
+      const digest = event.id.txDigest;
+      if (cache.seenDigests.has(digest)) continue;
+
+      const payload = await decodePayloadFromDigest(digest);
+      if (!payload) continue;
+
+      cache.rows = applyPayload(cache.rows, payload);
+      cache.seenDigests.add(digest);
     }
 
+    lastCursor = page.nextCursor;
     if (!page.hasNextPage) break;
     cursor = page.nextCursor;
   }
 
-  let rows: SqlRow[] = [];
-
-  for (const digest of digests) {
-    const tx = await client.getTransactionBlock({
-      digest,
-      options: { showInput: true },
-    });
-
-    const programmable = tx.transaction?.data?.transaction;
-    if (!programmable || programmable.kind !== "ProgrammableTransaction") continue;
-
-    const firstTx = programmable.transactions[0] as Record<string, unknown> | undefined;
-    const move = (firstTx?.MoveCall as { function?: string; arguments?: Array<{ Input?: number }> } | undefined) ?? undefined;
-    if (!move) continue;
-
-    const fn = move.function;
-    if (fn !== "insert" && fn !== "update" && fn !== "delete") continue;
-
-    if (!move.arguments || move.arguments.length < 3) continue;
-
-    const arg2 = move.arguments[2];
-    if (!arg2 || typeof arg2 !== "object" || !("Input" in arg2)) continue;
-
-    const inputIdx = arg2.Input;
-    if (typeof inputIdx !== "number") continue;
-    const payloadInput = programmable.inputs[inputIdx];
-    if (!payloadInput || payloadInput.type !== "pure") continue;
-
-    const payload = parsePayload(String(payloadInput.value));
-    if (!payload) continue;
-
-    rows = applyPayload(rows, payload);
-  }
-
-  return rows;
+  cache.cursor = lastCursor;
+  cache.initialized = true;
+  return cache.rows;
 }
 
 async function onchainQueryExecutor(req: OnchainQueryRequest): Promise<QueryResult> {
   const tableId = tableRegistry.get(req.table);
   if (!tableId) throw new Error(`Table not found: ${req.table}`);
 
-  const replayed = await replayRows(tableId);
-  const filtered = req.where ? replayed.filter((row) => {
-    const where = parseWhere(req.where!);
-    return String(row[where.field]) === where.value;
-  }) : replayed;
+  const replayed = await replayRowsIncremental(tableId);
+  const where = req.where ? parseWhere(req.where) : undefined;
+  const filtered = where ? replayed.filter((row) => String(row[where.field]) === where.value) : replayed;
+
+  const offset = req.offset ?? 0;
+  const limit = req.limit ?? filtered.length;
+  const paged = filtered.slice(offset, offset + limit);
 
   return {
-    rows: filtered.map((row) => pickFields(row, req.fields)),
+    rows: paged.map((row) => pickFields(row, req.fields)),
   };
 }
 
@@ -157,10 +190,10 @@ async function main() {
   console.log(`Using RPC: ${SUI_RPC_URL}`);
   console.log(`Replay table: ${TABLE_NAME} -> ${TABLE_ID}`);
 
-  const all = await db.query(`SELECT * FROM ${TABLE_NAME}`);
+  const all = await db.query(`SELECT * FROM ${TABLE_NAME} LIMIT 20 OFFSET 0`);
   console.log("SELECT * (replay) =>", all.rows);
 
-  const one = await db.query(`SELECT id, status, amount FROM ${TABLE_NAME} WHERE id = 'ord_1'`);
+  const one = await db.query(`SELECT id, status, amount FROM ${TABLE_NAME} WHERE id = 'ord_1' LIMIT 10 OFFSET 0`);
   console.log("SELECT filtered (replay) =>", one.rows);
 }
 

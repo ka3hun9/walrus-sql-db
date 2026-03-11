@@ -33,6 +33,8 @@ export interface OnchainQueryRequest {
   table: string;
   fields: string[] | ["*"];
   where?: string;
+  limit?: number;
+  offset?: number;
 }
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;

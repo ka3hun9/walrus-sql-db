@@ -88,6 +88,16 @@ Supported query subset:
 - `SELECT * FROM <table>`
 - `SELECT <fields> FROM <table> WHERE id = '...'`
 
+### 4.2 Pagination + incremental cache
+
+`select-replay` now supports:
+- `LIMIT <n> OFFSET <m>`
+- incremental event sync cache (per table object id) so repeated queries avoid full replay from genesis.
+
+Example:
+- `SELECT * FROM orders LIMIT 20 OFFSET 0`
+- `SELECT id, status FROM orders WHERE id = 'ord_1' LIMIT 10 OFFSET 0`
+
 Set in `.env`:
 
 ```env
