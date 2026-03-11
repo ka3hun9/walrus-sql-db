@@ -12,6 +12,8 @@ const PACKAGE_ID =
 const NETWORK = process.env.SUI_NETWORK ?? "testnet";
 const SUI_PRIVATE_KEY = process.env.SUI_PRIVATE_KEY;
 const CATALOG_OBJECT_ID = process.env.WALRUS_SQL_CATALOG_ID;
+const SUI_RPC_URL =
+  process.env.SUI_RPC_URL ?? (NETWORK === "mainnet" ? getFullnodeUrl("mainnet") : getFullnodeUrl("testnet"));
 
 if (!SUI_PRIVATE_KEY) {
   throw new Error("Missing SUI_PRIVATE_KEY in environment.");
@@ -19,9 +21,7 @@ if (!SUI_PRIVATE_KEY) {
 
 const { secretKey } = decodeSuiPrivateKey(SUI_PRIVATE_KEY);
 const signer = Ed25519Keypair.fromSecretKey(secretKey);
-const client = new SuiClient({
-  url: NETWORK === "mainnet" ? getFullnodeUrl("mainnet") : getFullnodeUrl("testnet"),
-});
+const client = new SuiClient({ url: SUI_RPC_URL });
 
 const tableByName = new Map<string, string>();
 
@@ -107,6 +107,7 @@ async function main() {
     onchainExecutor: executeMove,
   });
 
+  console.log(`Using RPC: ${SUI_RPC_URL}`);
   const tableName = `orders_${Date.now()}`;
 
   const createRes = await db.execute(

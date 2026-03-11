@@ -38,6 +38,8 @@ copy .env.example .env
 ```env
 SUI_PRIVATE_KEY=suiprivkey1...
 SUI_NETWORK=testnet
+SUI_RPC_URL=https://fullnode.testnet.sui.io:443
+# If timeout, switch to another public RPC endpoint in your region
 WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
 WALRUS_SQL_CATALOG_ID=<Catalog object id from publish-output.txt>
 ```
