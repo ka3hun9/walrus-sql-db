@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { WalrusSqlClient } from "../src/index.js";
 
@@ -72,6 +72,26 @@ const cases: Case[] = [
   },
 ];
 
+function makeSafeName(input: string): string {
+  return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "case";
+}
+
+function buildMreSql(caseName: string, setup: string[], walrusSql: string, sqliteSql: string): string {
+  const lines: string[] = [];
+  lines.push(`-- MRE for: ${caseName}`);
+  lines.push("-- Setup");
+  for (const s of setup) lines.push(`${s};`);
+  lines.push("");
+  lines.push("-- Walrus SQL");
+  lines.push(`${walrusSql};`);
+  lines.push("");
+  lines.push("-- SQLite SQL (mapped when needed)");
+  lines.push(`${sqliteSql};`);
+  lines.push("");
+  lines.push("-- Hint: run both queries after setup and compare ordered JSON rows.");
+  return lines.join("\n");
+}
+
 function normalizeRows(rows: Row[]): string[] {
   return rows
     .map((r) => JSON.stringify(Object.keys(r).sort().reduce((acc, k) => ({ ...acc, [k]: r[k] }), {} as Row)))
@@ -110,17 +130,28 @@ print(json.dumps([dict(r) for r in cur.fetchall()], ensure_ascii=False))
 
 async function main() {
   const reportPath = process.argv[2] ?? "reports/sql-compare-report.json";
+  const mreDir = process.argv[3] ?? "reports/mre";
   const db = new WalrusSqlClient({ packageId: "0xdev", network: "sui-testnet", mode: "simulator" });
   for (const s of setupSql) await db.execute(s);
 
   const results: Array<Record<string, unknown>> = [];
   let failed = 0;
 
+  mkdirSync(dirname(reportPath), { recursive: true });
+  mkdirSync(mreDir, { recursive: true });
+
   for (const c of cases) {
     const walrusRows = (await db.query(c.walrusSql)).rows as Row[];
-    const sqliteRows = runSqlite(setupSql, c.sqliteSql ?? c.walrusSql);
+    const sqliteSql = c.sqliteSql ?? c.walrusSql;
+    const sqliteRows = runSqlite(setupSql, sqliteSql);
     const ok = rowsEqual(walrusRows, sqliteRows);
-    if (!ok) failed++;
+    if (!ok) {
+      failed++;
+      const safe = makeSafeName(`${c.category}-${c.name}`);
+      const mrePath = join(mreDir, `${safe}.sql`);
+      writeFileSync(mrePath, buildMreSql(`${c.category}/${c.name}`, setupSql, c.walrusSql, sqliteSql), "utf8");
+      console.log(`  MRE written: ${mrePath}`);
+    }
 
     console.log(`${ok ? "PASS" : "FAIL"} :: [${c.category}] ${c.name}`);
 
@@ -129,7 +160,7 @@ async function main() {
       name: c.name,
       ok,
       walrusSql: c.walrusSql,
-      sqliteSql: c.sqliteSql ?? c.walrusSql,
+      sqliteSql,
       walrusRows,
       sqliteRows,
     });
@@ -141,7 +172,6 @@ async function main() {
     failed,
   };
 
-  mkdirSync(dirname(reportPath), { recursive: true });
   writeFileSync(reportPath, JSON.stringify({ summary, results }, null, 2), "utf8");
   console.log(`Report written: ${reportPath}`);
 
