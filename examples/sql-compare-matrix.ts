@@ -66,6 +66,31 @@ const cases: Case[] = [
     sqliteSql: "SELECT o.id AS id FROM orders o WHERE EXISTS (SELECT u.id FROM users u WHERE u.id = o.user_id AND u.tier >= 2) ORDER BY o.id",
   },
   {
+    category: "expr",
+    name: "arith precedence",
+    walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id",
+  },
+  {
+    category: "expr",
+    name: "coalesce",
+    walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') = 'x' ORDER BY id",
+  },
+  {
+    category: "expr",
+    name: "nullif",
+    walrusSql: "SELECT id FROM users WHERE NULLIF(name, 'Bob') IS NULL ORDER BY id",
+  },
+  {
+    category: "expr",
+    name: "cast int",
+    walrusSql: "SELECT id FROM orders WHERE CAST(amount / 10 AS INT) >= 2 ORDER BY id",
+  },
+  {
+    category: "expr",
+    name: "case in where",
+    walrusSql: "SELECT id FROM orders WHERE CASE WHEN amount >= 25 THEN 1 ELSE 0 END = 1 ORDER BY id",
+  },
+  {
     category: "logic",
     name: "AND/OR precedence",
     walrusSql: "SELECT id FROM orders WHERE (status = 'paid' OR status = 'shipped') AND amount >= 20 ORDER BY id",

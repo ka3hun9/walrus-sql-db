@@ -292,7 +292,9 @@ export class WalrusSqlClient {
 
     if (parsed.groupBy?.length) {
       const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
-      const havingRows = parsed.having ? this.applyWhereClauses(grouped, this.parseWhere(parsed.having)) : grouped;
+      const havingRows = parsed.having
+        ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(parsed.having!)) === "TRUE")
+        : grouped;
       const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
       const pagedGrouped = this.applyPage(orderedGrouped, parsed.offset, parsed.limit);
       return {
@@ -468,9 +470,13 @@ export class WalrusSqlClient {
     const rowNumberExpr = rawFieldList.find((f) => /^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f));
     const rowNumberAlias = rowNumberExpr?.match(/\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i)?.[1] ?? "row_number";
 
-    const aggregateFieldExpr = rawFieldList.find((f) => /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i.test(f));
+    const aggregateFieldExpr = rawFieldList.find((f) =>
+      /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f),
+    );
 
-    const aggregateMatch = aggregateFieldExpr?.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
+    const aggregateMatch = aggregateFieldExpr?.match(
+      /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i,
+    );
     const aggregate = aggregateMatch?.[1]?.toUpperCase() as ParsedSelect["aggregate"] | undefined;
     const aggregateField = aggregateMatch?.[2];
 
@@ -828,6 +834,72 @@ export class WalrusSqlClient {
     }
   }
 
+  private findTopLevelComparator(expr: string): { left: string; op: ComparePredicate; right: string } | null {
+    let depth = 0;
+    let quote = "";
+    let word = "";
+    let caseDepth = 0;
+
+    const flushWord = () => {
+      if (!word) return;
+      const u = word.toUpperCase();
+      if (u === "CASE") caseDepth++;
+      else if (u === "END" && caseDepth > 0) caseDepth--;
+      word = "";
+    };
+
+    for (let i = 0; i < expr.length; i++) {
+      const ch = expr[i]!;
+
+      if (quote) {
+        if (ch === quote) quote = "";
+        continue;
+      }
+
+      if (ch === "'" || ch === '"') {
+        flushWord();
+        quote = ch;
+        continue;
+      }
+
+      if (/[a-zA-Z0-9_]/.test(ch)) {
+        word += ch;
+      } else {
+        flushWord();
+      }
+
+      if (ch === "(") {
+        depth++;
+        continue;
+      }
+      if (ch === ")") {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+
+      if (depth !== 0 || caseDepth !== 0) continue;
+
+      const two = expr.slice(i, i + 2);
+      if ([">=", "<=", "!=", "<>"] .includes(two)) {
+        return {
+          left: expr.slice(0, i).trim(),
+          op: two as ComparePredicate,
+          right: expr.slice(i + 2).trim(),
+        };
+      }
+
+      if (["=", ">", "<"].includes(ch)) {
+        return {
+          left: expr.slice(0, i).trim(),
+          op: ch as ComparePredicate,
+          right: expr.slice(i + 1).trim(),
+        };
+      }
+    }
+
+    return null;
+  }
+
   private parseAtomicWhereClause(token: string): WhereClause {
     const expr = this.trimOuterParentheses(token.trim());
 
@@ -949,14 +1021,14 @@ export class WalrusSqlClient {
       };
     }
 
-    const cmpMatch = expr.match(/^(.+?)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
+    const cmpMatch = this.findTopLevelComparator(expr);
     if (cmpMatch) {
-      const leftParsed = this.parseFieldExpr(cmpMatch[1]!);
+      const leftParsed = this.parseFieldExpr(cmpMatch.left);
       return {
         field: leftParsed.field,
         valueExpr: leftParsed.valueExpr,
-        op: cmpMatch[2] as CompareOp,
-        valueExprs: [cmpMatch[3]!.trim()],
+        op: cmpMatch.op as CompareOp,
+        valueExprs: [cmpMatch.right],
       };
     }
 
@@ -1206,9 +1278,6 @@ export class WalrusSqlClient {
     const s = input.trim();
     const cm = s.match(/^(.+)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*)$/i);
     if (cm) return { field: cm[2]!, valueExpr: cm[1]!.trim() };
-
-    const rm = s.match(/^(.+)\s+([a-zA-Z_][a-zA-Z0-9_\.]*)$/);
-    if (rm && /[\(\)+\-*/%\s]/.test(rm[1]!)) return { field: rm[2]!, valueExpr: rm[1]!.trim() };
 
     if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(s)) return { field: s };
     return { field: s, valueExpr: s };
