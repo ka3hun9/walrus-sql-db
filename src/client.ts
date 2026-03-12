@@ -1052,10 +1052,35 @@ export class WalrusSqlClient {
 
     if (fieldExpr === "*") return filtered.map((r) => ({ ...r }));
 
+    const aggMatch = fieldExpr.match(
+      /^([a-zA-Z_][a-zA-Z0-9_]*)\((\*|[a-zA-Z_][a-zA-Z0-9_\.]*)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*))?$/i,
+    );
+    if (aggMatch) {
+      const fn = aggMatch[1]!.toUpperCase();
+      const aggField = aggMatch[2]!;
+      const alias = aggMatch[3] ?? fn.toLowerCase();
+
+      if (fn === "COUNT") {
+        const count = aggField === "*"
+          ? filtered.length
+          : filtered.filter((r) => this.resolveRowValue(r, aggField) !== null && this.resolveRowValue(r, aggField) !== undefined).length;
+        return [{ [alias]: count }];
+      }
+
+      const nums = filtered
+        .map((r) => Number(this.resolveRowValue(r, aggField)))
+        .filter((n) => Number.isFinite(n));
+
+      if (fn === "SUM") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) : null }];
+      if (fn === "AVG") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null }];
+      if (fn === "MIN") return [{ [alias]: nums.length ? Math.min(...nums) : null }];
+      if (fn === "MAX") return [{ [alias]: nums.length ? Math.max(...nums) : null }];
+    }
+
     const fields = fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
     return filtered.map((row) => {
       const out: SqlRow = {};
-      for (const f of fields) out[f] = row[f] ?? null;
+      for (const f of fields) out[f] = this.resolveRowValue(row, f) ?? null;
       return out;
     });
   }

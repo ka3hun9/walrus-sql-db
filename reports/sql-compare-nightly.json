@@ -44,7 +44,7 @@
       "total": 5,
       "passed": 5,
       "failed": 0,
-      "xfail": 1,
+      "xfail": 0,
       "xpass": 0
     },
     {
@@ -1199,14 +1199,30 @@
     },
     {
       "category": "subquery",
-      "name": "scalar subquery compare mapped",
-      "ok": false,
+      "name": "scalar subquery compare",
+      "ok": true,
       "pass": true,
-      "expectedFail": true,
-      "xfailReason": "simulator scalar-subquery NULL propagation differs from SQLite null-filtered MIN mapping",
+      "expectedFail": false,
+      "xfailReason": null,
       "walrusSql": "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users) ORDER BY id",
       "sqliteSql": "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users WHERE tier IS NOT NULL) ORDER BY id",
-      "walrusRows": [],
+      "walrusRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
       "sqliteRows": [
         {
           "id": "o1"

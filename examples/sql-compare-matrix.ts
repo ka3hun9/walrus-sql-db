@@ -119,10 +119,9 @@ const nightlyCases: Case[] = [
   },
   {
     category: "subquery",
-    name: "scalar subquery compare mapped",
+    name: "scalar subquery compare",
     walrusSql: "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users) ORDER BY id",
     sqliteSql: "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users WHERE tier IS NOT NULL) ORDER BY id",
-    xfailReason: "simulator scalar-subquery NULL propagation differs from SQLite null-filtered MIN mapping",
   },
 ];
 
