@@ -9,7 +9,7 @@ import type {
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
 
-type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "LIKE" | "IS_NULL" | "IS_NOT_NULL";
+type CompareOp = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=" | "IN" | "NOT_IN" | "BETWEEN" | "NOT_BETWEEN" | "LIKE" | "NOT_LIKE" | "IS_NULL" | "IS_NOT_NULL";
 type LogicOp = "AND" | "OR";
 
 type WhereClause = {
@@ -22,6 +22,7 @@ type WhereClause = {
 
 type WhereExprNode =
   | { type: "clause"; clause: WhereClause }
+  | { type: "not"; node: WhereExprNode }
   | { type: "and" | "or"; left: WhereExprNode; right: WhereExprNode };
 
 type ParsedSelect = {
@@ -128,11 +129,12 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("UPDATE")) {
       const table = this.extractTableName(normalized, /UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      const { setField, setValue, whereField, whereValue } = this.parseUpdate(normalized);
+      const { setField, setValue, whereExpr } = this.parseUpdate(normalized);
+      const whereTree = this.parseWhereTree(whereExpr);
       const bucket = this.requireTable(table);
       let touched = 0;
       for (const row of bucket) {
-        if (String(row[whereField]) === whereValue) {
+        if (this.evaluateWhereTree(row, whereTree)) {
           row[setField] = this.castValue(setValue);
           touched++;
         }
@@ -146,9 +148,10 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DELETE FROM")) {
       const table = this.extractTableName(normalized, /DELETE FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      const { whereField, whereValue } = this.parseDelete(normalized);
+      const { whereExpr } = this.parseDelete(normalized);
+      const whereTree = this.parseWhereTree(whereExpr);
       const bucket = this.requireTable(table);
-      const next = bucket.filter((row) => String(row[whereField]) !== whereValue);
+      const next = bucket.filter((row) => !this.evaluateWhereTree(row, whereTree));
       const touched = bucket.length - next.length;
       this.tables.set(table, next);
       return {
@@ -319,27 +322,25 @@ export class WalrusSqlClient {
     return row;
   }
 
-  private parseUpdate(sql: string): { setField: string; setValue: string; whereField: string; whereValue: string } {
+  private parseUpdate(sql: string): { setField: string; setValue: string; whereExpr: string } {
     const m = sql.match(
-      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i,
+      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)\s+WHERE\s+(.+)/i,
     );
     if (!m) throw new Error(`Unsupported UPDATE syntax: ${sql}`);
     return {
       setField: m[1].trim(),
       setValue: this.trimQuoted(m[2].trim()),
-      whereField: m[3].trim(),
-      whereValue: this.trimQuoted(m[4].trim()),
+      whereExpr: m[3].trim(),
     };
   }
 
-  private parseDelete(sql: string): { whereField: string; whereValue: string } {
+  private parseDelete(sql: string): { whereExpr: string } {
     const m = sql.match(
-      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)/i,
+      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+(.+)/i,
     );
     if (!m) throw new Error(`Unsupported DELETE syntax: ${sql}`);
     return {
-      whereField: m[1].trim(),
-      whereValue: this.trimQuoted(m[2].trim()),
+      whereExpr: m[1].trim(),
     };
   }
 
@@ -533,6 +534,14 @@ export class WalrusSqlClient {
   private parseWhereTree(whereExpr: string): WhereExprNode {
     const expr = this.trimOuterParentheses(whereExpr.trim());
 
+    const notMatch = expr.match(/^NOT\s+(.+)$/i);
+    if (notMatch) {
+      return {
+        type: "not",
+        node: this.parseWhereTree(notMatch[1].trim()),
+      };
+    }
+
     const orSplit = this.findTopLevelLogic(expr, "OR");
     if (orSplit) {
       return {
@@ -551,7 +560,7 @@ export class WalrusSqlClient {
       };
     }
 
-    return { type: "clause", clause: this.parseWhere(expr)[0]! };
+    return { type: "clause", clause: this.parseAtomicWhereClause(expr) };
   }
 
   private trimOuterParentheses(expr: string): string {
@@ -576,13 +585,52 @@ export class WalrusSqlClient {
 
   private findTopLevelLogic(expr: string, op: "AND" | "OR"): { left: string; right: string } | null {
     let depth = 0;
+    let quote = "";
+    let pendingBetween = false;
+    let word = "";
+
+    const flushWord = () => {
+      if (!word) return;
+      if (word.toUpperCase() === "BETWEEN") pendingBetween = true;
+      word = "";
+    };
+
     const needle = ` ${op} `;
     for (let i = 0; i <= expr.length - needle.length; i++) {
       const ch = expr[i];
-      if (ch === "(") depth++;
-      else if (ch === ")") depth = Math.max(0, depth - 1);
+
+      if (quote) {
+        if (ch === quote) quote = "";
+        continue;
+      }
+
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+
+      if (ch === "(") {
+        depth++;
+        flushWord();
+        continue;
+      }
+      if (ch === ")") {
+        depth = Math.max(0, depth - 1);
+        flushWord();
+        continue;
+      }
+
+      if (/\s/.test(ch)) {
+        flushWord();
+      } else {
+        word += ch;
+      }
 
       if (depth === 0 && expr.slice(i, i + needle.length).toUpperCase() === needle) {
+        if (op === "AND" && pendingBetween) {
+          pendingBetween = false;
+          continue;
+        }
         return {
           left: expr.slice(0, i).trim(),
           right: expr.slice(i + needle.length).trim(),
@@ -597,6 +645,9 @@ export class WalrusSqlClient {
     const out: string[] = [];
     let buf = "";
     let depth = 0;
+    let quote = "";
+    let pendingBetween = false;
+    let word = "";
 
     const flush = () => {
       const t = buf.trim();
@@ -604,17 +655,62 @@ export class WalrusSqlClient {
       buf = "";
     };
 
+    const flushWord = () => {
+      if (!word) return;
+      if (word.toUpperCase() === "BETWEEN") pendingBetween = true;
+      word = "";
+    };
+
     for (let i = 0; i < src.length; i++) {
       const ch = src[i];
-      if (ch === "(") depth++;
-      if (ch === ")") depth = Math.max(0, depth - 1);
+
+      if (quote) {
+        buf += ch;
+        if (ch === quote) quote = "";
+        continue;
+      }
+
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        buf += ch;
+        continue;
+      }
+
+      if (ch === "(") {
+        depth++;
+        flushWord();
+        buf += ch;
+        continue;
+      }
+      if (ch === ")") {
+        depth = Math.max(0, depth - 1);
+        flushWord();
+        buf += ch;
+        continue;
+      }
+
+      if (/\s/.test(ch)) {
+        flushWord();
+      } else {
+        word += ch;
+      }
 
       if (depth === 0) {
         const rest = src.slice(i).toUpperCase();
-        if (rest.startsWith(" AND ") || rest.startsWith(" OR ")) {
+        if (rest.startsWith(" AND ")) {
+          if (pendingBetween) {
+            pendingBetween = false;
+          } else {
+            flush();
+            out.push("AND");
+            i += 4;
+            continue;
+          }
+        }
+        if (rest.startsWith(" OR ")) {
           flush();
-          out.push(rest.startsWith(" AND ") ? "AND" : "OR");
-          i += rest.startsWith(" AND ") ? 4 : 3;
+          out.push("OR");
+          i += 3;
           continue;
         }
       }
@@ -634,6 +730,66 @@ export class WalrusSqlClient {
     }
   }
 
+  private parseAtomicWhereClause(token: string): WhereClause {
+    const expr = this.trimOuterParentheses(token.trim());
+
+    const nullMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+    if (nullMatch) {
+      return {
+        field: nullMatch[1],
+        op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
+      };
+    }
+
+    const betweenMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+    if (betweenMatch) {
+      return {
+        field: betweenMatch[1],
+        op: betweenMatch[2] ? "NOT_BETWEEN" : "BETWEEN",
+        values: [this.castValue(betweenMatch[3]), this.castValue(betweenMatch[4])],
+      };
+    }
+
+    const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+)$/i);
+    if (likeMatch) {
+      return {
+        field: likeMatch[1],
+        op: likeMatch[2] ? "NOT_LIKE" : "LIKE",
+        value: this.castValue(likeMatch[3]),
+      };
+    }
+
+    const inSubqueryMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\(\s*SELECT\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/i);
+    if (inSubqueryMatch) {
+      const subRows = this.requireTable(inSubqueryMatch[4]);
+      return {
+        field: inSubqueryMatch[1],
+        op: inSubqueryMatch[2] ? "NOT_IN" : "IN",
+        values: subRows.map((r) => r[inSubqueryMatch[3]] ?? null),
+      };
+    }
+
+    const inMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]+)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
+    if (inMatch) {
+      return {
+        field: inMatch[1],
+        op: inMatch[2] ? "NOT_IN" : "IN",
+        values: this.smartSplit(inMatch[3]).map((v) => this.castValue(v)),
+      };
+    }
+
+    const cmpMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
+    if (cmpMatch) {
+      return {
+        field: cmpMatch[1],
+        op: cmpMatch[2] as CompareOp,
+        value: this.castValue(cmpMatch[3]),
+      };
+    }
+
+    throw new Error(`Unsupported WHERE expression: ${token}`);
+  }
+
   private parseWhere(whereExpr: string): WhereClause[] {
     const tokens = this.splitWhereTokens(whereExpr);
     const out: WhereClause[] = [];
@@ -646,63 +802,9 @@ export class WalrusSqlClient {
         continue;
       }
 
-      const nullMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
-      if (nullMatch) {
-        out.push({
-          logic: pendingLogic,
-          field: nullMatch[1],
-          op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
-        });
-        pendingLogic = undefined;
-        continue;
-      }
-
-      const likeMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+LIKE\s+(.+)$/i);
-      if (likeMatch) {
-        out.push({
-          logic: pendingLogic,
-          field: likeMatch[1],
-          op: "LIKE",
-          value: this.castValue(likeMatch[2]),
-        });
-        pendingLogic = undefined;
-        continue;
-      }
-
-      const inSubqueryMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IN\s*\(\s*SELECT\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)$/i);
-      if (inSubqueryMatch) {
-        const subRows = this.requireTable(inSubqueryMatch[3]);
-        out.push({
-          logic: pendingLogic,
-          field: inSubqueryMatch[1],
-          op: "IN",
-          values: subRows.map((r) => r[inSubqueryMatch[2]] ?? null),
-        });
-        pendingLogic = undefined;
-        continue;
-      }
-
-      const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]+)\s+IN\s*\((.+)\)$/i);
-      if (inMatch) {
-        out.push({
-          logic: pendingLogic,
-          field: inMatch[1],
-          op: "IN",
-          values: this.smartSplit(inMatch[2]).map((v) => this.castValue(v)),
-        });
-        pendingLogic = undefined;
-        continue;
-      }
-
-      const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
-      if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
-
-      out.push({
-        logic: pendingLogic,
-        field: cmpMatch[1],
-        op: cmpMatch[2] as CompareOp,
-        value: this.castValue(cmpMatch[3]),
-      });
+      const clause = this.parseAtomicWhereClause(token);
+      clause.logic = pendingLogic;
+      out.push(clause);
       pendingLogic = undefined;
     }
 
@@ -711,6 +813,7 @@ export class WalrusSqlClient {
 
   private evaluateWhereTree(row: SqlRow, node: WhereExprNode): boolean {
     if (node.type === "clause") return this.evaluateClause(row, node.clause);
+    if (node.type === "not") return !this.evaluateWhereTree(row, node.node);
     if (node.type === "and") return this.evaluateWhereTree(row, node.left) && this.evaluateWhereTree(row, node.right);
     return this.evaluateWhereTree(row, node.left) || this.evaluateWhereTree(row, node.right);
   }
@@ -739,11 +842,23 @@ export class WalrusSqlClient {
       return (clause.values ?? []).some((v) => this.eq(left, v));
     }
 
+    if (clause.op === "NOT_IN") {
+      return !(clause.values ?? []).some((v) => this.eq(left, v));
+    }
+
+    if (clause.op === "BETWEEN" || clause.op === "NOT_BETWEEN") {
+      const lower = clause.values?.[0];
+      const upper = clause.values?.[1];
+      const inRange = this.compare(left, lower) >= 0 && this.compare(left, upper) <= 0;
+      return clause.op === "BETWEEN" ? inRange : !inRange;
+    }
+
     const right = clause.value;
     switch (clause.op) {
       case "=":
         return this.eq(left, right);
       case "!=":
+      case "<>":
         return !this.eq(left, right);
       case ">":
         return this.compare(left, right) > 0;
@@ -753,12 +868,14 @@ export class WalrusSqlClient {
         return this.compare(left, right) >= 0;
       case "<=":
         return this.compare(left, right) <= 0;
-      case "LIKE": {
+      case "LIKE":
+      case "NOT_LIKE": {
         const pattern = String(right ?? "")
           .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
           .replace(/%/g, ".*")
           .replace(/_/g, ".");
-        return new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+        const matched = new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+        return clause.op === "LIKE" ? matched : !matched;
       }
       case "IS_NULL":
         return left === null || left === undefined;
