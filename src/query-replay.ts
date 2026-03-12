@@ -46,6 +46,9 @@ type WhereClause = {
   op: CompareOp;
   value?: SqlPrimitive;
   values?: SqlPrimitive[];
+  valueExpr?: string;
+  valueExprs?: string[];
+  likeEscape?: string;
 };
 
 type ReplayCache = {
@@ -191,50 +194,332 @@ function splitWhereTokens(whereExpr: string): string[] {
   return out;
 }
 
-function parseAtomicWhereClause(token: string): WhereClause {
-  const expr = token.trim().replace(/^\((.*)\)$/s, "$1").trim();
+function trimOuterParentheses(expr: string): string {
+  let out = expr.trim();
+  while (out.startsWith("(") && out.endsWith(")")) {
+    let depth = 0;
+    let valid = true;
+    let quote = "";
+    for (let i = 0; i < out.length; i++) {
+      const ch = out[i]!;
+      if (quote) {
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      if (depth === 0 && i < out.length - 1) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) break;
+    out = out.slice(1, -1).trim();
+  }
+  return out;
+}
 
-  const nullMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+function parseFieldExpr(input: string): { field: string; valueExpr?: string } {
+  const s = input.trim();
+  const cm = s.match(/^(.+)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*)$/i);
+  if (cm) return { field: cm[2]!, valueExpr: cm[1]!.trim() };
+  if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(s)) return { field: s };
+  return { field: s, valueExpr: s };
+}
+
+function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
+  const expr = trimOuterParentheses(exprRaw.trim());
+
+  const caseMatch = expr.match(/^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+END$/i);
+  if (caseMatch) {
+    const condRows = applyWhereClauses([row], parseWhere(caseMatch[1]!));
+    const branch = condRows.length ? caseMatch[2]! : caseMatch[3]!;
+    return evalExpr(row, branch);
+  }
+
+  const coalesceMatch = expr.match(/^COALESCE\((.+)\)$/i);
+  if (coalesceMatch) {
+    for (const p of smartSplit(coalesceMatch[1]!)) {
+      const v = evalExpr(row, p);
+      if (v !== null && v !== undefined) return v;
+    }
+    return null;
+  }
+
+  const nullifMatch = expr.match(/^NULLIF\((.+),(.+)\)$/i);
+  if (nullifMatch) {
+    const a = evalExpr(row, nullifMatch[1]!);
+    const b = evalExpr(row, nullifMatch[2]!);
+    return eq(a, b) ? null : a;
+  }
+
+  const castMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL)\)$/i);
+  if (castMatch) {
+    const v = evalExpr(row, castMatch[1]!);
+    const t = castMatch[2]!.toUpperCase();
+    if (v == null) return null;
+    if (t === "TEXT") return String(v);
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    if (t === "INT" || t === "INTEGER") return Math.trunc(n);
+    return n;
+  }
+
+  if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return row[expr] as SqlPrimitive | undefined;
+
+  const lit = castValue(expr);
+  if (expr.startsWith("'") || expr.startsWith('"') || typeof lit !== "string") return lit;
+
+  const toks = tokenizeExpr(expr);
+  if (!toks.length) return null;
+  return evalRpn(row, toRpn(toks));
+}
+
+function tokenizeExpr(expr: string): string[] {
+  const out: string[] = [];
+  let buf = "";
+  let quote = "";
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]!;
+    if (quote) {
+      buf += ch;
+      if (ch === quote) {
+        out.push(buf);
+        buf = "";
+        quote = "";
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (buf.trim()) out.push(buf.trim());
+      buf = ch;
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (buf.trim()) out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    if ("()+-*/%".includes(ch)) {
+      if (buf.trim()) out.push(buf.trim());
+      out.push(ch);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+function toRpn(tokens: string[]): string[] {
+  const out: string[] = [];
+  const ops: string[] = [];
+  const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "u-": 3 };
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t === "(") {
+      ops.push(t);
+      continue;
+    }
+    if (t === ")") {
+      while (ops.length && ops[ops.length - 1] !== "(") out.push(ops.pop()!);
+      ops.pop();
+      continue;
+    }
+    if (["+", "-", "*", "/", "%"].includes(t)) {
+      const prev = tokens[i - 1];
+      const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%"].includes(prev!));
+      const op = unary ? "u-" : t;
+      while (ops.length && pri[ops[ops.length - 1]!] >= pri[op]) out.push(ops.pop()!);
+      ops.push(op);
+      continue;
+    }
+    out.push(t);
+  }
+
+  while (ops.length) out.push(ops.pop()!);
+  return out;
+}
+
+function evalRpn(row: SqlRow, rpn: string[]): SqlPrimitive | undefined {
+  const st: Array<SqlPrimitive | undefined> = [];
+  for (const t of rpn) {
+    if (t === "u-") {
+      const a = st.pop();
+      if (a == null) st.push(null);
+      else {
+        const n = Number(a);
+        st.push(Number.isFinite(n) ? -n : null);
+      }
+      continue;
+    }
+    if (["+", "-", "*", "/", "%"].includes(t)) {
+      const b = st.pop();
+      const a = st.pop();
+      if (a == null || b == null) {
+        st.push(null);
+        continue;
+      }
+      const an = Number(a);
+      const bn = Number(b);
+      if (!Number.isFinite(an) || !Number.isFinite(bn)) {
+        st.push(null);
+        continue;
+      }
+      if (t === "+") st.push(an + bn);
+      else if (t === "-") st.push(an - bn);
+      else if (t === "*") st.push(an * bn);
+      else if (t === "/") st.push(bn === 0 ? null : an / bn);
+      else st.push(bn === 0 ? null : an % bn);
+      continue;
+    }
+
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(t)) st.push(row[t] as SqlPrimitive | undefined);
+    else st.push(castValue(t));
+  }
+  return st.length ? st[st.length - 1] : null;
+}
+
+function findTopLevelComparator(expr: string): { left: string; op: ComparePredicate; right: string } | null {
+  let depth = 0;
+  let quote = "";
+  let word = "";
+  let caseDepth = 0;
+
+  const flushWord = () => {
+    if (!word) return;
+    const u = word.toUpperCase();
+    if (u === "CASE") caseDepth++;
+    else if (u === "END" && caseDepth > 0) caseDepth--;
+    word = "";
+  };
+
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]!;
+
+    if (quote) {
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      flushWord();
+      quote = ch;
+      continue;
+    }
+
+    if (/[a-zA-Z0-9_]/.test(ch)) word += ch;
+    else flushWord();
+
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+
+    if (depth !== 0 || caseDepth !== 0) continue;
+
+    const two = expr.slice(i, i + 2);
+    if ([">=", "<=", "!=", "<>"] .includes(two)) {
+      return { left: expr.slice(0, i).trim(), op: two as ComparePredicate, right: expr.slice(i + 2).trim() };
+    }
+    if (["=", ">", "<"].includes(ch)) {
+      return { left: expr.slice(0, i).trim(), op: ch as ComparePredicate, right: expr.slice(i + 1).trim() };
+    }
+  }
+
+  return null;
+}
+
+function likeToRegex(patternRaw: string, escapeChar?: string): string {
+  const escaped = /[.*+?^${}()|[\]\\]/;
+  let out = "";
+
+  for (let i = 0; i < patternRaw.length; i++) {
+    const ch = patternRaw[i]!;
+    if (escapeChar && ch === escapeChar) {
+      const next = patternRaw[i + 1];
+      if (next !== undefined) {
+        out += escaped.test(next) ? `\\${next}` : next;
+        i++;
+        continue;
+      }
+    }
+
+    if (ch === "%") out += ".*";
+    else if (ch === "_") out += ".";
+    else out += escaped.test(ch) ? `\\${ch}` : ch;
+  }
+
+  return `^${out}$`;
+}
+
+function parseAtomicWhereClause(token: string): WhereClause {
+  const expr = trimOuterParentheses(token.trim());
+
+  const nullMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?NULL$/i);
   if (nullMatch) {
+    const left = parseFieldExpr(nullMatch[1]!);
     return {
-      field: nullMatch[1],
+      field: left.field,
+      valueExpr: left.valueExpr,
       op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
     };
   }
 
-  const betweenMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+  const betweenMatch = expr.match(/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
   if (betweenMatch) {
+    const left = parseFieldExpr(betweenMatch[1]!);
     return {
-      field: betweenMatch[1],
+      field: left.field,
+      valueExpr: left.valueExpr,
       op: betweenMatch[2] ? "NOT_BETWEEN" : "BETWEEN",
-      values: [castValue(betweenMatch[3]), castValue(betweenMatch[4])],
+      valueExprs: [betweenMatch[3]!.trim(), betweenMatch[4]!.trim()],
     };
   }
 
-  const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+)$/i);
+  const likeMatch = expr.match(/^(.+?)\s+(NOT\s+)?LIKE\s+(.+?)(?:\s+ESCAPE\s+(.+))?$/i);
   if (likeMatch) {
+    const left = parseFieldExpr(likeMatch[1]!);
+    const escRaw = likeMatch[4] ? trimQuoted(likeMatch[4].trim()) : undefined;
+    const esc = escRaw && escRaw.length > 0 ? escRaw[0] : undefined;
     return {
-      field: likeMatch[1],
+      field: left.field,
+      valueExpr: left.valueExpr,
       op: likeMatch[2] ? "NOT_LIKE" : "LIKE",
-      value: castValue(likeMatch[3]),
+      valueExprs: [likeMatch[3]!.trim()],
+      likeEscape: esc,
     };
   }
 
-  const inMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
+  const inMatch = expr.match(/^(.+?)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
   if (inMatch) {
+    const left = parseFieldExpr(inMatch[1]!);
     return {
-      field: inMatch[1],
+      field: left.field,
+      valueExpr: left.valueExpr,
       op: inMatch[2] ? "NOT_IN" : "IN",
-      values: smartSplit(inMatch[3]).map((v) => castValue(v)),
+      valueExprs: smartSplit(inMatch[3]).map((v) => v.trim()),
     };
   }
 
-  const cmpMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
-  if (cmpMatch) {
+  const cmp = findTopLevelComparator(expr);
+  if (cmp) {
+    const left = parseFieldExpr(cmp.left);
     return {
-      field: cmpMatch[1],
-      op: cmpMatch[2] as CompareOp,
-      value: castValue(cmpMatch[3]),
+      field: left.field,
+      valueExpr: left.valueExpr,
+      op: cmp.op as CompareOp,
+      valueExprs: [cmp.right],
     };
   }
 
@@ -315,10 +600,10 @@ function tvOr(a: TruthValue, b: TruthValue): TruthValue {
 }
 
 function evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
-  const left = row[clause.field];
+  const left = clause.valueExpr ? evalExpr(row, clause.valueExpr) : (row[clause.field] as SqlPrimitive | undefined);
 
   if (clause.op === "IN" || clause.op === "NOT_IN") {
-    const values = clause.values ?? [];
+    const values = (clause.valueExprs?.length ? clause.valueExprs.map((v) => evalExpr(row, v) ?? null) : clause.values) ?? [];
     let hasUnknown = false;
     for (const v of values) {
       const t = compareByOp(left, v, "=");
@@ -330,13 +615,13 @@ function evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
   }
 
   if (clause.op === "BETWEEN" || clause.op === "NOT_BETWEEN") {
-    const lower = clause.values?.[0];
-    const upper = clause.values?.[1];
+    const lower = clause.valueExprs?.[0] ? evalExpr(row, clause.valueExprs[0]) : clause.values?.[0];
+    const upper = clause.valueExprs?.[1] ? evalExpr(row, clause.valueExprs[1]) : clause.values?.[1];
     const inRange = tvAnd(compareByOp(left, lower, ">="), compareByOp(left, upper, "<="));
     return clause.op === "BETWEEN" ? inRange : tvNot(inRange);
   }
 
-  const right = clause.value;
+  const right = clause.valueExprs?.[0] ? evalExpr(row, clause.valueExprs[0]) : clause.value;
   switch (clause.op) {
     case "=":
     case "!=":
@@ -349,11 +634,8 @@ function evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     case "LIKE":
     case "NOT_LIKE": {
       if (left == null || right == null) return "UNKNOWN";
-      const pattern = String(right ?? "")
-        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-        .replace(/%/g, ".*")
-        .replace(/_/g, ".");
-      const matched = new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+      const regex = likeToRegex(String(right ?? ""), clause.likeEscape);
+      const matched = new RegExp(regex, "i").test(String(left ?? ""));
       const tv: TruthValue = matched ? "TRUE" : "FALSE";
       return clause.op === "LIKE" ? tv : tvNot(tv);
     }
