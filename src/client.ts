@@ -50,6 +50,7 @@ type WhereClause = {
   value?: SqlPrimitive;
   values?: SqlPrimitive[];
   compareOp?: ComparePredicate;
+  likeEscape?: string;
 };
 
 type WhereExprNode =
@@ -858,12 +859,15 @@ export class WalrusSqlClient {
       };
     }
 
-    const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+)$/i);
+    const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+?)(?:\s+ESCAPE\s+(.+))?$/i);
     if (likeMatch) {
+      const escRaw = likeMatch[4] ? this.trimQuoted(likeMatch[4].trim()) : undefined;
+      const esc = escRaw && escRaw.length > 0 ? escRaw[0] : undefined;
       return {
         field: likeMatch[1],
         op: likeMatch[2] ? "NOT_LIKE" : "LIKE",
         value: this.castValue(likeMatch[3]),
+        likeEscape: esc,
       };
     }
 
@@ -1036,6 +1040,33 @@ export class WalrusSqlClient {
     });
   }
 
+  private likeToRegex(patternRaw: string, escapeChar?: string): string {
+    const escaped = /[.*+?^${}()|[\]\\]/;
+    let out = "";
+
+    for (let i = 0; i < patternRaw.length; i++) {
+      const ch = patternRaw[i]!;
+      if (escapeChar && ch === escapeChar) {
+        const next = patternRaw[i + 1];
+        if (next !== undefined) {
+          out += escaped.test(next) ? `\\${next}` : next;
+          i++;
+          continue;
+        }
+      }
+
+      if (ch === "%") {
+        out += ".*";
+      } else if (ch === "_") {
+        out += ".";
+      } else {
+        out += escaped.test(ch) ? `\\${ch}` : ch;
+      }
+    }
+
+    return `^${out}$`;
+  }
+
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     const left = row[clause.field];
 
@@ -1108,11 +1139,8 @@ export class WalrusSqlClient {
       case "LIKE":
       case "NOT_LIKE": {
         if (left == null || right == null) return "UNKNOWN";
-        const pattern = String(right ?? "")
-          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-          .replace(/%/g, ".*")
-          .replace(/_/g, ".");
-        const matched = new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+        const regex = this.likeToRegex(String(right ?? ""), clause.likeEscape);
+        const matched = new RegExp(regex, "i").test(String(left ?? ""));
         const tv: TruthValue = matched ? "TRUE" : "FALSE";
         return clause.op === "LIKE" ? tv : this.tvNot(tv);
       }
