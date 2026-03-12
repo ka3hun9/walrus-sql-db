@@ -14,6 +14,7 @@ npm run sql:join
 npm run sql:roadmap
 npm run sql:compare
 npm run sql:compare:sqlite
+npm run sql:compare:matrix
 npm run onchain:select-replay
 ```
 
