@@ -28,10 +28,28 @@ npm run build
 npm run sql:advanced
 npm run sql:join
 npm run sql:roadmap
+npm run sql:compare
+npm run sql:compare:sqlite
+npm run sql:compare:matrix
+npm run sql:compare:matrix:category -- compare
+npm run sql:compare:matrix:nightly
+npm run sql:verify:full
 npm run onchain:select-replay
 npm run onchain:join-replay
 npm run onchain:benchmark-replay
 ```
+
+## CI / Verification
+
+- PR workflow: category-parallel matrix checks + roadmap smoke
+- Nightly workflow: extended matrix profile
+- Full local verification:
+
+```bash
+npm run sql:verify:full
+```
+
+Matrix reports include per-category summary and support XFAIL/XPASS markers.
 
 ## Env
 

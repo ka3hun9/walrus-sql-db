@@ -28,10 +28,28 @@ npm run build
 npm run sql:advanced
 npm run sql:join
 npm run sql:roadmap
+npm run sql:compare
+npm run sql:compare:sqlite
+npm run sql:compare:matrix
+npm run sql:compare:matrix:category -- compare
+npm run sql:compare:matrix:nightly
+npm run sql:verify:full
 npm run onchain:select-replay
 npm run onchain:join-replay
 npm run onchain:benchmark-replay
 ```
+
+## CI / 验证
+
+- PR 工作流：按 category 并行矩阵校验 + roadmap smoke
+- Nightly 工作流：扩展矩阵 profile
+- 本地全量验收：
+
+```bash
+npm run sql:verify:full
+```
+
+矩阵报告包含按类别汇总，并支持 XFAIL/XPASS 标记。
 
 ## 环境变量
 

@@ -17,6 +17,7 @@ npm run sql:compare:sqlite
 npm run sql:compare:matrix
 npm run sql:compare:matrix:category -- compare
 npm run sql:compare:matrix:nightly
+npm run sql:verify:full
 npm run onchain:select-replay
 ```
 
