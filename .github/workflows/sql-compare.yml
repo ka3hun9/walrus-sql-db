@@ -6,8 +6,22 @@ on:
     branches: [main]
 
 jobs:
-  sql-compare-pr:
+  prep:
     runs-on: ubuntu-latest
+    outputs:
+      categories: ${{ steps.cats.outputs.categories }}
+    steps:
+      - name: Set category matrix
+        id: cats
+        run: echo 'categories=["compare","null-3vl","like","in-between","subquery","correlated","expr","logic","having"]' >> $GITHUB_OUTPUT
+
+  sql-compare-by-category:
+    runs-on: ubuntu-latest
+    needs: prep
+    strategy:
+      fail-fast: false
+      matrix:
+        category: ${{ fromJson(needs.prep.outputs.categories) }}
 
     steps:
       - name: Checkout
@@ -30,24 +44,42 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: SQL roadmap smoke
-        run: npm run sql:roadmap
+      - name: SQL matrix compare by category
+        run: npm run sql:compare:matrix:category -- ${{ matrix.category }}
 
-      - name: SQLite matrix compare (PR profile)
-        run: npm run sql:compare:matrix
-
-      - name: Upload compare report
+      - name: Upload category report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sql-compare-report
-          path: reports/sql-compare-report.json
+          name: sql-compare-${{ matrix.category }}-report
+          path: reports/sql-compare-category.json
           if-no-files-found: ignore
 
-      - name: Upload MRE files (if any)
+      - name: Upload category MRE files (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sql-compare-mre
+          name: sql-compare-${{ matrix.category }}-mre
           path: reports/mre
           if-no-files-found: ignore
+
+  sql-roadmap-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: SQL roadmap smoke
+        run: npm run sql:roadmap

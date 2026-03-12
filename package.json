@@ -20,6 +20,7 @@
     "sql:compare": "tsx examples/sql-compare-baseline.ts",
     "sql:compare:sqlite": "tsx examples/sql-compare-sqlite.ts",
     "sql:compare:matrix": "tsx examples/sql-compare-matrix.ts",
+    "sql:compare:matrix:category": "tsx examples/sql-compare-matrix.ts reports/sql-compare-category.json reports/mre pr",
     "sql:compare:matrix:nightly": "tsx examples/sql-compare-matrix.ts reports/sql-compare-nightly.json reports/mre nightly",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"

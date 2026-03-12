@@ -177,11 +177,34 @@ print(json.dumps([dict(r) for r in cur.fetchall()], ensure_ascii=False))
   return JSON.parse(out.stdout.trim() || "[]") as Row[];
 }
 
+function printCategorySummary(
+  profile: Profile,
+  categorySummary: Array<{ category: string; total: number; passed: number; failed: number; xfail: number; xpass: number }>,
+): void {
+  console.log(`Category summary (${profile}):`);
+  for (const s of categorySummary) {
+    console.log(
+      `  - ${s.category}: total=${s.total}, passed=${s.passed}, failed=${s.failed}, xfail=${s.xfail}, xpass=${s.xpass}`,
+    );
+  }
+}
+
+function parseCategoriesArg(raw?: string): Set<string> | null {
+  if (!raw) return null;
+  const items = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return items.length ? new Set(items) : null;
+}
+
 async function main() {
   const reportPath = process.argv[2] ?? "reports/sql-compare-report.json";
   const mreDir = process.argv[3] ?? "reports/mre";
   const profile = ((process.argv[4] ?? "pr").toLowerCase() as Profile);
-  const selected = profile === "nightly" ? [...baseCases, ...nightlyCases] : baseCases;
+  const categoryFilter = parseCategoriesArg(process.argv[5]);
+  const selectedRaw = profile === "nightly" ? [...baseCases, ...nightlyCases] : baseCases;
+  const selected = categoryFilter ? selectedRaw.filter((c) => categoryFilter.has(c.category)) : selectedRaw;
 
   const db = new WalrusSqlClient({ packageId: "0xdev", network: "sui-testnet", mode: "simulator" });
   for (const s of setupSql) await db.execute(s);
@@ -236,12 +259,14 @@ async function main() {
 
   const summary = {
     profile,
+    categoryFilter: categoryFilter ? [...categoryFilter] : null,
     total: selected.length,
     passed: selected.length - failed,
     failed,
   };
 
   writeFileSync(reportPath, JSON.stringify({ summary, categorySummary, results }, null, 2), "utf8");
+  printCategorySummary(profile, categorySummary);
   console.log(`Report written: ${reportPath}`);
 
   if (failed) throw new Error(`SQLite matrix compare failed: ${failed}/${selected.length}`);

@@ -1,6 +1,7 @@
 {
   "summary": {
     "profile": "nightly",
+    "categoryFilter": null,
     "total": 39,
     "passed": 39,
     "failed": 0

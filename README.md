@@ -15,6 +15,7 @@ npm run sql:roadmap
 npm run sql:compare
 npm run sql:compare:sqlite
 npm run sql:compare:matrix
+npm run sql:compare:matrix:category -- compare
 npm run sql:compare:matrix:nightly
 npm run onchain:select-replay
 ```
@@ -26,9 +27,8 @@ GitHub Actions workflows:
 - `.github/workflows/sql-compare-nightly.yml` (nightly extended profile)
 
 PR/push workflow runs:
-- `npm run build`
+- Category-parallel matrix jobs via `npm run sql:compare:matrix:category -- <category>`
 - `npm run sql:roadmap`
-- `npm run sql:compare:matrix`
 
 Nightly workflow runs:
 - `npm run build`
@@ -40,6 +40,7 @@ Artifacts:
 
 Note:
 - Nightly profile can contain explicit `XFAIL` cases for known semantic gaps.
+- Matrix runner prints per-category summary to console and JSON report.
 
 ## Key Scripts
 
