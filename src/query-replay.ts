@@ -35,8 +35,10 @@ type Payload =
     };
 
 type Cursor = { txDigest: string; eventSeq: string } | null | undefined;
-type CompareOp = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "LIKE" | "IS_NULL" | "IS_NOT_NULL";
+type CompareOp = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=" | "IN" | "NOT_IN" | "BETWEEN" | "NOT_BETWEEN" | "LIKE" | "NOT_LIKE" | "IS_NULL" | "IS_NOT_NULL";
 type LogicOp = "AND" | "OR";
+type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
+type ComparePredicate = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=";
 
 type WhereClause = {
   logic?: LogicOp;
@@ -107,9 +109,140 @@ function smartSplit(input: string): string[] {
   return out;
 }
 
+function splitWhereTokens(whereExpr: string): string[] {
+  const src = whereExpr.trim();
+  const out: string[] = [];
+  let buf = "";
+  let depth = 0;
+  let quote = "";
+  let pendingBetween = false;
+  let word = "";
+
+  const flush = () => {
+    const t = buf.trim();
+    if (t) out.push(t);
+    buf = "";
+  };
+
+  const flushWord = () => {
+    if (!word) return;
+    if (word.toUpperCase() === "BETWEEN") pendingBetween = true;
+    word = "";
+  };
+
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]!;
+
+    if (quote) {
+      buf += ch;
+      if (ch === quote) quote = "";
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+
+    if (ch === "(") {
+      depth++;
+      flushWord();
+      buf += ch;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      flushWord();
+      buf += ch;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      flushWord();
+    } else {
+      word += ch;
+    }
+
+    if (depth === 0) {
+      const rest = src.slice(i).toUpperCase();
+      if (rest.startsWith(" AND ")) {
+        if (pendingBetween) {
+          pendingBetween = false;
+        } else {
+          flush();
+          out.push("AND");
+          i += 4;
+          continue;
+        }
+      }
+      if (rest.startsWith(" OR ")) {
+        flush();
+        out.push("OR");
+        i += 3;
+        continue;
+      }
+    }
+
+    buf += ch;
+  }
+
+  flush();
+  return out;
+}
+
+function parseAtomicWhereClause(token: string): WhereClause {
+  const expr = token.trim().replace(/^\((.*)\)$/s, "$1").trim();
+
+  const nullMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+  if (nullMatch) {
+    return {
+      field: nullMatch[1],
+      op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
+    };
+  }
+
+  const betweenMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+  if (betweenMatch) {
+    return {
+      field: betweenMatch[1],
+      op: betweenMatch[2] ? "NOT_BETWEEN" : "BETWEEN",
+      values: [castValue(betweenMatch[3]), castValue(betweenMatch[4])],
+    };
+  }
+
+  const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+)$/i);
+  if (likeMatch) {
+    return {
+      field: likeMatch[1],
+      op: likeMatch[2] ? "NOT_LIKE" : "LIKE",
+      value: castValue(likeMatch[3]),
+    };
+  }
+
+  const inMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
+  if (inMatch) {
+    return {
+      field: inMatch[1],
+      op: inMatch[2] ? "NOT_IN" : "IN",
+      values: smartSplit(inMatch[3]).map((v) => castValue(v)),
+    };
+  }
+
+  const cmpMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
+  if (cmpMatch) {
+    return {
+      field: cmpMatch[1],
+      op: cmpMatch[2] as CompareOp,
+      value: castValue(cmpMatch[3]),
+    };
+  }
+
+  throw new Error(`Unsupported WHERE expression: ${token}`);
+}
+
 function parseWhere(whereExpr: string): WhereClause[] {
-  const sanitized = whereExpr.replace(/[()]/g, " ");
-  const tokens = sanitized.split(/\s+(AND|OR)\s+/i).map((x) => x.trim()).filter(Boolean);
+  const tokens = splitWhereTokens(whereExpr);
   const out: WhereClause[] = [];
   let pendingLogic: LogicOp | undefined;
 
@@ -120,50 +253,9 @@ function parseWhere(whereExpr: string): WhereClause[] {
       continue;
     }
 
-    const nullMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
-    if (nullMatch) {
-      out.push({
-        logic: pendingLogic,
-        field: nullMatch[1],
-        op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
-      });
-      pendingLogic = undefined;
-      continue;
-    }
-
-    const likeMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+LIKE\s+(.+)$/i);
-    if (likeMatch) {
-      out.push({
-        logic: pendingLogic,
-        field: likeMatch[1],
-        op: "LIKE",
-        value: castValue(likeMatch[2]),
-      });
-      pendingLogic = undefined;
-      continue;
-    }
-
-    const inMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IN\s*\((.+)\)$/i);
-    if (inMatch) {
-      out.push({
-        logic: pendingLogic,
-        field: inMatch[1],
-        op: "IN",
-        values: smartSplit(inMatch[2]).map((v) => castValue(v)),
-      });
-      pendingLogic = undefined;
-      continue;
-    }
-
-    const cmpMatch = token.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|>=|<=|>|<)\s*(.+)$/i);
-    if (!cmpMatch) throw new Error(`Unsupported WHERE expression: ${whereExpr}`);
-
-    out.push({
-      logic: pendingLogic,
-      field: cmpMatch[1],
-      op: cmpMatch[2] as CompareOp,
-      value: castValue(cmpMatch[3]),
-    });
+    const clause = parseAtomicWhereClause(token);
+    clause.logic = pendingLogic;
+    out.push(clause);
     pendingLogic = undefined;
   }
 
@@ -182,57 +274,112 @@ function compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): numb
   return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
 }
 
-function evaluateClause(row: SqlRow, clause: WhereClause): boolean {
+function compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
+  if (left == null || right == null) return "UNKNOWN";
+
+  switch (op) {
+    case "=":
+      return eq(left, right) ? "TRUE" : "FALSE";
+    case "!=":
+    case "<>":
+      return eq(left, right) ? "FALSE" : "TRUE";
+    case ">":
+      return compare(left, right) > 0 ? "TRUE" : "FALSE";
+    case "<":
+      return compare(left, right) < 0 ? "TRUE" : "FALSE";
+    case ">=":
+      return compare(left, right) >= 0 ? "TRUE" : "FALSE";
+    case "<=":
+      return compare(left, right) <= 0 ? "TRUE" : "FALSE";
+    default:
+      return "FALSE";
+  }
+}
+
+function tvNot(v: TruthValue): TruthValue {
+  if (v === "TRUE") return "FALSE";
+  if (v === "FALSE") return "TRUE";
+  return "UNKNOWN";
+}
+
+function tvAnd(a: TruthValue, b: TruthValue): TruthValue {
+  if (a === "FALSE" || b === "FALSE") return "FALSE";
+  if (a === "TRUE" && b === "TRUE") return "TRUE";
+  return "UNKNOWN";
+}
+
+function tvOr(a: TruthValue, b: TruthValue): TruthValue {
+  if (a === "TRUE" || b === "TRUE") return "TRUE";
+  if (a === "FALSE" && b === "FALSE") return "FALSE";
+  return "UNKNOWN";
+}
+
+function evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
   const left = row[clause.field];
 
-  if (clause.op === "IN") {
-    return (clause.values ?? []).some((v) => eq(left, v));
+  if (clause.op === "IN" || clause.op === "NOT_IN") {
+    const values = clause.values ?? [];
+    let hasUnknown = false;
+    for (const v of values) {
+      const t = compareByOp(left, v, "=");
+      if (t === "TRUE") return clause.op === "IN" ? "TRUE" : "FALSE";
+      if (t === "UNKNOWN") hasUnknown = true;
+    }
+    if (hasUnknown) return "UNKNOWN";
+    return clause.op === "IN" ? "FALSE" : "TRUE";
+  }
+
+  if (clause.op === "BETWEEN" || clause.op === "NOT_BETWEEN") {
+    const lower = clause.values?.[0];
+    const upper = clause.values?.[1];
+    const inRange = tvAnd(compareByOp(left, lower, ">="), compareByOp(left, upper, "<="));
+    return clause.op === "BETWEEN" ? inRange : tvNot(inRange);
   }
 
   const right = clause.value;
   switch (clause.op) {
     case "=":
-      return eq(left, right);
     case "!=":
-      return !eq(left, right);
+    case "<>":
     case ">":
-      return compare(left, right) > 0;
     case "<":
-      return compare(left, right) < 0;
     case ">=":
-      return compare(left, right) >= 0;
     case "<=":
-      return compare(left, right) <= 0;
-    case "LIKE": {
+      return compareByOp(left, right, clause.op as ComparePredicate);
+    case "LIKE":
+    case "NOT_LIKE": {
+      if (left == null || right == null) return "UNKNOWN";
       const pattern = String(right ?? "")
         .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
         .replace(/%/g, ".*")
         .replace(/_/g, ".");
-      return new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+      const matched = new RegExp(`^${pattern}$`, "i").test(String(left ?? ""));
+      const tv: TruthValue = matched ? "TRUE" : "FALSE";
+      return clause.op === "LIKE" ? tv : tvNot(tv);
     }
     case "IS_NULL":
-      return left === null || left === undefined;
+      return left === null || left === undefined ? "TRUE" : "FALSE";
     case "IS_NOT_NULL":
-      return left !== null && left !== undefined;
+      return left === null || left === undefined ? "FALSE" : "TRUE";
     default:
-      return false;
+      return "FALSE";
   }
 }
 
 function applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {
   return rows.filter((row) => {
-    let acc: boolean | null = null;
+    let acc: TruthValue | null = null;
     for (const c of clauses) {
       const matched = evaluateClause(row, c);
       if (acc === null) {
         acc = matched;
       } else if (c.logic === "OR") {
-        acc = acc || matched;
+        acc = tvOr(acc, matched);
       } else {
-        acc = acc && matched;
+        acc = tvAnd(acc, matched);
       }
     }
-    return Boolean(acc);
+    return acc === "TRUE";
   });
 }
 
