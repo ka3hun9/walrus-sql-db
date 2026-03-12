@@ -19,6 +19,8 @@ type CompareOp =
   | "<="
   | "IN"
   | "NOT_IN"
+  | "IN_SUBQUERY"
+  | "NOT_IN_SUBQUERY"
   | "BETWEEN"
   | "NOT_BETWEEN"
   | "LIKE"
@@ -51,6 +53,7 @@ type WhereClause = {
   values?: SqlPrimitive[];
   compareOp?: ComparePredicate;
   likeEscape?: string;
+  subquerySql?: string;
 };
 
 type WhereExprNode =
@@ -813,7 +816,7 @@ export class WalrusSqlClient {
       return {
         field: cmpSubqueryMatch[1],
         op: cmpSubqueryMatch[2] as CompareOp,
-        value: this.parseSubqueryValues(cmpSubqueryMatch[3])[0] ?? null,
+        subquerySql: cmpSubqueryMatch[3],
       };
     }
 
@@ -871,13 +874,12 @@ export class WalrusSqlClient {
       };
     }
 
-    const inSubqueryMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\(\s*SELECT\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?\s*\)$/i);
+    const inSubqueryMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\(\s*(SELECT\s+.+)\s*\)$/i);
     if (inSubqueryMatch) {
-      const subquerySql = `SELECT ${inSubqueryMatch[3]} FROM ${inSubqueryMatch[4]}${inSubqueryMatch[5] ? ` WHERE ${inSubqueryMatch[5]}` : ""}`;
       return {
         field: inSubqueryMatch[1],
-        op: inSubqueryMatch[2] ? "NOT_IN" : "IN",
-        values: this.parseSubqueryValues(subquerySql, inSubqueryMatch[3]),
+        op: inSubqueryMatch[2] ? "NOT_IN_SUBQUERY" : "IN_SUBQUERY",
+        subquerySql: inSubqueryMatch[3],
       };
     }
 
@@ -902,7 +904,7 @@ export class WalrusSqlClient {
     throw new Error(`Unsupported WHERE expression: ${token}`);
   }
 
-  private parseSubquerySelect(subquerySql: string): SqlRow[] {
+  private parseSubquerySelect(subquerySql: string, outerRow?: SqlRow): SqlRow[] {
     const normalized = subquerySql.trim().replace(/\s+/g, " ");
     const m = normalized.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?$/i);
     if (!m) throw new Error(`Unsupported subquery syntax: ${subquerySql}`);
@@ -912,7 +914,10 @@ export class WalrusSqlClient {
     const where = m[3]?.trim();
 
     const rows = this.requireTable(table);
-    const filtered = where ? rows.filter((r) => this.evaluateWhereTree(r, this.parseWhereTree(where)) === "TRUE") : rows;
+    const boundWhere = where && outerRow ? this.bindOuterRefs(where, outerRow) : where;
+    const filtered = boundWhere
+      ? rows.filter((r) => this.evaluateWhereTree(r, this.parseWhereTree(boundWhere)) === "TRUE")
+      : rows;
 
     if (fieldExpr === "*") return filtered.map((r) => ({ ...r }));
 
@@ -924,8 +929,8 @@ export class WalrusSqlClient {
     });
   }
 
-  private parseSubqueryValues(subquerySql: string, field?: string): SqlPrimitive[] {
-    const rows = this.parseSubquerySelect(subquerySql);
+  private parseSubqueryValues(subquerySql: string, field?: string, outerRow?: SqlRow): SqlPrimitive[] {
+    const rows = this.parseSubquerySelect(subquerySql, outerRow);
     if (!rows.length) return [];
 
     if (field) {
@@ -961,6 +966,21 @@ export class WalrusSqlClient {
       quantifier: m[3]!.toUpperCase() === "SOME" ? "ANY" : (m[3]!.toUpperCase() as "ANY" | "ALL"),
       subquerySql: m[4]!.trim(),
     };
+  }
+
+  private bindOuterRefs(expr: string, outerRow: SqlRow): string {
+    return expr.replace(/\bouter\.([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_m, key: string) => {
+      const v = outerRow[key];
+      if (v === null || v === undefined) return "NULL";
+      if (typeof v === "number") return String(v);
+      if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
+      const s = String(v).replace(/'/g, "''");
+      return `'${s}'`;
+    });
+  }
+
+  private resolveRowValue(row: SqlRow, field: string): SqlPrimitive | undefined {
+    return row[field] as SqlPrimitive | undefined;
   }
 
   private compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
@@ -1068,18 +1088,18 @@ export class WalrusSqlClient {
   }
 
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
-    const left = row[clause.field];
+    const left = this.resolveRowValue(row, clause.field);
 
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
-      const exists = this.parseSubquerySelect(subquerySql).length > 0;
+      const exists = this.parseSubquerySelect(subquerySql, row).length > 0;
       const tv: TruthValue = exists ? "TRUE" : "FALSE";
       return clause.op === "EXISTS" ? tv : this.tvNot(tv);
     }
 
     if (clause.op === "ANY" || clause.op === "ALL") {
       const subquerySql = String(clause.value ?? "");
-      const values = this.parseSubqueryValues(subquerySql);
+      const values = this.parseSubqueryValues(subquerySql, undefined, row);
       const cmp = clause.compareOp ?? "=";
 
       if (!values.length) {
@@ -1105,6 +1125,18 @@ export class WalrusSqlClient {
       return hasUnknown ? "UNKNOWN" : "TRUE";
     }
 
+    if (clause.op === "IN_SUBQUERY" || clause.op === "NOT_IN_SUBQUERY") {
+      const values = this.parseSubqueryValues(clause.subquerySql ?? "", undefined, row);
+      let hasUnknown = false;
+      for (const v of values) {
+        const t = this.compareByOp(left, v, "=");
+        if (t === "TRUE") return clause.op === "IN_SUBQUERY" ? "TRUE" : "FALSE";
+        if (t === "UNKNOWN") hasUnknown = true;
+      }
+      if (hasUnknown) return "UNKNOWN";
+      return clause.op === "IN_SUBQUERY" ? "FALSE" : "TRUE";
+    }
+
     if (clause.op === "IN" || clause.op === "NOT_IN") {
       const values = clause.values ?? [];
       let hasUnknown = false;
@@ -1126,7 +1158,9 @@ export class WalrusSqlClient {
       return clause.op === "BETWEEN" ? inRange : this.tvNot(inRange);
     }
 
-    const right = clause.value;
+    const right = clause.subquerySql
+      ? this.parseSubqueryValues(clause.subquerySql, undefined, row)[0] ?? null
+      : clause.value;
     switch (clause.op) {
       case "=":
       case "!=":
