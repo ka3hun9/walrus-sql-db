@@ -13,6 +13,7 @@ npm run sql:advanced
 npm run sql:join
 npm run sql:roadmap
 npm run sql:compare
+npm run sql:compare:sqlite
 npm run onchain:select-replay
 ```
 

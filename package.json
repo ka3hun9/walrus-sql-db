@@ -18,6 +18,7 @@
     "onchain:join-replay": "tsx examples/onchain-join-replay.ts",
     "sql:roadmap": "tsx examples/sql-roadmap.ts",
     "sql:compare": "tsx examples/sql-compare-baseline.ts",
+    "sql:compare:sqlite": "tsx examples/sql-compare-sqlite.ts",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
   },
