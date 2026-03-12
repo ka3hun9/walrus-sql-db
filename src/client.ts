@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
+import type { ExprAst, SelectStatementAst } from "./sql-ast.js";
 
 type CompareOp =
   | "="
@@ -65,6 +66,31 @@ type WhereExprNode =
   | { type: "and" | "or"; left: WhereExprNode; right: WhereExprNode };
 
 type ParsedSelect = {
+  explain: boolean;
+  table: string;
+  fields: string[] | ["*"];
+  where?: string;
+  whereClauses: WhereClause[];
+  whereTree?: WhereExprNode;
+  limit?: number;
+  offset?: number;
+  orderBy?: string;
+  orderDirection?: "ASC" | "DESC";
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+  aggregateField?: string;
+  groupBy?: string[];
+  having?: string;
+  join?: {
+    type: "INNER" | "LEFT" | "RIGHT";
+    table: string;
+    leftField: string;
+    rightField: string;
+  };
+  rowNumberAlias?: string;
+};
+
+type AstParsedSelect = {
   explain: boolean;
   table: string;
   fields: string[] | ["*"];
@@ -424,7 +450,114 @@ export class WalrusSqlClient {
     };
   }
 
+  private exprAstToSql(expr?: ExprAst): string | undefined {
+    if (!expr) return undefined;
+    switch (expr.kind) {
+      case "identifier":
+        return expr.name;
+      case "literal":
+        if (expr.value === null) return "NULL";
+        if (typeof expr.value === "string") return `'${String(expr.value).replace(/'/g, "''")}'`;
+        if (typeof expr.value === "boolean") return expr.value ? "TRUE" : "FALSE";
+        return String(expr.value);
+      case "function":
+        return `${expr.name}(${expr.args.map((a) => this.exprAstToSql(a) ?? "").join(", ")})`;
+      case "raw":
+        return expr.text;
+      default:
+        return undefined;
+    }
+  }
+
+  private astSelectToParsedSelect(ast: SelectStatementAst): AstParsedSelect {
+    const table = ast.from.name;
+    const where = this.exprAstToSql(ast.where);
+    const having = this.exprAstToSql(ast.having);
+
+    const groupBy = ast.groupBy?.map((g) => this.exprAstToSql(g) ?? "").filter(Boolean);
+
+    const orderByList = ast.orderBy
+      ?.map((o) => ({
+        field: this.exprAstToSql(o.expr) ?? "",
+        direction: o.direction,
+      }))
+      .filter((x) => x.field);
+
+    const rowNumberItem = ast.selectItems.find(
+      (it) => it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text),
+    );
+    const rowNumberAlias = rowNumberItem?.alias ?? (rowNumberItem ? "row_number" : undefined);
+
+    const rawFieldTexts = ast.selectItems.map((it) => {
+      if (it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text)) {
+        return it.alias ?? "row_number";
+      }
+      const exprText = this.exprAstToSql(it.expr) ?? "";
+      return it.alias ? `${exprText} AS ${it.alias}` : exprText;
+    });
+
+    const normalizedFieldTexts = ast.selectItems.map((it) => {
+      if (it.alias) return it.alias;
+      if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name)) {
+        return it.expr.name.toLowerCase();
+      }
+      if (it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text)) {
+        return rowNumberAlias ?? "row_number";
+      }
+      return this.exprAstToSql(it.expr) ?? "";
+    });
+
+    const aggregateItem = ast.selectItems.find(
+      (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name),
+    );
+    const aggregate =
+      aggregateItem?.expr.kind === "function" ? (aggregateItem.expr.name as AstParsedSelect["aggregate"]) : undefined;
+    const aggregateField =
+      aggregateItem?.expr.kind === "function" ? (this.exprAstToSql(aggregateItem.expr.args[0]) ?? "*") : undefined;
+
+    const fields = aggregate
+      ? (normalizedFieldTexts as string[])
+      : rawFieldTexts.length === 1 && rawFieldTexts[0] === "*"
+        ? (["*"] as ["*"])
+        : rawFieldTexts;
+
+    const whereClauses = where ? this.tryParseWhere(where) : [];
+    const whereTree = where ? this.parseWhereTree(where) : undefined;
+
+    return {
+      explain: ast.explain,
+      table,
+      fields,
+      where,
+      whereClauses,
+      whereTree,
+      limit: ast.limit,
+      offset: ast.offset,
+      orderBy: orderByList?.[0]?.field,
+      orderDirection: orderByList?.[0]?.direction,
+      orderByList,
+      aggregate,
+      aggregateField,
+      groupBy,
+      having,
+      join: ast.join
+        ? {
+            type: ast.join.joinType,
+            table: ast.join.table,
+            leftField: ast.join.onLeft,
+            rightField: ast.join.onRight,
+          }
+        : undefined,
+      rowNumberAlias,
+    };
+  }
+
   private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
+    const ast = parseSqlToAst(rawSql);
+    if (ast.kind === "select") {
+      return this.astSelectToParsedSelect(ast);
+    }
+
     const explain = /^EXPLAIN\s+/i.test(normalizedSql);
     const base = explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "") : normalizedSql;
 

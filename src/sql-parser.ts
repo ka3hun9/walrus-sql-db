@@ -71,9 +71,12 @@ function parseSelectItems(raw: string): SelectItemAst[] {
   return splitCommaAware(raw).map((item) => {
     const m = item.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
     if (m) {
-      return { kind: "select_item", expr: parseExpr(m[1]!), alias: m[2]! };
+      const exprText = m[1]!;
+      const expr = /\bOVER\s*\(/i.test(exprText) ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+      return { kind: "select_item", expr, alias: m[2]! };
     }
-    return { kind: "select_item", expr: parseExpr(item) };
+    const expr = /\bOVER\s*\(/i.test(item) ? ({ kind: "raw", text: item } as ExprAst) : parseExpr(item);
+    return { kind: "select_item", expr };
   });
 }
 
@@ -81,7 +84,8 @@ function parseOrderItems(raw?: string): OrderItemAst[] | undefined {
   if (!raw) return undefined;
   return splitCommaAware(raw).map((part) => {
     const m = part.match(/^(.+?)(?:\s+(ASC|DESC))?$/i);
-    const expr = parseExpr(m?.[1] ?? part);
+    const exprText = m?.[1] ?? part;
+    const expr = /\bOVER\s*\(/i.test(exprText) ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
     const direction = ((m?.[2] ?? "ASC").toUpperCase() as "ASC" | "DESC");
     return { kind: "order_item", expr, direction };
   });
