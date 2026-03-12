@@ -8,6 +8,7 @@ import type {
   WalrusSqlClientOptions,
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
+import { parseSqlToAst } from "./sql-parser.js";
 
 type CompareOp =
   | "="
@@ -207,6 +208,13 @@ export class WalrusSqlClient {
   }
 
   async query(sql: string): Promise<QueryResult> {
+    const ast = parseSqlToAst(sql);
+    if (ast.kind === "select") {
+      // Phase-0 AST migration: parse and validate through unified AST entry.
+      // Execution still uses existing evaluator path until full AST executor lands.
+      void ast;
+    }
+
     const normalizedForDerived = sql.trim().replace(/\s+/g, " ");
     const derived = this.parseFromSubquery(normalizedForDerived);
     if (derived) {
