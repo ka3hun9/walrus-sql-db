@@ -18,6 +18,17 @@ npm run sql:compare:matrix
 npm run onchain:select-replay
 ```
 
+## CI
+
+GitHub Actions workflow: `.github/workflows/sql-compare.yml`
+
+It runs on push/PR:
+- `npm run build`
+- `npm run sql:roadmap`
+- `npm run sql:compare:matrix`
+
+It also uploads `reports/sql-compare-report.json` as an artifact.
+
 ## Key Scripts
 
 ```bash

@@ -1,0 +1,45 @@
+name: SQL Compare Matrix
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  sql-compare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: SQL roadmap smoke
+        run: npm run sql:roadmap
+
+      - name: SQLite matrix compare
+        run: npm run sql:compare:matrix
+
+      - name: Upload compare report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-compare-report
+          path: reports/sql-compare-report.json
+          if-no-files-found: ignore
