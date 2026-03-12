@@ -51,6 +51,8 @@ type WhereClause = {
   op: CompareOp;
   value?: SqlPrimitive;
   values?: SqlPrimitive[];
+  valueExpr?: string;
+  valueExprs?: string[];
   compareOp?: ComparePredicate;
   likeEscape?: string;
   subquerySql?: string;
@@ -486,6 +488,13 @@ export class WalrusSqlClient {
       return f;
     });
 
+    const outputFieldList = rawFieldList.map((f) => {
+      if (/^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f)) {
+        return rowNumberAlias;
+      }
+      return f;
+    });
+
     if (aggregate) {
       return {
         explain,
@@ -531,7 +540,7 @@ export class WalrusSqlClient {
     return {
       explain,
       table,
-      fields: normalizedFieldList as string[],
+      fields: outputFieldList as string[],
       where,
       whereClauses,
       whereTree,
@@ -833,8 +842,10 @@ export class WalrusSqlClient {
 
     const anyAllMatch = this.parseAnyAllPredicate(expr);
     if (anyAllMatch) {
+      const leftParsed = this.parseFieldExpr(anyAllMatch.leftExpr);
       return {
-        field: anyAllMatch.field,
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: anyAllMatch.quantifier,
         compareOp: anyAllMatch.compareOp,
         value: anyAllMatch.subquerySql,
@@ -852,8 +863,9 @@ export class WalrusSqlClient {
       };
     }
 
-    const truthPredMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?(TRUE|FALSE|UNKNOWN)$/i);
+    const truthPredMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?(TRUE|FALSE|UNKNOWN)$/i);
     if (truthPredMatch) {
+      const leftParsed = this.parseFieldExpr(truthPredMatch[1]!);
       const subject = truthPredMatch[3]!.toUpperCase();
       const isNot = Boolean(truthPredMatch[2]);
       const op =
@@ -863,73 +875,88 @@ export class WalrusSqlClient {
             ? (isNot ? "IS_NOT_FALSE" : "IS_FALSE")
             : (isNot ? "IS_NOT_UNKNOWN" : "IS_UNKNOWN");
       return {
-        field: truthPredMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op,
       };
     }
 
-    const distinctMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/i);
+    const distinctMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/i);
     if (distinctMatch) {
+      const leftParsed = this.parseFieldExpr(distinctMatch[1]!);
       return {
-        field: distinctMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: distinctMatch[2] ? "IS_NOT_DISTINCT_FROM" : "IS_DISTINCT_FROM",
-        value: this.castValue(distinctMatch[3]),
+        valueExprs: [distinctMatch[3]!.trim()],
       };
     }
 
-    const nullMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+IS\s+(NOT\s+)?NULL$/i);
+    const nullMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?NULL$/i);
     if (nullMatch) {
+      const leftParsed = this.parseFieldExpr(nullMatch[1]!);
       return {
-        field: nullMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: nullMatch[2] ? "IS_NOT_NULL" : "IS_NULL",
       };
     }
 
-    const betweenMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+    const betweenMatch = expr.match(/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
     if (betweenMatch) {
+      const leftParsed = this.parseFieldExpr(betweenMatch[1]!);
       return {
-        field: betweenMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: betweenMatch[2] ? "NOT_BETWEEN" : "BETWEEN",
-        values: [this.castValue(betweenMatch[3]), this.castValue(betweenMatch[4])],
+        valueExprs: [betweenMatch[3]!.trim(), betweenMatch[4]!.trim()],
       };
     }
 
-    const likeMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?LIKE\s+(.+?)(?:\s+ESCAPE\s+(.+))?$/i);
+    const likeMatch = expr.match(/^(.+?)\s+(NOT\s+)?LIKE\s+(.+?)(?:\s+ESCAPE\s+(.+))?$/i);
     if (likeMatch) {
+      const leftParsed = this.parseFieldExpr(likeMatch[1]!);
       const escRaw = likeMatch[4] ? this.trimQuoted(likeMatch[4].trim()) : undefined;
       const esc = escRaw && escRaw.length > 0 ? escRaw[0] : undefined;
       return {
-        field: likeMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: likeMatch[2] ? "NOT_LIKE" : "LIKE",
-        value: this.castValue(likeMatch[3]),
+        valueExprs: [likeMatch[3]!.trim()],
         likeEscape: esc,
       };
     }
 
-    const inSubqueryMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\(\s*(SELECT\s+.+)\s*\)$/i);
+    const inSubqueryMatch = expr.match(/^(.+?)\s+(NOT\s+)?IN\s*\(\s*(SELECT\s+.+)\s*\)$/i);
     if (inSubqueryMatch) {
+      const leftParsed = this.parseFieldExpr(inSubqueryMatch[1]!);
       return {
-        field: inSubqueryMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: inSubqueryMatch[2] ? "NOT_IN_SUBQUERY" : "IN_SUBQUERY",
         subquerySql: inSubqueryMatch[3],
       };
     }
 
-    const inMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
+    const inMatch = expr.match(/^(.+?)\s+(NOT\s+)?IN\s*\((.+)\)$/i);
     if (inMatch) {
+      const leftParsed = this.parseFieldExpr(inMatch[1]!);
       return {
-        field: inMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: inMatch[2] ? "NOT_IN" : "IN",
-        values: this.smartSplit(inMatch[3]).map((v) => this.castValue(v)),
+        valueExprs: this.smartSplit(inMatch[3]).map((v) => v.trim()),
       };
     }
 
-    const cmpMatch = expr.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
+    const cmpMatch = expr.match(/^(.+?)\s*(=|!=|<>|>=|<=|>|<)\s*(.+)$/i);
     if (cmpMatch) {
+      const leftParsed = this.parseFieldExpr(cmpMatch[1]!);
       return {
-        field: cmpMatch[1],
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
         op: cmpMatch[2] as CompareOp,
-        value: this.castValue(cmpMatch[3]),
+        valueExprs: [cmpMatch[3]!.trim()],
       };
     }
 
@@ -986,14 +1013,14 @@ export class WalrusSqlClient {
   }
 
   private parseAnyAllPredicate(expr: string):
-    | { field: string; compareOp: ComparePredicate; quantifier: "ANY" | "ALL"; subquerySql: string }
+    | { leftExpr: string; compareOp: ComparePredicate; quantifier: "ANY" | "ALL"; subquerySql: string }
     | null {
     const m = expr.match(
-      /^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*(ANY|SOME|ALL)\s*\((SELECT\s+.+)\)$/i,
+      /^(.+?)\s*(=|!=|<>|>=|<=|>|<)\s*(ANY|SOME|ALL)\s*\((SELECT\s+.+)\)$/i,
     );
     if (!m) return null;
     return {
-      field: m[1]!,
+      leftExpr: m[1]!.trim(),
       compareOp: m[2] as ComparePredicate,
       quantifier: m[3]!.toUpperCase() === "SOME" ? "ANY" : (m[3]!.toUpperCase() as "ANY" | "ALL"),
       subquerySql: m[4]!.trim(),
@@ -1009,6 +1036,182 @@ export class WalrusSqlClient {
       const s = String(v).replace(/'/g, "''");
       return `'${s}'`;
     });
+  }
+
+  private evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
+    const expr = this.trimOuterParentheses(exprRaw.trim());
+
+    const caseMatch = expr.match(/^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+END$/i);
+    if (caseMatch) {
+      const cond = this.evaluateWhereTree(row, this.parseWhereTree(caseMatch[1]!));
+      const branch = cond === "TRUE" ? caseMatch[2]! : caseMatch[3]!;
+      return this.evalExpr(row, branch);
+    }
+
+    const coalesceMatch = expr.match(/^COALESCE\((.+)\)$/i);
+    if (coalesceMatch) {
+      for (const p of this.smartSplit(coalesceMatch[1]!)) {
+        const v = this.evalExpr(row, p);
+        if (v !== null && v !== undefined) return v;
+      }
+      return null;
+    }
+
+    const nullifMatch = expr.match(/^NULLIF\((.+),(.+)\)$/i);
+    if (nullifMatch) {
+      const a = this.evalExpr(row, nullifMatch[1]!);
+      const b = this.evalExpr(row, nullifMatch[2]!);
+      return this.eq(a, b) ? null : a;
+    }
+
+    const castMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL)\)$/i);
+    if (castMatch) {
+      const v = this.evalExpr(row, castMatch[1]!);
+      const t = castMatch[2]!.toUpperCase();
+      if (v === null || v === undefined) return null;
+      if (t === "TEXT") return String(v);
+      if (t === "INT" || t === "INTEGER") {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.trunc(n) : null;
+      }
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return this.resolveRowValue(row, expr);
+
+    const lit = this.castValue(expr);
+    if (expr.startsWith("'") || expr.startsWith('"') || typeof lit !== "string") return lit;
+
+    const toks = this.tokenizeExpr(expr);
+    if (toks.length === 0) return null;
+    const rpn = this.toRpn(toks);
+    return this.evalRpn(row, rpn);
+  }
+
+  private tokenizeExpr(expr: string): string[] {
+    const out: string[] = [];
+    let buf = "";
+    let quote = "";
+    for (let i = 0; i < expr.length; i++) {
+      const ch = expr[i]!;
+      if (quote) {
+        buf += ch;
+        if (ch === quote) {
+          out.push(buf);
+          buf = "";
+          quote = "";
+        }
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        if (buf.trim()) out.push(buf.trim());
+        buf = ch;
+        quote = ch;
+        continue;
+      }
+      if (/\s/.test(ch)) {
+        if (buf.trim()) out.push(buf.trim());
+        buf = "";
+        continue;
+      }
+      if ("()+-*/%".includes(ch)) {
+        if (buf.trim()) out.push(buf.trim());
+        out.push(ch);
+        buf = "";
+        continue;
+      }
+      buf += ch;
+    }
+    if (buf.trim()) out.push(buf.trim());
+    return out;
+  }
+
+  private toRpn(tokens: string[]): string[] {
+    const out: string[] = [];
+    const ops: string[] = [];
+    const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "u-": 3 };
+
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i]!;
+      if (t === "(") {
+        ops.push(t);
+        continue;
+      }
+      if (t === ")") {
+        while (ops.length && ops[ops.length - 1] !== "(") out.push(ops.pop()!);
+        ops.pop();
+        continue;
+      }
+      if (["+", "-", "*", "/", "%"].includes(t)) {
+        const prev = tokens[i - 1];
+        const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%"].includes(prev!));
+        const op = unary ? "u-" : t;
+        while (ops.length && pri[ops[ops.length - 1]!] >= pri[op]) out.push(ops.pop()!);
+        ops.push(op);
+        continue;
+      }
+      out.push(t);
+    }
+
+    while (ops.length) out.push(ops.pop()!);
+    return out;
+  }
+
+  private evalRpn(row: SqlRow, rpn: string[]): SqlPrimitive | undefined {
+    const st: Array<SqlPrimitive | undefined> = [];
+    for (const t of rpn) {
+      if (t === "u-") {
+        const a = st.pop();
+        if (a == null) {
+          st.push(null);
+        } else {
+          const n = Number(a);
+          st.push(Number.isFinite(n) ? -n : null);
+        }
+        continue;
+      }
+      if (["+", "-", "*", "/", "%"].includes(t)) {
+        const b = st.pop();
+        const a = st.pop();
+        if (a == null || b == null) {
+          st.push(null);
+          continue;
+        }
+        const an = Number(a);
+        const bn = Number(b);
+        if (!Number.isFinite(an) || !Number.isFinite(bn)) {
+          st.push(null);
+          continue;
+        }
+        if (t === "+") st.push(an + bn);
+        else if (t === "-") st.push(an - bn);
+        else if (t === "*") st.push(an * bn);
+        else if (t === "/") st.push(bn === 0 ? null : an / bn);
+        else st.push(bn === 0 ? null : an % bn);
+        continue;
+      }
+
+      if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(t)) {
+        st.push(this.resolveRowValue(row, t));
+      } else {
+        st.push(this.castValue(t));
+      }
+    }
+
+    return st.length ? st[st.length - 1] : null;
+  }
+
+  private parseFieldExpr(input: string): { field: string; valueExpr?: string } {
+    const s = input.trim();
+    const cm = s.match(/^(.+)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*)$/i);
+    if (cm) return { field: cm[2]!, valueExpr: cm[1]!.trim() };
+
+    const rm = s.match(/^(.+)\s+([a-zA-Z_][a-zA-Z0-9_\.]*)$/);
+    if (rm && /[\(\)+\-*/%\s]/.test(rm[1]!)) return { field: rm[2]!, valueExpr: rm[1]!.trim() };
+
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(s)) return { field: s };
+    return { field: s, valueExpr: s };
   }
 
   private resolveRowValue(row: SqlRow, field: string): SqlPrimitive | undefined {
@@ -1120,7 +1323,7 @@ export class WalrusSqlClient {
   }
 
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
-    const left = this.resolveRowValue(row, clause.field);
+    const left = clause.valueExpr ? this.evalExpr(row, clause.valueExpr) : this.resolveRowValue(row, clause.field);
 
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
@@ -1170,7 +1373,7 @@ export class WalrusSqlClient {
     }
 
     if (clause.op === "IN" || clause.op === "NOT_IN") {
-      const values = clause.values ?? [];
+      const values = (clause.valueExprs?.length ? clause.valueExprs.map((v) => this.evalExpr(row, v) ?? null) : clause.values) ?? [];
       let hasUnknown = false;
       for (const v of values) {
         const t = this.compareByOp(left, v, "=");
@@ -1182,8 +1385,8 @@ export class WalrusSqlClient {
     }
 
     if (clause.op === "BETWEEN" || clause.op === "NOT_BETWEEN") {
-      const lower = clause.values?.[0];
-      const upper = clause.values?.[1];
+      const lower = clause.valueExprs?.[0] ? this.evalExpr(row, clause.valueExprs[0]) : clause.values?.[0];
+      const upper = clause.valueExprs?.[1] ? this.evalExpr(row, clause.valueExprs[1]) : clause.values?.[1];
       const ge = this.compareByOp(left, lower, ">=");
       const le = this.compareByOp(left, upper, "<=");
       const inRange = this.tvAnd(ge, le);
@@ -1192,7 +1395,9 @@ export class WalrusSqlClient {
 
     const right = clause.subquerySql
       ? this.parseSubqueryValues(clause.subquerySql, undefined, row)[0] ?? null
-      : clause.value;
+      : clause.valueExprs?.[0]
+        ? this.evalExpr(row, clause.valueExprs[0])
+        : clause.value;
     switch (clause.op) {
       case "=":
       case "!=":
@@ -1312,7 +1517,12 @@ export class WalrusSqlClient {
   private pickFields(row: SqlRow, fields: string[] | ["*"]): SqlRow {
     if (fields.length === 1 && fields[0] === "*") return row;
     const out: SqlRow = {};
-    for (const f of fields) out[f] = row[f] ?? null;
+    for (const f of fields) {
+      const parsed = this.parseFieldExpr(f);
+      const key = parsed.field;
+      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : row[key];
+      out[key] = val ?? null;
+    }
     return out;
   }
 
