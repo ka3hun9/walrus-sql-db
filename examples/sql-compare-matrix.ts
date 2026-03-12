@@ -4,55 +4,71 @@ import { spawnSync } from "node:child_process";
 import { WalrusSqlClient } from "../src/index.js";
 
 type Row = Record<string, unknown>;
+type Profile = "pr" | "nightly";
+
+type SqliteMapKind = "SOME_GT" | "ALL_GT_NULLSAFE" | "DERIVED_ALIAS_DOT";
 
 type Case = {
   category: string;
   name: string;
   walrusSql: string;
   sqliteSql?: string;
+  sqliteMap?: SqliteMapKind;
+  xfailReason?: string;
 };
 
 const setupSql = [
-  "CREATE TABLE users (id TEXT, tier INT, name TEXT)",
+  "CREATE TABLE users (id TEXT, tier INT, name TEXT, city TEXT)",
   "CREATE TABLE orders (id TEXT, user_id TEXT, amount INT, note TEXT, status TEXT)",
-  "INSERT INTO users (id, tier, name) VALUES ('u1', 3, 'Alice')",
-  "INSERT INTO users (id, tier, name) VALUES ('u2', 1, 'Bob')",
-  "INSERT INTO users (id, tier, name) VALUES ('u3', NULL, 'A_100')",
-  "INSERT INTO users (id, tier, name) VALUES ('u4', 2, 'Ann')",
+  "INSERT INTO users (id, tier, name, city) VALUES ('u1', 3, 'Alice', 'Shanghai')",
+  "INSERT INTO users (id, tier, name, city) VALUES ('u2', 1, 'Bob', 'Suzhou')",
+  "INSERT INTO users (id, tier, name, city) VALUES ('u3', NULL, 'A_100', NULL)",
+  "INSERT INTO users (id, tier, name, city) VALUES ('u4', 2, 'Ann', 'Shanghai')",
   "INSERT INTO orders (id, user_id, amount, note, status) VALUES ('o1', 'u1', 10, 'A_1', 'paid')",
   "INSERT INTO orders (id, user_id, amount, note, status) VALUES ('o2', 'u2', 20, 'A%2', 'shipped')",
   "INSERT INTO orders (id, user_id, amount, note, status) VALUES ('o3', 'u9', 30, NULL, 'paid')",
   "INSERT INTO orders (id, user_id, amount, note, status) VALUES ('o4', 'u4', 25, 'AB', 'draft')",
+  "INSERT INTO orders (id, user_id, amount, note, status) VALUES ('o5', 'u1', 60, 'A_9', 'shipped')",
 ];
 
-const cases: Case[] = [
+const baseCases: Case[] = [
   { category: "compare", name: "basic >", walrusSql: "SELECT id FROM orders WHERE amount > 20 ORDER BY id" },
   { category: "compare", name: "basic <=", walrusSql: "SELECT id FROM orders WHERE amount <= 20 ORDER BY id" },
+  { category: "compare", name: "not equal", walrusSql: "SELECT id FROM orders WHERE status <> 'paid' ORDER BY id" },
+
   { category: "null-3vl", name: "NOT IN + NULL", walrusSql: "SELECT id FROM orders WHERE user_id NOT IN ('u2', NULL) ORDER BY id" },
   { category: "null-3vl", name: "IS NOT DISTINCT FROM", walrusSql: "SELECT id FROM users WHERE tier IS NOT DISTINCT FROM NULL ORDER BY id" },
   { category: "null-3vl", name: "IS DISTINCT FROM", walrusSql: "SELECT id FROM users WHERE tier IS DISTINCT FROM NULL ORDER BY id" },
+  { category: "null-3vl", name: "IS NULL", walrusSql: "SELECT id FROM users WHERE city IS NULL ORDER BY id" },
+
   { category: "like", name: "LIKE ESCAPE _", walrusSql: "SELECT id FROM orders WHERE note LIKE 'A\\_%' ESCAPE '\\' ORDER BY id" },
+  { category: "like", name: "LIKE ESCAPE %", walrusSql: "SELECT id FROM orders WHERE note LIKE 'A\\%%' ESCAPE '\\' ORDER BY id" },
   { category: "like", name: "NOT LIKE", walrusSql: "SELECT id FROM orders WHERE note NOT LIKE 'A%' ORDER BY id" },
+
+  { category: "in-between", name: "IN literal", walrusSql: "SELECT id FROM orders WHERE status IN ('paid', 'draft') ORDER BY id" },
+  { category: "in-between", name: "BETWEEN", walrusSql: "SELECT id FROM orders WHERE amount BETWEEN 20 AND 30 ORDER BY id" },
+  { category: "in-between", name: "NOT BETWEEN", walrusSql: "SELECT id FROM orders WHERE amount NOT BETWEEN 20 AND 30 ORDER BY id" },
+
   { category: "subquery", name: "EXISTS", walrusSql: "SELECT id FROM orders WHERE EXISTS (SELECT id FROM users WHERE tier >= 3) ORDER BY id" },
   {
     category: "subquery",
     name: "SOME mapped",
     walrusSql: "SELECT id FROM orders WHERE amount > SOME (SELECT tier FROM users) ORDER BY id",
-    sqliteSql: "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users) ORDER BY id",
+    sqliteMap: "SOME_GT",
   },
   {
     category: "subquery",
     name: "ALL mapped",
     walrusSql: "SELECT id FROM orders WHERE amount > ALL (SELECT tier FROM users) ORDER BY id",
-    sqliteSql:
-      "SELECT id FROM orders WHERE (SELECT COUNT(*) FROM users) = 0 OR ((SELECT COUNT(*) FROM users WHERE tier IS NULL) = 0 AND amount > (SELECT MAX(tier) FROM users WHERE tier IS NOT NULL)) ORDER BY id",
+    sqliteMap: "ALL_GT_NULLSAFE",
   },
   {
     category: "subquery",
     name: "FROM subquery",
     walrusSql: "SELECT d.id FROM (SELECT id, amount FROM orders WHERE amount >= 20) d WHERE d.amount > 20 ORDER BY d.id",
-    sqliteSql: "SELECT d.id AS \"d.id\" FROM (SELECT id, amount FROM orders WHERE amount >= 20) d WHERE d.amount > 20 ORDER BY d.id",
+    sqliteMap: "DERIVED_ALIAS_DOT",
   },
+
   {
     category: "correlated",
     name: "correlated IN",
@@ -65,37 +81,82 @@ const cases: Case[] = [
     walrusSql: "SELECT id FROM orders WHERE EXISTS (SELECT id FROM users WHERE id = outer.user_id AND tier >= 2) ORDER BY id",
     sqliteSql: "SELECT o.id AS id FROM orders o WHERE EXISTS (SELECT u.id FROM users u WHERE u.id = o.user_id AND u.tier >= 2) ORDER BY o.id",
   },
+
+  { category: "expr", name: "arith precedence", walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id" },
+  { category: "expr", name: "coalesce", walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') = 'x' ORDER BY id" },
+  { category: "expr", name: "nullif", walrusSql: "SELECT id FROM users WHERE NULLIF(name, 'Bob') IS NULL ORDER BY id" },
+  { category: "expr", name: "cast int", walrusSql: "SELECT id FROM orders WHERE CAST(amount / 10 AS INT) >= 2 ORDER BY id" },
+  { category: "expr", name: "case in where", walrusSql: "SELECT id FROM orders WHERE CASE WHEN amount >= 25 THEN 1 ELSE 0 END = 1 ORDER BY id" },
+  { category: "expr", name: "unary minus", walrusSql: "SELECT id FROM orders WHERE -amount < -20 ORDER BY id" },
+
+  { category: "logic", name: "AND/OR precedence", walrusSql: "SELECT id FROM orders WHERE (status = 'paid' OR status = 'shipped') AND amount >= 20 ORDER BY id" },
+  { category: "logic", name: "NOT", walrusSql: "SELECT id FROM orders WHERE NOT (status = 'paid') ORDER BY id" },
+
   {
-    category: "expr",
-    name: "arith precedence",
-    walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id",
+    category: "having",
+    name: "having alias compare",
+    walrusSql: "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING sum >= 30 ORDER BY user_id",
   },
   {
-    category: "expr",
-    name: "coalesce",
-    walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') = 'x' ORDER BY id",
-  },
-  {
-    category: "expr",
-    name: "nullif",
-    walrusSql: "SELECT id FROM users WHERE NULLIF(name, 'Bob') IS NULL ORDER BY id",
-  },
-  {
-    category: "expr",
-    name: "cast int",
-    walrusSql: "SELECT id FROM orders WHERE CAST(amount / 10 AS INT) >= 2 ORDER BY id",
-  },
-  {
-    category: "expr",
-    name: "case in where",
-    walrusSql: "SELECT id FROM orders WHERE CASE WHEN amount >= 25 THEN 1 ELSE 0 END = 1 ORDER BY id",
-  },
-  {
-    category: "logic",
-    name: "AND/OR precedence",
-    walrusSql: "SELECT id FROM orders WHERE (status = 'paid' OR status = 'shipped') AND amount >= 20 ORDER BY id",
+    category: "having",
+    name: "having case",
+    walrusSql: "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING CASE WHEN sum >= 30 THEN 1 ELSE 0 END = 1 ORDER BY user_id",
   },
 ];
+
+const nightlyCases: Case[] = [
+  { category: "compare", name: "compare >=", walrusSql: "SELECT id FROM orders WHERE amount >= 25 ORDER BY id" },
+  { category: "compare", name: "compare <", walrusSql: "SELECT id FROM orders WHERE amount < 25 ORDER BY id" },
+  { category: "null-3vl", name: "city IS NOT NULL", walrusSql: "SELECT id FROM users WHERE city IS NOT NULL ORDER BY id" },
+  { category: "like", name: "like plain", walrusSql: "SELECT id FROM orders WHERE note LIKE 'A%' ORDER BY id" },
+  { category: "in-between", name: "NOT IN literal", walrusSql: "SELECT id FROM orders WHERE status NOT IN ('paid') ORDER BY id" },
+  { category: "expr", name: "cast real", walrusSql: "SELECT id FROM orders WHERE CAST(amount / 4 AS REAL) > 5 ORDER BY id" },
+  { category: "expr", name: "coalesce in where nightly", walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') LIKE 'A%' ORDER BY id" },
+  { category: "logic", name: "nested boolean", walrusSql: "SELECT id FROM orders WHERE (status='paid' AND amount>20) OR (status='draft' AND amount>=25) ORDER BY id" },
+  {
+    category: "having",
+    name: "having coalesce",
+    walrusSql: "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING COALESCE(sum, 0) > 20 ORDER BY user_id",
+  },
+  {
+    category: "subquery",
+    name: "scalar subquery compare mapped",
+    walrusSql: "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users) ORDER BY id",
+    sqliteSql: "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users WHERE tier IS NOT NULL) ORDER BY id",
+    xfailReason: "simulator scalar-subquery NULL propagation differs from SQLite null-filtered MIN mapping",
+  },
+];
+
+function mapSqliteSql(c: Case): string {
+  if (c.sqliteSql) return c.sqliteSql;
+  if (!c.sqliteMap) return c.walrusSql;
+
+  if (c.sqliteMap === "SOME_GT") {
+    return c.walrusSql.replace(
+      />\s*SOME\s*\(\s*SELECT\s+(.+?)\s+FROM\s+(.+?)\s*\)/i,
+      "> (SELECT MIN($1) FROM $2)",
+    );
+  }
+
+  if (c.sqliteMap === "ALL_GT_NULLSAFE") {
+    const m = c.walrusSql.match(/^SELECT\s+(.+?)\s+FROM\s+(.+?)\s+WHERE\s+(.+?)\s*>\s*ALL\s*\(\s*SELECT\s+(.+?)\s+FROM\s+(.+?)\s*\)\s+ORDER BY\s+(.+)$/i);
+    if (m) {
+      const sel = m[1]!;
+      const from = m[2]!;
+      const left = m[3]!;
+      const innerCol = m[4]!;
+      const innerFrom = m[5]!;
+      const ord = m[6]!;
+      return `SELECT ${sel} FROM ${from} WHERE (SELECT COUNT(*) FROM ${innerFrom}) = 0 OR ((SELECT COUNT(*) FROM ${innerFrom} WHERE ${innerCol} IS NULL) = 0 AND ${left} > (SELECT MAX(${innerCol}) FROM ${innerFrom} WHERE ${innerCol} IS NOT NULL)) ORDER BY ${ord}`;
+    }
+  }
+
+  if (c.sqliteMap === "DERIVED_ALIAS_DOT") {
+    return c.walrusSql.replace(/^SELECT\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\s+/i, 'SELECT $1.$2 AS "$1.$2" ');
+  }
+
+  return c.walrusSql;
+}
 
 function makeSafeName(input: string): string {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "case";
@@ -141,21 +202,18 @@ cur.execute(payload["query"])
 print(json.dumps([dict(r) for r in cur.fetchall()], ensure_ascii=False))
 `;
 
-  const tried: string[] = [];
-  for (const [cmd, args] of [["python", ["-c", py, payload]] as const]) {
-    tried.push(cmd);
-    const out = spawnSync(cmd, args, { encoding: "utf8" });
-    if (out.error) continue;
-    if (out.status !== 0) throw new Error(out.stderr || out.stdout || `sqlite runner failed: ${cmd}`);
-    return JSON.parse(out.stdout.trim() || "[]") as Row[];
-  }
-
-  throw new Error(`SQLite runner unavailable. Tried: ${tried.join(", ")}`);
+  const out = spawnSync("python", ["-c", py, payload], { encoding: "utf8" });
+  if (out.error) throw new Error(`SQLite runner unavailable: ${out.error.message}`);
+  if (out.status !== 0) throw new Error(out.stderr || out.stdout || "sqlite runner failed");
+  return JSON.parse(out.stdout.trim() || "[]") as Row[];
 }
 
 async function main() {
   const reportPath = process.argv[2] ?? "reports/sql-compare-report.json";
   const mreDir = process.argv[3] ?? "reports/mre";
+  const profile = ((process.argv[4] ?? "pr").toLowerCase() as Profile);
+  const selected = profile === "nightly" ? [...baseCases, ...nightlyCases] : baseCases;
+
   const db = new WalrusSqlClient({ packageId: "0xdev", network: "sui-testnet", mode: "simulator" });
   for (const s of setupSql) await db.execute(s);
 
@@ -165,12 +223,15 @@ async function main() {
   mkdirSync(dirname(reportPath), { recursive: true });
   mkdirSync(mreDir, { recursive: true });
 
-  for (const c of cases) {
+  for (const c of selected) {
     const walrusRows = (await db.query(c.walrusSql)).rows as Row[];
-    const sqliteSql = c.sqliteSql ?? c.walrusSql;
+    const sqliteSql = mapSqliteSql(c);
     const sqliteRows = runSqlite(setupSql, sqliteSql);
     const ok = rowsEqual(walrusRows, sqliteRows);
-    if (!ok) {
+    const expectedFail = Boolean(c.xfailReason);
+    const pass = expectedFail ? !ok : ok;
+
+    if (!pass) {
       failed++;
       const safe = makeSafeName(`${c.category}-${c.name}`);
       const mrePath = join(mreDir, `${safe}.sql`);
@@ -178,12 +239,16 @@ async function main() {
       console.log(`  MRE written: ${mrePath}`);
     }
 
-    console.log(`${ok ? "PASS" : "FAIL"} :: [${c.category}] ${c.name}`);
+    const tag = expectedFail ? (ok ? "XPASS" : "XFAIL") : (ok ? "PASS" : "FAIL");
+    console.log(`${tag} :: [${c.category}] ${c.name}`);
 
     results.push({
       category: c.category,
       name: c.name,
       ok,
+      pass,
+      expectedFail,
+      xfailReason: c.xfailReason ?? null,
       walrusSql: c.walrusSql,
       sqliteSql,
       walrusRows,
@@ -191,16 +256,26 @@ async function main() {
     });
   }
 
+  const categories = [...new Set(selected.map((c) => c.category))];
+  const categorySummary = categories.map((cat) => {
+    const slice = results.filter((r) => r.category === cat);
+    const pass = slice.filter((r) => r.pass).length;
+    const xfail = slice.filter((r) => r.expectedFail && !r.ok).length;
+    const xpass = slice.filter((r) => r.expectedFail && r.ok).length;
+    return { category: cat, total: slice.length, passed: pass, failed: slice.length - pass, xfail, xpass };
+  });
+
   const summary = {
-    total: cases.length,
-    passed: cases.length - failed,
+    profile,
+    total: selected.length,
+    passed: selected.length - failed,
     failed,
   };
 
-  writeFileSync(reportPath, JSON.stringify({ summary, results }, null, 2), "utf8");
+  writeFileSync(reportPath, JSON.stringify({ summary, categorySummary, results }, null, 2), "utf8");
   console.log(`Report written: ${reportPath}`);
 
-  if (failed) throw new Error(`SQLite matrix compare failed: ${failed}/${cases.length}`);
+  if (failed) throw new Error(`SQLite matrix compare failed: ${failed}/${selected.length}`);
 }
 
 main().catch((e) => {

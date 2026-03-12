@@ -15,19 +15,31 @@ npm run sql:roadmap
 npm run sql:compare
 npm run sql:compare:sqlite
 npm run sql:compare:matrix
+npm run sql:compare:matrix:nightly
 npm run onchain:select-replay
 ```
 
 ## CI
 
-GitHub Actions workflow: `.github/workflows/sql-compare.yml`
+GitHub Actions workflows:
+- `.github/workflows/sql-compare.yml` (PR/push profile)
+- `.github/workflows/sql-compare-nightly.yml` (nightly extended profile)
 
-It runs on push/PR:
+PR/push workflow runs:
 - `npm run build`
 - `npm run sql:roadmap`
 - `npm run sql:compare:matrix`
 
-It also uploads `reports/sql-compare-report.json` as an artifact.
+Nightly workflow runs:
+- `npm run build`
+- `npm run sql:compare:matrix:nightly`
+
+Artifacts:
+- `reports/sql-compare-report.json` or `reports/sql-compare-nightly.json`
+- `reports/mre/**` (when failures occur)
+
+Note:
+- Nightly profile can contain explicit `XFAIL` cases for known semantic gaps.
 
 ## Key Scripts
 

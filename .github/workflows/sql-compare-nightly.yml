@@ -1,12 +1,12 @@
-name: SQL Compare Matrix
+name: SQL Compare Nightly
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
 
 jobs:
-  sql-compare-pr:
+  sql-compare-nightly:
     runs-on: ubuntu-latest
 
     steps:
@@ -30,24 +30,21 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: SQL roadmap smoke
-        run: npm run sql:roadmap
+      - name: SQLite matrix compare (nightly profile)
+        run: npm run sql:compare:matrix:nightly
 
-      - name: SQLite matrix compare (PR profile)
-        run: npm run sql:compare:matrix
-
-      - name: Upload compare report
+      - name: Upload nightly compare report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sql-compare-report
-          path: reports/sql-compare-report.json
+          name: sql-compare-nightly-report
+          path: reports/sql-compare-nightly.json
           if-no-files-found: ignore
 
-      - name: Upload MRE files (if any)
+      - name: Upload nightly MRE files (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sql-compare-mre
+          name: sql-compare-nightly-mre
           path: reports/mre
           if-no-files-found: ignore

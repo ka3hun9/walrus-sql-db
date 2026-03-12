@@ -1,49 +1,49 @@
 {
   "summary": {
-    "profile": "pr",
-    "total": 29,
-    "passed": 29,
+    "profile": "nightly",
+    "total": 39,
+    "passed": 39,
     "failed": 0
   },
   "categorySummary": [
     {
       "category": "compare",
-      "total": 3,
-      "passed": 3,
+      "total": 5,
+      "passed": 5,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "null-3vl",
-      "total": 4,
-      "passed": 4,
+      "total": 5,
+      "passed": 5,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "like",
-      "total": 3,
-      "passed": 3,
+      "total": 4,
+      "passed": 4,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "in-between",
-      "total": 3,
-      "passed": 3,
+      "total": 4,
+      "passed": 4,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "subquery",
-      "total": 4,
-      "passed": 4,
+      "total": 5,
+      "passed": 5,
       "failed": 0,
-      "xfail": 0,
+      "xfail": 1,
       "xpass": 0
     },
     {
@@ -56,24 +56,24 @@
     },
     {
       "category": "expr",
-      "total": 6,
-      "passed": 6,
+      "total": 8,
+      "passed": 8,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "logic",
-      "total": 2,
-      "passed": 2,
+      "total": 3,
+      "passed": 3,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
     },
     {
       "category": "having",
-      "total": 2,
-      "passed": 2,
+      "total": 3,
+      "passed": 3,
       "failed": 0,
       "xfail": 0,
       "xpass": 0
@@ -899,6 +899,328 @@
         {
           "user_id": "u9",
           "sum": 30
+        }
+      ]
+    },
+    {
+      "category": "compare",
+      "name": "compare >=",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE amount >= 25 ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE amount >= 25 ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ]
+    },
+    {
+      "category": "compare",
+      "name": "compare <",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE amount < 25 ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE amount < 25 ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        }
+      ]
+    },
+    {
+      "category": "null-3vl",
+      "name": "city IS NOT NULL",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM users WHERE city IS NOT NULL ORDER BY id",
+      "sqliteSql": "SELECT id FROM users WHERE city IS NOT NULL ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "u1"
+        },
+        {
+          "id": "u2"
+        },
+        {
+          "id": "u4"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "u1"
+        },
+        {
+          "id": "u2"
+        },
+        {
+          "id": "u4"
+        }
+      ]
+    },
+    {
+      "category": "like",
+      "name": "like plain",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE note LIKE 'A%' ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE note LIKE 'A%' ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ]
+    },
+    {
+      "category": "in-between",
+      "name": "NOT IN literal",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE status NOT IN ('paid') ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE status NOT IN ('paid') ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ]
+    },
+    {
+      "category": "expr",
+      "name": "cast real",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE CAST(amount / 4 AS REAL) > 5 ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE CAST(amount / 4 AS REAL) > 5 ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ]
+    },
+    {
+      "category": "expr",
+      "name": "coalesce in where nightly",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE COALESCE(note, 'x') LIKE 'A%' ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE COALESCE(note, 'x') LIKE 'A%' ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
+        }
+      ]
+    },
+    {
+      "category": "logic",
+      "name": "nested boolean",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT id FROM orders WHERE (status='paid' AND amount>20) OR (status='draft' AND amount>=25) ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE (status='paid' AND amount>20) OR (status='draft' AND amount>=25) ORDER BY id",
+      "walrusRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        }
+      ],
+      "sqliteRows": [
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        }
+      ]
+    },
+    {
+      "category": "having",
+      "name": "having coalesce",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING COALESCE(sum, 0) > 20 ORDER BY user_id",
+      "sqliteSql": "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING COALESCE(sum, 0) > 20 ORDER BY user_id",
+      "walrusRows": [
+        {
+          "user_id": "u1",
+          "sum": 70
+        },
+        {
+          "user_id": "u4",
+          "sum": 25
+        },
+        {
+          "user_id": "u9",
+          "sum": 30
+        }
+      ],
+      "sqliteRows": [
+        {
+          "user_id": "u1",
+          "sum": 70
+        },
+        {
+          "user_id": "u4",
+          "sum": 25
+        },
+        {
+          "user_id": "u9",
+          "sum": 30
+        }
+      ]
+    },
+    {
+      "category": "subquery",
+      "name": "scalar subquery compare mapped",
+      "ok": false,
+      "pass": true,
+      "expectedFail": true,
+      "xfailReason": "simulator scalar-subquery NULL propagation differs from SQLite null-filtered MIN mapping",
+      "walrusSql": "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users) ORDER BY id",
+      "sqliteSql": "SELECT id FROM orders WHERE amount > (SELECT MIN(tier) FROM users WHERE tier IS NOT NULL) ORDER BY id",
+      "walrusRows": [],
+      "sqliteRows": [
+        {
+          "id": "o1"
+        },
+        {
+          "id": "o2"
+        },
+        {
+          "id": "o3"
+        },
+        {
+          "id": "o4"
+        },
+        {
+          "id": "o5"
         }
       ]
     }
