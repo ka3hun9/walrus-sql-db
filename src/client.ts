@@ -205,6 +205,25 @@ export class WalrusSqlClient {
   }
 
   async query(sql: string): Promise<QueryResult> {
+    const normalizedForDerived = sql.trim().replace(/\s+/g, " ");
+    const derived = this.parseFromSubquery(normalizedForDerived);
+    if (derived) {
+      const inner = await this.query(derived.subquerySql);
+      const tempTable = `__derived_${randomUUID().replace(/-/g, "")}`;
+      const materialized = inner.rows.map((r) => {
+        const out: SqlRow = { ...r };
+        for (const [k, v] of Object.entries(r)) out[`${derived.alias}.${k}`] = v;
+        return out;
+      });
+
+      this.tables.set(tempTable, materialized);
+      try {
+        return await this.query(derived.rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+      } finally {
+        this.tables.delete(tempTable);
+      }
+    }
+
     const unionSplit = this.splitUnion(sql);
     if (unionSplit) {
       const left = await this.query(unionSplit.left);
@@ -316,6 +335,19 @@ export class WalrusSqlClient {
 
   async verify(result: QueryProofResult): Promise<boolean> {
     return Boolean(result.proof.manifestHash && result.proof.indexRoot && result.proof.txDigest);
+  }
+
+  private parseFromSubquery(sql: string): { subquerySql: string; alias: string; rewrittenSql: string } | null {
+    const m = sql.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+([a-zA-Z_][a-zA-Z0-9_]*)(.*)$/i);
+    if (!m) return null;
+
+    const outerFields = m[1]!.trim();
+    const subquerySql = m[2]!.trim();
+    const alias = m[3]!.trim();
+    const tail = m[4] ?? "";
+
+    const rewrittenSql = `SELECT ${outerFields} FROM __DERIVED_TABLE__${tail}`;
+    return { subquerySql, alias, rewrittenSql };
   }
 
   private splitUnion(sql: string): { left: string; right: string; all: boolean } | null {

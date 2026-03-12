@@ -7,7 +7,7 @@
 | SELECT/WHERE/ORDER/LIMIT/OFFSET | ✅ | Baseline stable + 3VL filter semantics |
 | Aggregates + GROUP BY/HAVING | ✅ | COUNT/SUM/AVG/MIN/MAX |
 | JOIN | 🟡 | INNER/LEFT/RIGHT (first-cut) |
-| Subquery | 🟡 | IN/EXISTS/scalar/ANY/ALL first-cut + correlated WHERE refs via `outer.<col>` |
+| Subquery | 🟡 | IN/EXISTS/scalar/ANY/ALL first-cut + correlated WHERE refs via `outer.<col>` + FROM subquery first-cut |
 | UNION | 🟡 | UNION / UNION ALL first-cut |
 | Window | 🟡 | ROW_NUMBER first-cut |
 | NULL/LIKE | ✅ | 3VL, IS NULL/IS NOT NULL, LIKE/NOT LIKE, LIKE ESCAPE |
