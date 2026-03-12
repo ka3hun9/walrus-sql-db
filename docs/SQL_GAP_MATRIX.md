@@ -19,17 +19,25 @@
 
 ## Next milestones
 
-1. **M1 (stabilize)**
+1. **Sprint E (in progress / phase-1 done)**
+   - ✅ Matrix coverage expanded (PR profile + nightly profile)
+   - ✅ SQLite dialect mapping extracted to dedicated module (`examples/sql-compare-dialect.ts`)
+   - ✅ CI split by profile:
+     - `.github/workflows/sql-compare.yml` (PR/push)
+     - `.github/workflows/sql-compare-nightly.yml` (scheduled)
+   - ✅ Report supports category summary and XFAIL/XPASS tracking
+
+2. **M1 (stabilize)**
    - Join correctness test matrix
    - Complex where precedence + parentheses AST
    - Subquery edge cases + negative tests
 
-2. **M2 (coverage)**
+3. **M2 (coverage)**
    - Correlated subquery
    - FROM subquery
    - Extra windows (RANK, DENSE_RANK)
 
-3. **M3 (engine)**
+4. **M3 (engine)**
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
