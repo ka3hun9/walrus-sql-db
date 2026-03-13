@@ -163,7 +163,22 @@ function parsePrimary(ts: TokenStream): ExprAst {
   }
 
   if (isIdentifierToken(t) && ts.peek() === "(") {
+    const fn = t.toUpperCase();
     ts.next(); // (
+
+    if (fn === "CAST") {
+      const valueExpr = parseOr(ts);
+      ts.expect("AS");
+      const targetType = ts.next();
+      if (!targetType) throw new Error("expected CAST target type");
+      ts.expect(")");
+      return {
+        kind: "function",
+        name: "CAST",
+        args: [valueExpr, { kind: "literal", value: targetType.toUpperCase() }],
+      };
+    }
+
     const args: ExprAst[] = [];
     if (ts.peek() !== ")") {
       while (!ts.eof()) {
@@ -176,7 +191,7 @@ function parsePrimary(ts: TokenStream): ExprAst {
       }
     }
     ts.expect(")");
-    return { kind: "function", name: t.toUpperCase(), args };
+    return { kind: "function", name: fn, args };
   }
 
   if (isIdentifierToken(t)) return { kind: "identifier", name: t };

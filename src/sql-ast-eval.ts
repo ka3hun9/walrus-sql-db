@@ -143,6 +143,22 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
         return String(a) === String(b) ? null : a;
       }
 
+      if (fn === "CAST") {
+        const a = args[0];
+        const t = String(args[1] ?? "").toUpperCase();
+        if (a == null) return null;
+        if (t === "TEXT") return String(a);
+        if (t === "INT" || t === "INTEGER") {
+          const n = Number(a);
+          return Number.isFinite(n) ? Math.trunc(n) : null;
+        }
+        if (t === "REAL") {
+          const n = Number(a);
+          return Number.isFinite(n) ? n : null;
+        }
+        return null;
+      }
+
       return null;
     }
     case "raw":

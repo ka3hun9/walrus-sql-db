@@ -124,12 +124,14 @@ Regression examples:
 - `examples/sql-client-g3a-ast-tree-consistency.ts`
 - `examples/sql-g3b-subquery-edge-regression.ts`
 - `examples/sql-g3b-expr-edge-regression.ts`
+- `examples/sql-g3b-cast-case-regression.ts`
 
 ## 9) G3-B expression/subquery edge notes
 
 Current additions:
 - subquery edge regressions (correlated EXISTS, NOT IN + NULL propagation, scalar subquery null-compare)
-- AST function eval support for `COALESCE` / `NULLIF` in predicate path
+- AST function eval support for `COALESCE` / `NULLIF` / `CAST` in predicate path
+- `CASE` remains covered via bounded raw-expression fallback path in current baseline
 
 ## 10) Change-control rules
 
