@@ -25,6 +25,7 @@ const cases: RunnerCase[] = [
   { name: "g5-sqlserver-top", script: "examples/sql-g5-sqlserver-top-regression.ts" },
   { name: "g5-fetch", script: "examples/sql-g5-fetch-regression.ts" },
   { name: "g5-quoting", script: "examples/sql-g5-quoting-regression.ts" },
+  { name: "g5-function-gating", script: "examples/sql-g5-function-gating-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

@@ -41,6 +41,16 @@ Implemented:
 - non-target dialect usage throws deterministic `SQL_DIALECT_UNSUPPORTED_SYNTAX`
 - normalized quoted identifiers feed existing parser/executor path (no silent fallback)
 
+## G5-E: Dialect function gating (explicit)
+
+Implemented:
+- parser adds dialect-specific function gate with deterministic error:
+  - mysql-only: `IFNULL`
+  - sqlserver-only: `ISNULL`, `IIF`
+  - postgres-only: `DATE_TRUNC`
+  - sqlite-only: `PRINTF`
+- non-target dialect invocation fails fast with `SQL_DIALECT_UNSUPPORTED_FUNCTION`
+
 Regression:
-- `examples/sql-g5-quoting-regression.ts`
+- `examples/sql-g5-function-gating-regression.ts`
 

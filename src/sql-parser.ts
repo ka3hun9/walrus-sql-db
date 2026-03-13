@@ -10,6 +10,26 @@ import type {
   TableRefAst,
 } from "./sql-ast.js";
 
+function detectUnsupportedDialectFunction(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
+  const text = sql.toUpperCase();
+  const fnMatches = Array.from(text.matchAll(/\b([A-Z_][A-Z0-9_]*)\s*\(/g)).map((m) => m[1]!);
+  if (fnMatches.length === 0) return null;
+
+  const mysqlOnly = new Set(["IFNULL"]);
+  const sqlserverOnly = new Set(["ISNULL", "IIF"]);
+  const postgresOnly = new Set(["DATE_TRUNC"]);
+  const sqliteOnly = new Set(["PRINTF"]);
+
+  for (const fn of fnMatches) {
+    if (mysqlOnly.has(fn) && dialect !== "mysql") return fn;
+    if (sqlserverOnly.has(fn) && dialect !== "sqlserver") return fn;
+    if (postgresOnly.has(fn) && dialect !== "postgres") return fn;
+    if (sqliteOnly.has(fn) && dialect !== "sqlite") return fn;
+  }
+
+  return null;
+}
+
 function normalizeDialectQuotedIdentifiers(sql: string, dialect: SqlDialectProfile = "ansi"): string {
   const hasBacktickQuoted = /`[^`]+`/.test(sql);
   const hasBracketQuoted = /\[[^\]]+\]/.test(sql);
@@ -534,6 +554,15 @@ export function parseSqlToAst(
   }
 
   const normalized = normalizeDialectQuotedIdentifiers(sql, dialect).trim().replace(/\s+/g, " ");
+  const unsupportedFn = detectUnsupportedDialectFunction(normalized, dialect);
+  if (unsupportedFn) {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_FUNCTION", {
+      message: `Function ${unsupportedFn} is not enabled for current dialect profile`,
+      token: unsupportedFn,
+      dialect,
+    });
+  }
+
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
 
