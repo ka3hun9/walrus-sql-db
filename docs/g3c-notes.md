@@ -11,5 +11,8 @@ Regression:
 - `examples/sql-g3c-window-row-number.ts`
 
 ## Next in G3-C
-- set-op parity pass (UNION/UNION ALL projection and ordering edge cases)
-- additional window edge coverage (ties, null ordering behavior)
+- [x] set-op parity pass (UNION/UNION ALL projection and ordering edge cases)
+- [ ] additional window edge coverage (ties, null ordering behavior)
+
+Set-op regression:
+- `examples/sql-g3c-setop-regression.ts`

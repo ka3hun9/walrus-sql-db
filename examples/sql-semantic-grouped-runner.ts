@@ -13,6 +13,8 @@ const cases: RunnerCase[] = [
   { name: "g3b-expr-edge", script: "examples/sql-g3b-expr-edge-regression.ts" },
   { name: "g3b-cast-case", script: "examples/sql-g3b-cast-case-regression.ts" },
   { name: "g3b-composed-expr", script: "examples/sql-g3b-composed-expr-regression.ts" },
+  { name: "g3c-window-row-number", script: "examples/sql-g3c-window-row-number.ts" },
+  { name: "g3c-setop", script: "examples/sql-g3c-setop-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

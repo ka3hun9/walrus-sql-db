@@ -243,7 +243,7 @@ export class WalrusSqlClient {
       }
       const dedup = new Map<string, SqlRow>();
       for (const row of [...left.rows, ...right.rows]) {
-        dedup.set(JSON.stringify(row), row);
+        dedup.set(this.makeRowKey(row), row);
       }
       return { rows: [...dedup.values()] };
     }
@@ -1851,6 +1851,16 @@ export class WalrusSqlClient {
       out[key] = val ?? null;
     }
     return out;
+  }
+
+  private makeRowKey(row: SqlRow): string {
+    const ordered = Object.keys(row)
+      .sort()
+      .reduce((acc, k) => {
+        acc[k] = row[k] ?? null;
+        return acc;
+      }, {} as SqlRow);
+    return JSON.stringify(ordered);
   }
 
   private eq(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): boolean {
