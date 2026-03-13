@@ -12,6 +12,9 @@
   - validates set-op projection schema behavior follows left branch output names/order
   - validates `UNION` distinct vs `UNION ALL` cardinality under aligned projection
   - validates ordering stability after set-op on left-branch column names
+- `examples/sql-g3d-setop-order-limit-offset-regression.ts`
+  - validates outer ORDER BY/LIMIT/OFFSET is applied on merged set-op result
+  - covers both `UNION` distinct and `UNION ALL` pagination behavior
 
 ## Status
 - Initial G3-D combo regression is passing in simulator path.

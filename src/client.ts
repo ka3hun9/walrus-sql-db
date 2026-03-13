@@ -237,8 +237,10 @@ export class WalrusSqlClient {
     const ast = parseSqlToAst(sql);
 
     if (ast.kind === "union") {
+      const rightPlan = this.splitSelectTail(ast.rightSql);
+
       const left = await this.query(ast.leftSql);
-      const right = await this.query(ast.rightSql);
+      const right = await this.query(rightPlan.baseSql);
 
       const inferredLeftColumns = this.inferUnionColumns(ast.leftSql);
       const leftColumns =
@@ -248,14 +250,19 @@ export class WalrusSqlClient {
       const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
       const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
 
-      if (ast.all) {
-        return { rows: [...normalizedLeft, ...normalizedRight] };
-      }
-      const dedup = new Map<string, SqlRow>();
-      for (const row of [...normalizedLeft, ...normalizedRight]) {
-        dedup.set(this.makeRowKey(row), row);
-      }
-      return { rows: [...dedup.values()] };
+      const merged = ast.all
+        ? [...normalizedLeft, ...normalizedRight]
+        : (() => {
+            const dedup = new Map<string, SqlRow>();
+            for (const row of [...normalizedLeft, ...normalizedRight]) {
+              dedup.set(this.makeRowKey(row), row);
+            }
+            return [...dedup.values()];
+          })();
+
+      const ordered = this.applyOrder(merged, rightPlan.orderByList);
+      const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
+      return { rows: paged };
     }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
@@ -603,6 +610,39 @@ export class WalrusSqlClient {
       out[col] = values[idx] ?? null;
     });
     return out;
+  }
+
+  private splitSelectTail(sql: string): {
+    baseSql: string;
+    orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+    limit?: number;
+    offset?: number;
+  } {
+    const trimmed = sql.trim();
+    const m = trimmed.match(
+      /^(.*?)(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$/i,
+    );
+    if (!m) return { baseSql: trimmed };
+
+    const baseSql = m[1]!.trim();
+    const orderByText = m[2]?.trim();
+    const limit = m[3] ? Number(m[3]) : undefined;
+    const offset = m[4] ? Number(m[4]) : undefined;
+
+    const orderByList = orderByText
+      ? orderByText
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((part) => {
+            const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)((?:\s+(?:ASC|DESC))?)$/i);
+            if (!om) throw sqlError("ERR_UNSUPPORTED_ORDER_BY", part);
+            const dir = om[2]?.trim().toUpperCase() as "ASC" | "DESC" | "";
+            return { field: om[1], direction: (dir || "ASC") as "ASC" | "DESC" };
+          })
+      : undefined;
+
+    return { baseSql, orderByList, limit, offset };
   }
 
   private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
