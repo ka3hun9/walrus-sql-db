@@ -64,6 +64,17 @@ export function resolveIdentifierBinding(availableKeys: string[], identifier: st
     };
   }
 
+  // qualified identifier fallback: allow `<table>.<col>` to bind `<col>` if present.
+  if (canonical.includes(".")) {
+    const leaf = canonical.split(".").at(-1) ?? canonical;
+    if (availableKeys.includes(leaf)) {
+      return {
+        resolved: { name: leaf },
+        isOuterRef,
+      };
+    }
+  }
+
   // unqualified identifier fallback: match `<alias>.<column>` uniquely
   if (!canonical.includes(".")) {
     const suffix = `.${canonical}`;

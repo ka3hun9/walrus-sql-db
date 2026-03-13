@@ -1228,7 +1228,7 @@ export class WalrusSqlClient {
     const fields = fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
     return filtered.map((row) => {
       const out: SqlRow = {};
-      for (const f of fields) out[f] = this.resolveRowValue(row, f) ?? null;
+      for (const f of fields) out[f] = this.evalExpr(row, f) ?? null;
       return out;
     });
   }
@@ -1569,14 +1569,14 @@ export class WalrusSqlClient {
   }
 
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
-    const left = clause.valueExpr ? this.evalExpr(row, clause.valueExpr) : this.resolveRowValue(row, clause.field);
-
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
       const exists = this.parseSubquerySelect(subquerySql, row).length > 0;
       const tv: TruthValue = exists ? "TRUE" : "FALSE";
       return clause.op === "EXISTS" ? tv : this.tvNot(tv);
     }
+
+    const left = clause.valueExpr ? this.evalExpr(row, clause.valueExpr) : this.resolveRowValue(row, clause.field);
 
     if (clause.op === "ANY" || clause.op === "ALL") {
       const subquerySql = String(clause.value ?? "");
