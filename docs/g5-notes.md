@@ -32,6 +32,15 @@ Implemented:
 - malformed FETCH shape returns deterministic `SQL_SYNTAX_INCOMPLETE_STATEMENT`
 - mixed row-limiter conflict (`TOP/LIMIT/FETCH` simultaneously) returns `SQL_SYNTAX_INVALID_CLAUSE_ORDER`
 
+## G5-D: Dialect identifier quoting gateway
+
+Implemented:
+- parser pre-normalization now handles dialect-specific identifier quoting:
+  - mysql: backticks (e.g. `` `users` ``)
+  - sqlserver: bracket quoting (e.g. `[users]`)
+- non-target dialect usage throws deterministic `SQL_DIALECT_UNSUPPORTED_SYNTAX`
+- normalized quoted identifiers feed existing parser/executor path (no silent fallback)
+
 Regression:
-- `examples/sql-g5-fetch-regression.ts`
+- `examples/sql-g5-quoting-regression.ts`
 

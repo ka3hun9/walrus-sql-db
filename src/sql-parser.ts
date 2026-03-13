@@ -10,6 +10,36 @@ import type {
   TableRefAst,
 } from "./sql-ast.js";
 
+function normalizeDialectQuotedIdentifiers(sql: string, dialect: SqlDialectProfile = "ansi"): string {
+  const hasBacktickQuoted = /`[^`]+`/.test(sql);
+  const hasBracketQuoted = /\[[^\]]+\]/.test(sql);
+
+  if (hasBacktickQuoted && dialect !== "mysql") {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message: "Backtick-quoted identifiers are only enabled for mysql dialect profile",
+      token: "`",
+      dialect,
+    });
+  }
+
+  if (hasBracketQuoted && dialect !== "sqlserver") {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message: "Bracket-quoted identifiers are only enabled for sqlserver dialect profile",
+      token: "[",
+      dialect,
+    });
+  }
+
+  let out = sql;
+  if (dialect === "mysql") {
+    out = out.replace(/`([a-zA-Z_][a-zA-Z0-9_]*)`/g, "$1");
+  }
+  if (dialect === "sqlserver") {
+    out = out.replace(/\[([a-zA-Z_][a-zA-Z0-9_]*)\]/g, "$1");
+  }
+  return out;
+}
+
 function trimQuoted(v: string): string {
   if ((v.startsWith("'") && v.endsWith("'")) || (v.startsWith('"') && v.endsWith('"'))) return v.slice(1, -1);
   return v;
@@ -473,8 +503,10 @@ export type ParseSqlToAstResult = {
 };
 
 export function parseSqlToAstWithMeta(sql: string, options?: ParseSqlToAstOptions): ParseSqlToAstResult {
-  const grammar = inspectSqlGrammarSkeleton(sql, { dialect: options?.dialect });
-  const ast = parseSqlToAst(sql, { grammar, dialect: options?.dialect });
+  const dialect = options?.dialect ?? "ansi";
+  const normalizedForDialect = normalizeDialectQuotedIdentifiers(sql, dialect);
+  const grammar = inspectSqlGrammarSkeleton(normalizedForDialect, { dialect });
+  const ast = parseSqlToAst(sql, { grammar, dialect });
   return { ast, grammar };
 }
 
@@ -483,7 +515,7 @@ export function parseSqlToAst(
   precomputedOrOptions?: SqlGrammarSkeleton | ParseSqlToAstOptions | { grammar?: SqlGrammarSkeleton; dialect?: SqlDialectProfile },
 ): SqlAstStatement {
   const dialect =
-    precomputedOrOptions && "dialect" in precomputedOrOptions ? precomputedOrOptions.dialect : undefined;
+    (precomputedOrOptions && "dialect" in precomputedOrOptions ? precomputedOrOptions.dialect : undefined) ?? "ansi";
   const precomputedSkeleton =
     precomputedOrOptions && "clauses" in precomputedOrOptions
       ? precomputedOrOptions
@@ -501,7 +533,7 @@ export function parseSqlToAst(
     });
   }
 
-  const normalized = sql.trim().replace(/\s+/g, " ");
+  const normalized = normalizeDialectQuotedIdentifiers(sql, dialect).trim().replace(/\s+/g, " ");
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
 
