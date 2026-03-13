@@ -69,6 +69,14 @@ Implemented:
   - sqlite-only: `NONE`
 - non-target dialect CAST targets fail fast with deterministic `SQL_DIALECT_UNSUPPORTED_SYNTAX`
 
+## G5-H: Clause-shape dialect constraints
+
+Implemented (sqlserver profile):
+- `LIMIT` rejected (`SQL_DIALECT_UNSUPPORTED_SYNTAX`)
+- `OFFSET` requires `ORDER BY` (`SQL_SYNTAX_INVALID_CLAUSE_ORDER`)
+- `FETCH` requires both `ORDER BY` and `OFFSET` (`SQL_SYNTAX_INVALID_CLAUSE_ORDER`)
+- valid shape accepted: `ORDER BY ... OFFSET n FETCH NEXT m ROW(S) ONLY`
+
 Regression:
-- `examples/sql-g5-cast-type-gating-regression.ts`
+- `examples/sql-g5-clause-shape-regression.ts`
 

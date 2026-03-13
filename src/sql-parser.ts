@@ -742,6 +742,40 @@ export function parseSqlToAst(
     });
   }
 
+  if (dialect === "sqlserver") {
+    if (limitFromLimit !== undefined) {
+      throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+        message: "LIMIT is not enabled for sqlserver dialect profile; use TOP or OFFSET/FETCH",
+        token: "LIMIT",
+        dialect,
+      });
+    }
+
+    if (offset !== undefined && !orderBy) {
+      throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+        message: "SQL Server OFFSET requires ORDER BY",
+        token: "OFFSET",
+        hint: "Use ORDER BY ... OFFSET n ROWS [FETCH NEXT m ROWS ONLY]",
+      });
+    }
+
+    if (limitFromFetch !== undefined && !orderBy) {
+      throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+        message: "SQL Server FETCH requires ORDER BY",
+        token: "FETCH",
+        hint: "Use ORDER BY ... OFFSET n ROWS FETCH NEXT m ROWS ONLY",
+      });
+    }
+
+    if (limitFromFetch !== undefined && offset === undefined) {
+      throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+        message: "SQL Server FETCH requires OFFSET",
+        token: "FETCH",
+        hint: "Use OFFSET n ROWS FETCH NEXT m ROWS ONLY",
+      });
+    }
+  }
+
   const limit = topLimit ?? limitFromLimit ?? limitFromFetch;
 
   const ast: SelectStatementAst = {
