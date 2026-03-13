@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
+import { evalExprAst, exprAstToSql } from "./sql-ast-eval.js";
 import type { ExprAst, SelectStatementAst } from "./sql-ast.js";
 
 type CompareOp =
@@ -70,6 +71,8 @@ type ParsedSelect = {
   table: string;
   fields: string[] | ["*"];
   where?: string;
+  whereAst?: ExprAst;
+  havingAst?: ExprAst;
   whereClauses: WhereClause[];
   whereTree?: WhereExprNode;
   limit?: number;
@@ -95,6 +98,8 @@ type AstParsedSelect = {
   table: string;
   fields: string[] | ["*"];
   where?: string;
+  whereAst?: ExprAst;
+  havingAst?: ExprAst;
   whereClauses: WhereClause[];
   whereTree?: WhereExprNode;
   limit?: number;
@@ -318,7 +323,26 @@ export class WalrusSqlClient {
 
     const bucket = this.requireTable(parsed.table);
     const baseRows = parsed.join ? this.applyJoin(parsed.table, bucket, parsed.join) : bucket;
-    const filtered = parsed.whereTree
+    const whereSql = this.exprAstToSql(parsed.whereAst);
+    const filtered = parsed.whereAst && whereSql
+      && !/\bLIST\s*\(/i.test(whereSql)
+      && !/\bIN\s*\(/i.test(whereSql)
+      && !/\bBETWEEN\b/i.test(whereSql)
+      && !/\bLIKE\b/i.test(whereSql)
+      && !/\bIS\s+DISTINCT\s+FROM\b/i.test(whereSql)
+      && !/\bIS\s+NOT\s+DISTINCT\s+FROM\b/i.test(whereSql)
+      && !/\bEXISTS\s*\(/i.test(whereSql)
+      && !/\b(ANY|SOME|ALL)\s*\(\s*SELECT\b/i.test(whereSql)
+      && !/\(\s*SELECT\b/i.test(whereSql)
+      && !/\bCASE\b/i.test(whereSql)
+      && !/\bCOALESCE\s*\(/i.test(whereSql)
+      && !/\bNULLIF\s*\(/i.test(whereSql)
+      && !/\bCAST\s*\(/i.test(whereSql)
+      ? baseRows.filter((row) => {
+          const v = evalExprAst(parsed.whereAst!, (name) => this.resolveRowValue(row, name));
+          return v === true;
+        })
+      : parsed.whereTree
       ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
       : parsed.whereClauses.length
         ? this.applyWhereClauses(baseRows, parsed.whereClauses)
@@ -326,7 +350,21 @@ export class WalrusSqlClient {
 
     if (parsed.groupBy?.length) {
       const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
-      const havingRows = parsed.having
+      const havingSql = this.exprAstToSql(parsed.havingAst);
+      const havingRows = parsed.havingAst && havingSql
+        && !/\bLIST\s*\(/i.test(havingSql)
+        && !/\bIN\s*\(/i.test(havingSql)
+        && !/\bBETWEEN\b/i.test(havingSql)
+        && !/\bLIKE\b/i.test(havingSql)
+        && !/\bCASE\b/i.test(havingSql)
+        && !/\bCOALESCE\s*\(/i.test(havingSql)
+        && !/\bNULLIF\s*\(/i.test(havingSql)
+        && !/\bCAST\s*\(/i.test(havingSql)
+        ? grouped.filter((row) => {
+            const v = evalExprAst(parsed.havingAst!, (name) => this.resolveRowValue(row, name));
+            return v === true;
+          })
+        : parsed.having
         ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(parsed.having!)) === "TRUE")
         : grouped;
       const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
@@ -451,28 +489,13 @@ export class WalrusSqlClient {
   }
 
   private exprAstToSql(expr?: ExprAst): string | undefined {
-    if (!expr) return undefined;
-    switch (expr.kind) {
-      case "identifier":
-        return expr.name;
-      case "literal":
-        if (expr.value === null) return "NULL";
-        if (typeof expr.value === "string") return `'${String(expr.value).replace(/'/g, "''")}'`;
-        if (typeof expr.value === "boolean") return expr.value ? "TRUE" : "FALSE";
-        return String(expr.value);
-      case "function":
-        return `${expr.name}(${expr.args.map((a) => this.exprAstToSql(a) ?? "").join(", ")})`;
-      case "raw":
-        return expr.text;
-      default:
-        return undefined;
-    }
+    return exprAstToSql(expr);
   }
 
   private astSelectToParsedSelect(ast: SelectStatementAst): AstParsedSelect {
     const table = ast.from.name;
-    const where = this.exprAstToSql(ast.where);
-    const having = this.exprAstToSql(ast.having);
+    const where = ast.whereText ?? this.exprAstToSql(ast.where);
+    const having = ast.havingText ?? this.exprAstToSql(ast.having);
 
     const groupBy = ast.groupBy?.map((g) => this.exprAstToSql(g) ?? "").filter(Boolean);
 
@@ -529,6 +552,8 @@ export class WalrusSqlClient {
       table,
       fields,
       where,
+      whereAst: ast.where,
+      havingAst: ast.having,
       whereClauses,
       whereTree,
       limit: ast.limit,
