@@ -29,4 +29,4 @@ Reference:
 - [x] add differential fixture mapping for the above scenarios (`docs/g3b-differential-fixtures.md`)
 - [x] wire regressions into grouped SQL semantic runner (`npm run sql:semantic:grouped`)
 - [ ] wire grouped runner into CI grouped SQL suite
-- [ ] publish mismatch budget note (expected deltas vs target engines)
+- [x] publish mismatch budget note (`docs/g3b-mismatch-budget.md`)

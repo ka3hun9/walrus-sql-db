@@ -133,6 +133,9 @@ Current additions:
 - subquery edge regressions (correlated EXISTS, NOT IN + NULL propagation, scalar subquery null-compare)
 - AST function eval support for `COALESCE` / `NULLIF` / `CAST` in predicate path
 - `CASE` remains covered via bounded raw-expression fallback path in current baseline
+- differential fixture mapping and mismatch budget notes:
+  - `docs/g3b-differential-fixtures.md`
+  - `docs/g3b-mismatch-budget.md`
 
 ## 10) Change-control rules
 
