@@ -1,6 +1,8 @@
 # SQL Baseline v1 (Grammar + Contracts)
 
 Status: Phase-freeze baseline (G0/G2 foundation)
+Version: `baseline-v1`
+Freeze State: `FROZEN` (see `docs/sql-baseline-v1-freeze.md`)
 
 ## 1) Scope policy
 - This baseline freezes **contracts**, not future capability.
@@ -101,7 +103,16 @@ Parser now exposes two entry points:
 
 This is the baseline observability layer for G2 freeze and later conformance diagnostics.
 
-## 7) Change-control rules
+## 7) Baseline freeze checks (G2)
+
+Run:
+- `npx tsx examples/sql-parser-g1-gate.ts`
+- `npx tsx examples/sql-baseline-v1-matrix.ts`
+
+Reference freeze declaration:
+- `docs/sql-baseline-v1-freeze.md`
+
+## 8) Change-control rules
 
 Any baseline-breaking change requires:
 1. contract note (what changed and why)
