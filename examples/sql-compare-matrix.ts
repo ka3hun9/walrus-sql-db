@@ -113,6 +113,7 @@ const baseCases: Case[] = [
     name: "setop window combo derived",
     walrusSql:
       "SELECT uid, amt, ROW_NUMBER() OVER (PARTITION BY uid ORDER BY amt DESC) AS rn FROM (SELECT user_id AS uid, amount AS amt FROM orders WHERE user_id IN ('u1','u4') UNION ALL SELECT user_id AS uid, amount AS amt FROM orders WHERE id='o1') u ORDER BY uid, rn",
+    sqliteMap: "ROW_NUMBER_DERIVED",
   },
 
   { category: "expr", name: "arith precedence", walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id" },

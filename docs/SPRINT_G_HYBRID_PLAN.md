@@ -78,6 +78,8 @@ Build toward **Full SQL parser/AST + edge semantic coverage** with minimal total
 
 ## G4 (P4) Verification System (Parallel Track)
 
+Status: Complete (2026-03-13)
+
 ### Deliverables
 - Conformance suite (ANSI-first)
 - Differential testing:

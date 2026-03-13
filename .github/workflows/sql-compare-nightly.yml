@@ -33,8 +33,14 @@ jobs:
       - name: SQLite matrix compare (nightly profile)
         run: npm run sql:compare:matrix:nightly
 
+      - name: SQL budget gate (nightly)
+        run: npm run sql:budget:gate -- reports/sql-compare-nightly.json nightly
+
       - name: SQL semantic grouped regressions
         run: npm run sql:semantic:grouped
+
+      - name: SQL fuzz + reducer
+        run: npm run sql:fuzz -- reports/sql-fuzz-nightly.json reports/mre-fuzz 120 1337
 
       - name: Upload nightly compare report
         if: always()
@@ -50,4 +56,20 @@ jobs:
         with:
           name: sql-compare-nightly-mre
           path: reports/mre
+          if-no-files-found: ignore
+
+      - name: Upload nightly fuzz report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-fuzz-nightly-report
+          path: reports/sql-fuzz-nightly.json
+          if-no-files-found: ignore
+
+      - name: Upload nightly fuzz MRE files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-fuzz-nightly-mre
+          path: reports/mre-fuzz
           if-no-files-found: ignore

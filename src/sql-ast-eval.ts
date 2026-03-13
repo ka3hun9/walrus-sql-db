@@ -94,8 +94,11 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
         if (l == null) return null;
         if (expr.right.kind === "function" && expr.right.name === "LIST") {
           const vals = expr.right.args.map((a) => evalExprAst(a, resolve));
-          const has = vals.some((v) => String(v) === String(l));
-          return op === "IN" ? has : !has;
+          const has = vals.some((v) => v != null && String(v) === String(l));
+          if (has) return op === "IN" ? true : false;
+          const hasNull = vals.some((v) => v == null);
+          if (hasNull) return null;
+          return op === "IN" ? false : true;
         }
       }
 

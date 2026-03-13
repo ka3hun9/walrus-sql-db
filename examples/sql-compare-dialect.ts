@@ -1,4 +1,4 @@
-export type SqliteMapKind = "SOME_GT" | "ALL_GT_NULLSAFE" | "DERIVED_ALIAS_DOT";
+export type SqliteMapKind = "SOME_GT" | "ALL_GT_NULLSAFE" | "DERIVED_ALIAS_DOT" | "ROW_NUMBER_DERIVED";
 
 export function mapSqliteSql(
   walrusSql: string,
@@ -30,6 +30,13 @@ export function mapSqliteSql(
 
   if (sqliteMap === "DERIVED_ALIAS_DOT") {
     return walrusSql.replace(/^SELECT\s+([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\s+/i, 'SELECT $1.$2 AS "$1.$2" ');
+  }
+
+  if (sqliteMap === "ROW_NUMBER_DERIVED") {
+    return walrusSql.replace(
+      /^SELECT\s+(.+?)\s+FROM\s*\((SELECT.+)\)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ORDER\s+BY\s+(.+)$/i,
+      'SELECT $1 FROM ($2) AS "$3" ORDER BY $4',
+    );
   }
 
   return walrusSql;
