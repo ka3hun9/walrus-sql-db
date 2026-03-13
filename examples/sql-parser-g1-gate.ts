@@ -1,9 +1,15 @@
 import { strict as assert } from "node:assert";
-import { parseSqlToAst } from "../src/sql-parser.js";
+import { parseSqlToAst, parseSqlToAstWithMeta } from "../src/sql-parser.js";
 import { SqlEngineError } from "../src/sql-errors.js";
 
 const ok = parseSqlToAst("SELECT id FROM users WHERE id > 1 ORDER BY id LIMIT 3");
 assert.equal(ok.kind, "select");
+
+const okWithMeta = parseSqlToAstWithMeta("SELECT id FROM users WHERE id > 1 ORDER BY id LIMIT 3");
+assert.equal(okWithMeta.ast.kind, "select");
+assert.equal(okWithMeta.grammar.statement, "select");
+assert.equal(okWithMeta.grammar.clauses.where, "present");
+assert.equal(okWithMeta.grammar.unsupported.length, 0);
 
 let topErr: unknown;
 try {

@@ -88,7 +88,20 @@ Out-of-scope or partial (must error explicitly or stay staged):
 - transaction semantics
 - optimizer/full planner semantics
 
-## 6) Change-control rules
+## 6) Parser observability (G1)
+
+Parser now exposes two entry points:
+- `parseSqlToAst(sql)`
+- `parseSqlToAstWithMeta(sql)` -> `{ ast, grammar }`
+
+`grammar` comes from `inspectSqlGrammarSkeleton` and provides:
+- statement kind
+- clause presence map
+- explicit unsupported feature list
+
+This is the baseline observability layer for G2 freeze and later conformance diagnostics.
+
+## 7) Change-control rules
 
 Any baseline-breaking change requires:
 1. contract note (what changed and why)
