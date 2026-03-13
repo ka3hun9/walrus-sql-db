@@ -5,6 +5,7 @@ import type {
   SelectItemAst,
   SelectStatementAst,
   SqlAstStatement,
+  TableRefAst,
 } from "./sql-ast.js";
 
 function trimQuoted(v: string): string {
@@ -370,18 +371,107 @@ function parseJoin(tail: string): { join?: JoinAst; rest: string } {
   };
 }
 
+function parseFromRef(base: string): { from: TableRefAst; tail: string } | null {
+  const sub = base.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  if (sub) {
+    const outerFields = sub[1]!.trim();
+    const subquerySql = sub[2]!.trim();
+    const alias = sub[3]!.trim();
+    const tail = sub[4] ?? "";
+    const rewrittenSql = `SELECT ${outerFields} FROM __DERIVED_TABLE__${tail}`;
+    return {
+      from: {
+        kind: "subquery",
+        subquerySql,
+        alias,
+        rewrittenSql,
+      },
+      tail,
+    };
+  }
+
+  const table = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  if (!table) return null;
+  return {
+    from: { kind: "table", name: table[2]!.trim() },
+    tail: table[3] ?? "",
+  };
+}
+
+function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; all: boolean } | null {
+  let depth = 0;
+  let quote = "";
+
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]!;
+
+    if (quote) {
+      if (ch === quote) quote = "";
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+
+    if (depth !== 0) continue;
+
+    const rest = sql.slice(i).toUpperCase();
+    if (rest.startsWith("UNION ALL ")) {
+      return {
+        leftSql: sql.slice(0, i).trim(),
+        rightSql: sql.slice(i + "UNION ALL".length).trim(),
+        all: true,
+      };
+    }
+    if (rest.startsWith("UNION ")) {
+      return {
+        leftSql: sql.slice(0, i).trim(),
+        rightSql: sql.slice(i + "UNION".length).trim(),
+        all: false,
+      };
+    }
+  }
+
+  return null;
+}
+
 export function parseSqlToAst(sql: string): SqlAstStatement {
   const normalized = sql.trim().replace(/\s+/g, " ");
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
 
-  const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  const union = splitUnionTopLevel(base);
+  if (union) {
+    return {
+      kind: "union",
+      all: union.all,
+      leftSql: union.leftSql,
+      rightSql: union.rightSql,
+      rawSql: sql,
+    };
+  }
+
+  const fromParsed = parseFromRef(base);
+  if (!fromParsed) return { kind: "unknown", rawSql: sql };
+
+  const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+/i);
   if (!m) return { kind: "unknown", rawSql: sql };
 
   const selectFields = m[1]!.trim();
-  const from = m[2]!.trim();
+  const { from, tail } = fromParsed;
 
-  const { join, rest } = parseJoin(m[3] ?? "");
+  const { join, rest } = parseJoin(tail);
   const tm = rest.match(
     /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?\s*$/i,
   );
@@ -397,7 +487,7 @@ export function parseSqlToAst(sql: string): SqlAstStatement {
   const ast: SelectStatementAst = {
     kind: "select",
     explain,
-    from: { kind: "table", name: from },
+    from,
     selectItems: parseSelectItems(selectFields),
     where: where ? parseExpr(where) : undefined,
     whereText: where,

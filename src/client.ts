@@ -93,32 +93,21 @@ type ParsedSelect = {
   rowNumberAlias?: string;
 };
 
-type AstParsedSelect = {
-  explain: boolean;
-  table: string;
-  fields: string[] | ["*"];
-  where?: string;
-  whereAst?: ExprAst;
-  havingAst?: ExprAst;
-  whereClauses: WhereClause[];
-  whereTree?: WhereExprNode;
-  limit?: number;
-  offset?: number;
-  orderBy?: string;
-  orderDirection?: "ASC" | "DESC";
-  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
-  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
-  aggregateField?: string;
-  groupBy?: string[];
-  having?: string;
-  join?: {
-    type: "INNER" | "LEFT" | "RIGHT";
-    table: string;
-    leftField: string;
-    rightField: string;
-  };
-  rowNumberAlias?: string;
-};
+type SqlErrorCode =
+  | "ERR_TABLE_NOT_FOUND"
+  | "ERR_UNSUPPORTED_INSERT"
+  | "ERR_UNSUPPORTED_UPDATE"
+  | "ERR_UNSUPPORTED_DELETE"
+  | "ERR_UNSUPPORTED_SELECT"
+  | "ERR_UNSUPPORTED_SELECT_CLAUSES"
+  | "ERR_UNSUPPORTED_ORDER_BY"
+  | "ERR_UNSUPPORTED_WHERE"
+  | "ERR_UNSUPPORTED_SUBQUERY"
+  | "ERR_UNSUPPORTED_AST_FROM";
+
+function sqlError(code: SqlErrorCode, detail: string): Error {
+  return new Error(`${code}: ${detail}`);
+}
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
@@ -240,36 +229,11 @@ export class WalrusSqlClient {
 
   async query(sql: string): Promise<QueryResult> {
     const ast = parseSqlToAst(sql);
-    if (ast.kind === "select") {
-      // Phase-0 AST migration: parse and validate through unified AST entry.
-      // Execution still uses existing evaluator path until full AST executor lands.
-      void ast;
-    }
 
-    const normalizedForDerived = sql.trim().replace(/\s+/g, " ");
-    const derived = this.parseFromSubquery(normalizedForDerived);
-    if (derived) {
-      const inner = await this.query(derived.subquerySql);
-      const tempTable = `__derived_${randomUUID().replace(/-/g, "")}`;
-      const materialized = inner.rows.map((r) => {
-        const out: SqlRow = { ...r };
-        for (const [k, v] of Object.entries(r)) out[`${derived.alias}.${k}`] = v;
-        return out;
-      });
-
-      this.tables.set(tempTable, materialized);
-      try {
-        return await this.query(derived.rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
-      } finally {
-        this.tables.delete(tempTable);
-      }
-    }
-
-    const unionSplit = this.splitUnion(sql);
-    if (unionSplit) {
-      const left = await this.query(unionSplit.left);
-      const right = await this.query(unionSplit.right);
-      if (unionSplit.all) {
+    if (ast.kind === "union") {
+      const left = await this.query(ast.leftSql);
+      const right = await this.query(ast.rightSql);
+      if (ast.all) {
         return { rows: [...left.rows, ...right.rows] };
       }
       const dedup = new Map<string, SqlRow>();
@@ -277,6 +241,23 @@ export class WalrusSqlClient {
         dedup.set(JSON.stringify(row), row);
       }
       return { rows: [...dedup.values()] };
+    }
+
+    if (ast.kind === "select" && ast.from.kind === "subquery") {
+      const inner = await this.query(ast.from.subquerySql);
+      const tempTable = `__derived_${randomUUID().replace(/-/g, "")}`;
+      const materialized = inner.rows.map((r) => {
+        const out: SqlRow = { ...r };
+        for (const [k, v] of Object.entries(r)) out[`${ast.from.alias}.${k}`] = v;
+        return out;
+      });
+
+      this.tables.set(tempTable, materialized);
+      try {
+        return await this.query(ast.from.rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+      } finally {
+        this.tables.delete(tempTable);
+      }
     }
 
     const normalized = sql.trim().replace(/\s+/g, " ");
@@ -384,29 +365,6 @@ export class WalrusSqlClient {
     return Boolean(result.proof.manifestHash && result.proof.indexRoot && result.proof.txDigest);
   }
 
-  private parseFromSubquery(sql: string): { subquerySql: string; alias: string; rewrittenSql: string } | null {
-    const m = sql.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+([a-zA-Z_][a-zA-Z0-9_]*)(.*)$/i);
-    if (!m) return null;
-
-    const outerFields = m[1]!.trim();
-    const subquerySql = m[2]!.trim();
-    const alias = m[3]!.trim();
-    const tail = m[4] ?? "";
-
-    const rewrittenSql = `SELECT ${outerFields} FROM __DERIVED_TABLE__${tail}`;
-    return { subquerySql, alias, rewrittenSql };
-  }
-
-  private splitUnion(sql: string): { left: string; right: string; all: boolean } | null {
-    const mAll = sql.match(/^(.*)\s+UNION\s+ALL\s+(.*)$/i);
-    if (mAll) return { left: mAll[1].trim(), right: mAll[2].trim(), all: true };
-
-    const m = sql.match(/^(.*)\s+UNION\s+(.*)$/i);
-    if (m) return { left: m[1].trim(), right: m[2].trim(), all: false };
-
-    return null;
-  }
-
   private fakeDigest(input: string): string {
     return createHash("sha256")
       .update(`${this.opts.network}:${this.opts.packageId}:${input}`)
@@ -416,7 +374,7 @@ export class WalrusSqlClient {
 
   private requireTable(name: string): SqlRow[] {
     const table = this.tables.get(name);
-    if (!table) throw new Error(`Table not found: ${name}`);
+    if (!table) throw sqlError("ERR_TABLE_NOT_FOUND", name);
     return table;
   }
 
@@ -428,7 +386,7 @@ export class WalrusSqlClient {
 
   private parseInsert(sql: string): SqlRow {
     const m = sql.match(/INSERT INTO\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\((.+)\)\s*VALUES\s*\((.+)\)/i);
-    if (!m) throw new Error(`Unsupported INSERT syntax: ${sql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_INSERT", sql);
     const cols = m[1].split(",").map((c) => c.trim());
     const vals = this.smartSplit(m[2]).map((v) => this.castValue(v));
     if (cols.length !== vals.length) throw new Error(`INSERT column/value mismatch`);
@@ -441,7 +399,7 @@ export class WalrusSqlClient {
     const m = sql.match(
       /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)\s+WHERE\s+(.+)/i,
     );
-    if (!m) throw new Error(`Unsupported UPDATE syntax: ${sql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_UPDATE", sql);
     return {
       setField: m[1].trim(),
       setValue: this.trimQuoted(m[2].trim()),
@@ -453,7 +411,7 @@ export class WalrusSqlClient {
     const m = sql.match(
       /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+(.+)/i,
     );
-    if (!m) throw new Error(`Unsupported DELETE syntax: ${sql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_DELETE", sql);
     return {
       whereExpr: m[1].trim(),
     };
@@ -464,6 +422,9 @@ export class WalrusSqlClient {
   }
 
   private astSelectToParsedSelect(ast: SelectStatementAst): AstParsedSelect {
+    if (ast.from.kind !== "table") {
+      throw sqlError("ERR_UNSUPPORTED_AST_FROM", ast.from.kind);
+    }
     const table = ast.from.name;
     const where = ast.whereText ?? this.exprAstToSql(ast.where);
     const having = ast.havingText ?? this.exprAstToSql(ast.having);
@@ -558,7 +519,7 @@ export class WalrusSqlClient {
     const base = explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "") : normalizedSql;
 
     const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
-    if (!m) throw new Error(`Unsupported SELECT: ${rawSql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_SELECT", rawSql);
 
     const selectFields = m[1].trim();
     const table = m[2];
@@ -581,7 +542,7 @@ export class WalrusSqlClient {
     const tm = tail.match(
       /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?\s*$/i,
     );
-    if (!tm) throw new Error(`Unsupported SELECT clauses: ${rawSql}`);
+    if (!tm) throw sqlError("ERR_UNSUPPORTED_SELECT_CLAUSES", rawSql);
 
     const where = tm[1]?.trim();
     const groupBy = tm[2]?.split(",").map((x) => x.trim()).filter(Boolean);
@@ -597,7 +558,7 @@ export class WalrusSqlClient {
           .filter(Boolean)
           .map((part) => {
             const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)((?:\s+(?:ASC|DESC))?)$/i);
-            if (!om) throw new Error(`Unsupported ORDER BY segment: ${part}`);
+            if (!om) throw sqlError("ERR_UNSUPPORTED_ORDER_BY", part);
             const dir = om[2]?.trim().toUpperCase() as "ASC" | "DESC" | "";
             return { field: om[1], direction: (dir || "ASC") as "ASC" | "DESC" };
           })
@@ -1169,13 +1130,13 @@ export class WalrusSqlClient {
       };
     }
 
-    throw new Error(`Unsupported WHERE expression: ${token}`);
+    throw sqlError("ERR_UNSUPPORTED_WHERE", token);
   }
 
   private parseSubquerySelect(subquerySql: string, outerRow?: SqlRow): SqlRow[] {
     const normalized = subquerySql.trim().replace(/\s+/g, " ");
     const m = normalized.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?$/i);
-    if (!m) throw new Error(`Unsupported subquery syntax: ${subquerySql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", subquerySql);
 
     const fieldExpr = m[1]!.trim();
     const table = m[2]!.trim();

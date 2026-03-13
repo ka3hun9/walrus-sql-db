@@ -1,7 +1,15 @@
-export type SqlAstStatement = SelectStatementAst | UnknownStatementAst;
+export type SqlAstStatement = SelectStatementAst | UnionStatementAst | UnknownStatementAst;
 
 export type UnknownStatementAst = {
   kind: "unknown";
+  rawSql: string;
+};
+
+export type UnionStatementAst = {
+  kind: "union";
+  all: boolean;
+  leftSql: string;
+  rightSql: string;
   rawSql: string;
 };
 
@@ -11,8 +19,10 @@ export type SelectStatementAst = {
   from: TableRefAst;
   selectItems: SelectItemAst[];
   where?: ExprAst;
+  whereText?: string;
   groupBy?: ExprAst[];
   having?: ExprAst;
+  havingText?: string;
   orderBy?: OrderItemAst[];
   limit?: number;
   offset?: number;
@@ -20,10 +30,17 @@ export type SelectStatementAst = {
   rawSql: string;
 };
 
-export type TableRefAst = {
-  kind: "table";
-  name: string;
-};
+export type TableRefAst =
+  | {
+      kind: "table";
+      name: string;
+    }
+  | {
+      kind: "subquery";
+      subquerySql: string;
+      alias: string;
+      rewrittenSql: string;
+    };
 
 export type JoinAst = {
   kind: "join";
@@ -49,4 +66,6 @@ export type ExprAst =
   | { kind: "identifier"; name: string }
   | { kind: "literal"; value: string | number | boolean | null }
   | { kind: "function"; name: string; args: ExprAst[] }
+  | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
+  | { kind: "unary"; op: string; expr: ExprAst }
   | { kind: "raw"; text: string };
