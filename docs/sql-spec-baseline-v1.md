@@ -112,7 +112,18 @@ Run:
 Reference freeze declaration:
 - `docs/sql-baseline-v1-freeze.md`
 
-## 8) Change-control rules
+## 8) G3-A semantic convergence notes
+
+Current convergence policy:
+- AST predicate path uses strict identifier semantics (`SQL_SEMANTIC_UNKNOWN_IDENTIFIER` / `SQL_SEMANTIC_AMBIGUOUS_IDENTIFIER`).
+- Raw-expression fallback path is retained for staged features but remains explicit and bounded by allowlist.
+
+Regression examples:
+- `examples/sql-semantics-g3a.ts`
+- `examples/sql-client-g3a-strict-where.ts`
+- `examples/sql-client-g3a-ast-tree-consistency.ts`
+
+## 9) Change-control rules
 
 Any baseline-breaking change requires:
 1. contract note (what changed and why)
