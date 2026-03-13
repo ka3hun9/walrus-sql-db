@@ -1,0 +1,31 @@
+# G3-B Completion Checklist
+
+Status: in-progress closeout snapshot
+
+## Delivered in G3-B
+
+### Subquery edge semantics
+- [x] Correlated EXISTS regression added
+- [x] NOT IN + NULL propagation regression added
+- [x] Scalar subquery null-compare regression added
+- [x] Subquery projection fixed to support expression projection (`SELECT 1` style)
+
+Reference:
+- `examples/sql-g3b-subquery-edge-regression.ts`
+
+### Expression edge semantics
+- [x] AST predicate eval: `COALESCE`
+- [x] AST predicate eval: `NULLIF`
+- [x] AST predicate eval: `CAST`
+- [x] CASE path retained and regression-covered via bounded raw fallback
+- [x] Composed-expression regression (CAST+COALESCE+NULLIF + 3VL behavior)
+
+Reference:
+- `examples/sql-g3b-expr-edge-regression.ts`
+- `examples/sql-g3b-cast-case-regression.ts`
+- `examples/sql-g3b-composed-expr-regression.ts`
+
+## Remaining before G3-B close
+- [ ] add differential fixture mapping for the above scenarios
+- [ ] wire these regressions into CI grouped SQL suite
+- [ ] publish mismatch budget note (expected deltas vs target engines)
