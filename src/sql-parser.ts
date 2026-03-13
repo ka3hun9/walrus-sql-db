@@ -554,7 +554,27 @@ export function parseSqlToAst(
     });
   }
 
-  const selectFields = m[1]!.trim();
+  let selectFields = m[1]!.trim();
+  let topLimit: number | undefined;
+
+  const topMatch = selectFields.match(/^TOP\s+(\d+)\s+(.+)$/i);
+  if (/^TOP\b/i.test(selectFields)) {
+    if (dialect !== "sqlserver") {
+      throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+        message: "TOP is only enabled for sqlserver dialect profile",
+        token: "TOP",
+        dialect,
+      });
+    }
+    if (!topMatch) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "TOP requires numeric count before select list",
+        token: "TOP",
+      });
+    }
+    topLimit = Number(topMatch[1]);
+    selectFields = topMatch[2]!.trim();
+  }
   const { from, tail } = fromParsed;
 
   const { join, rest } = parseJoin(tail);
@@ -572,7 +592,7 @@ export function parseSqlToAst(
   const groupBy = tm[2]?.trim();
   const having = tm[3]?.trim();
   const orderBy = tm[4]?.trim();
-  const limit = tm[5] ? Number(tm[5]) : undefined;
+  const limit = topLimit ?? (tm[5] ? Number(tm[5]) : undefined);
   const offset = tm[6] ? Number(tm[6]) : undefined;
 
   const ast: SelectStatementAst = {

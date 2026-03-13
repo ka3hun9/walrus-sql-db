@@ -15,5 +15,14 @@ Regression:
   - validates non-target dialects fail with `SQL_DIALECT_UNSUPPORTED_SYNTAX`
   - validates target dialect grammar-recognition staging via skeleton inspection
 
-Notes:
-- This is gating-layer enablement only (parser/executor behavior for TOP/FETCH remains staged for later G5 blocks).
+## G5-B: SQL Server TOP n (parser+executor)
+
+Implemented:
+- `SELECT TOP <n> ...` enabled under `dialect: "sqlserver"`
+- parser strips TOP from select list and maps to AST `limit`
+- malformed `TOP` (non-numeric) returns `SQL_SYNTAX_INCOMPLETE_STATEMENT`
+- non-sqlserver dialects keep `SQL_DIALECT_UNSUPPORTED_SYNTAX`
+
+Regression:
+- `examples/sql-g5-sqlserver-top-regression.ts`
+
