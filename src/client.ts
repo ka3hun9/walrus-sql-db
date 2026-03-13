@@ -108,7 +108,8 @@ type SqlErrorCode =
   | "ERR_UNSUPPORTED_ORDER_BY"
   | "ERR_UNSUPPORTED_WHERE"
   | "ERR_UNSUPPORTED_AST_FROM"
-  | "ERR_UNSUPPORTED_RAW_EXPR";
+  | "ERR_UNSUPPORTED_RAW_EXPR"
+  | "ERR_UNSUPPORTED_SUBQUERY";
 
 function sqlError(code: SqlErrorCode, detail: string): Error {
   return new Error(`${code}: ${detail}`);
@@ -249,17 +250,18 @@ export class WalrusSqlClient {
     }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
-      const inner = await this.query(ast.from.subquerySql);
+      const { subquerySql, alias, rewrittenSql } = ast.from;
+      const inner = await this.query(subquerySql);
       const tempTable = `__derived_${randomUUID().replace(/-/g, "")}`;
       const materialized = inner.rows.map((r) => {
         const out: SqlRow = { ...r };
-        for (const [k, v] of Object.entries(r)) out[`${ast.from.alias}.${k}`] = v;
+        for (const [k, v] of Object.entries(r)) out[`${alias}.${k}`] = v;
         return out;
       });
 
       this.tables.set(tempTable, materialized);
       try {
-        return await this.query(ast.from.rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+        return await this.query(rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
       } finally {
         this.tables.delete(tempTable);
       }
@@ -469,7 +471,7 @@ export class WalrusSqlClient {
     }
   }
 
-  private astSelectToParsedSelect(ast: SelectStatementAst): AstParsedSelect {
+  private astSelectToParsedSelect(ast: SelectStatementAst): ParsedSelect {
     if (ast.from.kind !== "table") {
       throw sqlError("ERR_UNSUPPORTED_AST_FROM", ast.from.kind);
     }
@@ -523,7 +525,7 @@ export class WalrusSqlClient {
       (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name),
     );
     const aggregate =
-      aggregateItem?.expr.kind === "function" ? (aggregateItem.expr.name as AstParsedSelect["aggregate"]) : undefined;
+      aggregateItem?.expr.kind === "function" ? (aggregateItem.expr.name as ParsedSelect["aggregate"]) : undefined;
     const aggregateField =
       aggregateItem?.expr.kind === "function" ? (this.exprAstToSql(aggregateItem.expr.args[0]) ?? "*") : undefined;
 
