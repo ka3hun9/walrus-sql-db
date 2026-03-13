@@ -81,6 +81,23 @@ const baseCases: Case[] = [
     sqliteSql: "SELECT o.id AS id FROM orders o WHERE EXISTS (SELECT u.id FROM users u WHERE u.id = o.user_id AND u.tier >= 2) ORDER BY o.id",
   },
 
+  {
+    category: "g3b-fixture",
+    name: "correlated exists by outer id",
+    walrusSql: "SELECT id FROM users WHERE EXISTS (SELECT id FROM orders WHERE orders.user_id = outer.id AND amount >= 20) ORDER BY id",
+    sqliteSql: "SELECT u.id AS id FROM users u WHERE EXISTS (SELECT o.id FROM orders o WHERE o.user_id = u.id AND o.amount >= 20) ORDER BY u.id",
+  },
+  {
+    category: "g3b-fixture",
+    name: "expr composed cast nullif",
+    walrusSql: "SELECT id FROM orders WHERE CAST(amount AS INT) >= 20 AND NULLIF(status, 'draft') IS NOT NULL ORDER BY id",
+  },
+  {
+    category: "g3b-fixture",
+    name: "not in subquery paid users",
+    walrusSql: "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'paid') ORDER BY id",
+  },
+
   { category: "expr", name: "arith precedence", walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id" },
   { category: "expr", name: "coalesce", walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') = 'x' ORDER BY id" },
   { category: "expr", name: "nullif", walrusSql: "SELECT id FROM users WHERE NULLIF(name, 'Bob') IS NULL ORDER BY id" },
