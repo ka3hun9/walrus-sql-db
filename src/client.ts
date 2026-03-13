@@ -1457,7 +1457,7 @@ export class WalrusSqlClient {
   }
 
   private resolveRowValue(row: SqlRow, field: string): SqlPrimitive | undefined {
-    return resolveIdentifierValue(row, field);
+    return resolveIdentifierValue(row, field, "strict");
   }
 
   private compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
