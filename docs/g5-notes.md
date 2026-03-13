@@ -85,6 +85,18 @@ Implemented:
 - sqlserver UNION tail supports valid `ORDER BY ... OFFSET ... FETCH ...` shape.
 - invalid sqlserver tail shape and ansi FETCH leakage produce deterministic explicit errors.
 
-Regression:
-- `examples/sql-g5-union-tail-dialect-regression.ts`
+## G5-J: Dialect profile compare fixture
+
+Implemented:
+- compare matrix supports per-case Walrus dialect override (`Case.dialect`)
+- added `g5-fixture` category with profile-focused parity checks:
+  - mysql: backtick quoting
+  - postgres: `FETCH FIRST ...`
+  - sqlserver: `TOP` + bracket quoting
+- added script: `npm run sql:compare:matrix:g5`
+- CI category matrix now includes `g5-fixture`
+
+Validation:
+- `g5-fixture` category compare: 3/3 pass
+  - output: `reports/sql-compare-g5-fixture.json`
 

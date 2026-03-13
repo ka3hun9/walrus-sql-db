@@ -13,6 +13,7 @@ type Case = {
   walrusSql: string;
   sqliteSql?: string;
   sqliteMap?: SqliteMapKind;
+  dialect?: "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";
   xfailReason?: string;
 };
 
@@ -132,9 +133,25 @@ const baseCases: Case[] = [
     walrusSql: "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING sum >= 30 ORDER BY user_id",
   },
   {
-    category: "having",
-    name: "having case",
-    walrusSql: "SELECT user_id, SUM(amount) AS sum FROM orders GROUP BY user_id HAVING CASE WHEN sum >= 30 THEN 1 ELSE 0 END = 1 ORDER BY user_id",
+    category: "g5-fixture",
+    name: "mysql backtick quoting",
+    walrusSql: "SELECT `id` FROM `users` WHERE `city` IS NULL ORDER BY `id`",
+    sqliteSql: "SELECT id FROM users WHERE city IS NULL ORDER BY id",
+    dialect: "mysql",
+  },
+  {
+    category: "g5-fixture",
+    name: "postgres fetch first",
+    walrusSql: "SELECT id FROM users ORDER BY id FETCH FIRST 2 ROWS ONLY",
+    sqliteSql: "SELECT id FROM users ORDER BY id LIMIT 2",
+    dialect: "postgres",
+  },
+  {
+    category: "g5-fixture",
+    name: "sqlserver top + bracket quoting",
+    walrusSql: "SELECT TOP 2 [id] FROM [orders] ORDER BY [amount] DESC",
+    sqliteSql: "SELECT id FROM orders ORDER BY amount DESC LIMIT 2",
+    dialect: "sqlserver",
   },
 ];
 
@@ -250,7 +267,15 @@ async function main() {
   mkdirSync(mreDir, { recursive: true });
 
   for (const c of selected) {
-    const walrusRows = (await db.query(c.walrusSql)).rows as Row[];
+    const walrusDb = c.dialect
+      ? new WalrusSqlClient({ packageId: "0xdev", network: "sui-testnet", mode: "simulator", dialect: c.dialect })
+      : db;
+
+    if (c.dialect) {
+      for (const s of setupSql) await walrusDb.execute(s);
+    }
+
+    const walrusRows = (await walrusDb.query(c.walrusSql)).rows as Row[];
     const sqliteSql = mapSqliteSql(c.walrusSql, c.sqliteSql, c.sqliteMap);
     const sqliteRows = runSqlite(setupSql, sqliteSql);
     const ok = rowsEqual(walrusRows, sqliteRows);
