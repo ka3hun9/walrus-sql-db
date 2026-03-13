@@ -51,6 +51,14 @@ Implemented:
   - sqlite-only: `PRINTF`
 - non-target dialect invocation fails fast with `SQL_DIALECT_UNSUPPORTED_FUNCTION`
 
+## G5-F: Dialect operator gating (explicit)
+
+Implemented:
+- parser adds dialect-specific operator gate with deterministic error:
+  - postgres-only: `ILIKE`, regex operators (`~`, `~*`, `!~`, `!~*`)
+  - mysql/sqlite-only: `REGEXP`
+- non-target dialect operator use fails fast with `SQL_DIALECT_UNSUPPORTED_OPERATOR`
+
 Regression:
-- `examples/sql-g5-function-gating-regression.ts`
+- `examples/sql-g5-operator-gating-regression.ts`
 

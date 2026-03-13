@@ -10,6 +10,21 @@ import type {
   TableRefAst,
 } from "./sql-ast.js";
 
+function detectUnsupportedDialectOperator(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
+  const textUpper = sql.toUpperCase();
+
+  const hasIlike = /\bILIKE\b/.test(textUpper);
+  if (hasIlike && dialect !== "postgres") return "ILIKE";
+
+  const hasRegexp = /\bREGEXP\b/.test(textUpper);
+  if (hasRegexp && !(dialect === "mysql" || dialect === "sqlite")) return "REGEXP";
+
+  const hasPostgresRegexOp = /!~\*|!~|~\*/.test(sql) || /(^|[^!])~([^*]|$)/.test(sql);
+  if (hasPostgresRegexOp && dialect !== "postgres") return "~";
+
+  return null;
+}
+
 function detectUnsupportedDialectFunction(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
   const text = sql.toUpperCase();
   const fnMatches = Array.from(text.matchAll(/\b([A-Z_][A-Z0-9_]*)\s*\(/g)).map((m) => m[1]!);
@@ -554,6 +569,15 @@ export function parseSqlToAst(
   }
 
   const normalized = normalizeDialectQuotedIdentifiers(sql, dialect).trim().replace(/\s+/g, " ");
+  const unsupportedOp = detectUnsupportedDialectOperator(normalized, dialect);
+  if (unsupportedOp) {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_OPERATOR", {
+      message: `Operator ${unsupportedOp} is not enabled for current dialect profile`,
+      token: unsupportedOp,
+      dialect,
+    });
+  }
+
   const unsupportedFn = detectUnsupportedDialectFunction(normalized, dialect);
   if (unsupportedFn) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_FUNCTION", {
