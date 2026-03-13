@@ -23,6 +23,7 @@
     "sql:compare:matrix:category": "tsx examples/sql-compare-matrix.ts reports/sql-compare-category.json reports/mre pr",
     "sql:compare:matrix:nightly": "tsx examples/sql-compare-matrix.ts reports/sql-compare-nightly.json reports/mre nightly",
     "sql:ast:smoke": "tsx examples/sql-ast-smoke.ts",
+    "sql:semantic:grouped": "tsx examples/sql-semantic-grouped-runner.ts",
     "sql:verify:full": "npm run build && npm run sql:compare:matrix && npm run sql:compare:matrix:nightly && npm run sql:roadmap",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"

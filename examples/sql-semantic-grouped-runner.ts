@@ -1,0 +1,47 @@
+import { spawn } from "node:child_process";
+
+type RunnerCase = {
+  name: string;
+  script: string;
+};
+
+const cases: RunnerCase[] = [
+  { name: "g3a-semantics", script: "examples/sql-semantics-g3a.ts" },
+  { name: "g3a-client-strict-where", script: "examples/sql-client-g3a-strict-where.ts" },
+  { name: "g3a-ast-tree-consistency", script: "examples/sql-client-g3a-ast-tree-consistency.ts" },
+  { name: "g3b-subquery-edge", script: "examples/sql-g3b-subquery-edge-regression.ts" },
+  { name: "g3b-expr-edge", script: "examples/sql-g3b-expr-edge-regression.ts" },
+  { name: "g3b-cast-case", script: "examples/sql-g3b-cast-case-regression.ts" },
+  { name: "g3b-composed-expr", script: "examples/sql-g3b-composed-expr-regression.ts" },
+];
+
+function runCase(c: RunnerCase): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("npx", ["tsx", c.script], {
+      stdio: "inherit",
+      shell: process.platform === "win32",
+    });
+
+    child.on("exit", (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`case ${c.name} failed with code ${code ?? -1}`));
+    });
+  });
+}
+
+async function main() {
+  const startedAt = Date.now();
+  for (const c of cases) {
+    // eslint-disable-next-line no-console
+    console.log(`\n==> [${c.name}] ${c.script}`);
+    await runCase(c);
+  }
+  const ms = Date.now() - startedAt;
+  // eslint-disable-next-line no-console
+  console.log(`\nSQL semantic grouped runner OK (${cases.length} cases, ${ms} ms)`);
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

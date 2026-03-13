@@ -27,5 +27,6 @@ Reference:
 
 ## Remaining before G3-B close
 - [ ] add differential fixture mapping for the above scenarios
-- [ ] wire these regressions into CI grouped SQL suite
+- [x] wire regressions into grouped SQL semantic runner (`npm run sql:semantic:grouped`)
+- [ ] wire grouped runner into CI grouped SQL suite
 - [ ] publish mismatch budget note (expected deltas vs target engines)
