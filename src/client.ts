@@ -1759,8 +1759,8 @@ export class WalrusSqlClient {
         for (const ord of spec.orderBy) {
           const av = this.resolveRowValue(a.row, ord.field);
           const bv = this.resolveRowValue(b.row, ord.field);
-          const c = this.compare(av, bv);
-          if (c !== 0) return ord.direction === "DESC" ? -c : c;
+          const c = this.compareForOrder(av, bv, ord.direction);
+          if (c !== 0) return c;
         }
         return a.idx - b.idx;
       });
@@ -1777,11 +1777,26 @@ export class WalrusSqlClient {
     if (!orderByList?.length) return rows;
     return [...rows].sort((a, b) => {
       for (const { field, direction } of orderByList) {
-        const cmp = this.compare(a[field], b[field]);
-        if (cmp !== 0) return direction === "DESC" ? -cmp : cmp;
+        const cmp = this.compareForOrder(a[field], b[field], direction);
+        if (cmp !== 0) return cmp;
       }
       return 0;
     });
+  }
+
+  private compareForOrder(
+    a: SqlPrimitive | undefined,
+    b: SqlPrimitive | undefined,
+    direction: "ASC" | "DESC",
+  ): number {
+    const aNull = a === null || a === undefined;
+    const bNull = b === null || b === undefined;
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;
+    if (bNull) return -1;
+
+    const base = this.compare(a, b);
+    return direction === "DESC" ? -base : base;
   }
 
   private applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
@@ -1869,6 +1884,12 @@ export class WalrusSqlClient {
   }
 
   private compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): number {
+    const aNull = a === null || a === undefined;
+    const bNull = b === null || b === undefined;
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;
+    if (bNull) return -1;
+
     const an = Number(a);
     const bn = Number(b);
     if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
