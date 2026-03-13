@@ -15,6 +15,9 @@
 - `examples/sql-g3d-setop-order-limit-offset-regression.ts`
   - validates outer ORDER BY/LIMIT/OFFSET is applied on merged set-op result
   - covers both `UNION` distinct and `UNION ALL` pagination behavior
+- `examples/sql-g3d-setop-error-regression.ts`
+  - validates malformed set-op SQL fails deterministically with syntax code
+  - scenarios: dangling `UNION`, right branch missing SELECT
 
 ## Status
 - Initial G3-D combo regression is passing in simulator path.

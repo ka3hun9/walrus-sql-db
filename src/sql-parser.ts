@@ -444,14 +444,14 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
     if (depth !== 0) continue;
 
     const rest = sql.slice(i).toUpperCase();
-    if (rest.startsWith("UNION ALL ")) {
+    if (rest.startsWith("UNION ALL") && (rest.length === "UNION ALL".length || /\s/.test(rest["UNION ALL".length]!))) {
       return {
         leftSql: sql.slice(0, i).trim(),
         rightSql: sql.slice(i + "UNION ALL".length).trim(),
         all: true,
       };
     }
-    if (rest.startsWith("UNION ")) {
+    if (rest.startsWith("UNION") && (rest.length === "UNION".length || /\s/.test(rest["UNION".length]!))) {
       return {
         leftSql: sql.slice(0, i).trim(),
         rightSql: sql.slice(i + "UNION".length).trim(),
@@ -491,6 +491,20 @@ export function parseSqlToAst(sql: string, precomputedSkeleton?: SqlGrammarSkele
 
   const union = splitUnionTopLevel(base);
   if (union) {
+    if (!union.leftSql || !union.rightSql) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "UNION requires both left and right SELECT statements",
+        token: "UNION",
+      });
+    }
+
+    if (/^(ORDER|LIMIT|OFFSET|GROUP\s+BY|HAVING|WHERE|UNION)\b/i.test(union.rightSql)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "UNION right branch is missing SELECT statement",
+        token: "UNION",
+      });
+    }
+
     return {
       kind: "union",
       all: union.all,
