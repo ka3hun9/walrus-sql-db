@@ -1,0 +1,147 @@
+{
+  "summary": {
+    "profile": "pr",
+    "categoryFilter": [
+      "g3d-fixture"
+    ],
+    "total": 3,
+    "passed": 3,
+    "failed": 0
+  },
+  "categorySummary": [
+    {
+      "category": "g3d-fixture",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "xfail": 0,
+      "xpass": 0
+    }
+  ],
+  "results": [
+    {
+      "category": "g3d-fixture",
+      "name": "setop distinct outer order limit offset",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT amount AS v FROM orders WHERE amount <= 25 UNION SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v DESC LIMIT 3 OFFSET 1",
+      "sqliteSql": "SELECT amount AS v FROM orders WHERE amount <= 25 UNION SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v DESC LIMIT 3 OFFSET 1",
+      "walrusRows": [
+        {
+          "v": 30
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 20
+        }
+      ],
+      "sqliteRows": [
+        {
+          "v": 30
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 20
+        }
+      ]
+    },
+    {
+      "category": "g3d-fixture",
+      "name": "setop all outer order limit offset",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT amount AS v FROM orders WHERE amount <= 25 UNION ALL SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v ASC LIMIT 4 OFFSET 1",
+      "sqliteSql": "SELECT amount AS v FROM orders WHERE amount <= 25 UNION ALL SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v ASC LIMIT 4 OFFSET 1",
+      "walrusRows": [
+        {
+          "v": 20
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 30
+        }
+      ],
+      "sqliteRows": [
+        {
+          "v": 20
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 25
+        },
+        {
+          "v": 30
+        }
+      ]
+    },
+    {
+      "category": "g3d-fixture",
+      "name": "setop window combo derived",
+      "ok": true,
+      "pass": true,
+      "expectedFail": false,
+      "xfailReason": null,
+      "walrusSql": "SELECT uid, amt, ROW_NUMBER() OVER (PARTITION BY uid ORDER BY amt DESC) AS rn FROM (SELECT user_id AS uid, amount AS amt FROM orders WHERE user_id IN ('u1','u4') UNION ALL SELECT user_id AS uid, amount AS amt FROM orders WHERE id='o1') u ORDER BY uid, rn",
+      "sqliteSql": "SELECT uid, amt, ROW_NUMBER() OVER (PARTITION BY uid ORDER BY amt DESC) AS rn FROM (SELECT user_id AS uid, amount AS amt FROM orders WHERE user_id IN ('u1','u4') UNION ALL SELECT user_id AS uid, amount AS amt FROM orders WHERE id='o1') u ORDER BY uid, rn",
+      "walrusRows": [
+        {
+          "uid": "u1",
+          "amt": 60,
+          "rn": 1
+        },
+        {
+          "uid": "u1",
+          "amt": 10,
+          "rn": 2
+        },
+        {
+          "uid": "u1",
+          "amt": 10,
+          "rn": 3
+        },
+        {
+          "uid": "u4",
+          "amt": 25,
+          "rn": 1
+        }
+      ],
+      "sqliteRows": [
+        {
+          "uid": "u1",
+          "amt": 60,
+          "rn": 1
+        },
+        {
+          "uid": "u1",
+          "amt": 10,
+          "rn": 2
+        },
+        {
+          "uid": "u1",
+          "amt": 10,
+          "rn": 3
+        },
+        {
+          "uid": "u4",
+          "amt": 25,
+          "rn": 1
+        }
+      ]
+    }
+  ]
+}

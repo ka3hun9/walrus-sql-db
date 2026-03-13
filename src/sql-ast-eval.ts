@@ -64,20 +64,42 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
     }
     case "binary": {
       const l = evalExprAst(expr.left, resolve);
-      const r = evalExprAst(expr.right, resolve);
       const op = expr.op.toUpperCase();
 
       if (op === "AND") {
+        const r = evalExprAst(expr.right, resolve);
         if (l === false || r === false) return false;
         if (l == null || r == null) return null;
         return Boolean(l) && Boolean(r);
       }
       if (op === "OR") {
+        const r = evalExprAst(expr.right, resolve);
         if (l === true || r === true) return true;
         if (l == null || r == null) return null;
         return Boolean(l) || Boolean(r);
       }
 
+      if (op === "BETWEEN" || op === "NOT BETWEEN") {
+        if (l == null) return null;
+        if (expr.right.kind === "function" && expr.right.name === "RANGE") {
+          const a = evalExprAst(expr.right.args[0]!, resolve);
+          const b = evalExprAst(expr.right.args[1]!, resolve);
+          if (a == null || b == null) return null;
+          const ok = Number(l) >= Number(a) && Number(l) <= Number(b);
+          return op === "BETWEEN" ? ok : !ok;
+        }
+      }
+
+      if (op === "IN" || op === "NOT IN") {
+        if (l == null) return null;
+        if (expr.right.kind === "function" && expr.right.name === "LIST") {
+          const vals = expr.right.args.map((a) => evalExprAst(a, resolve));
+          const has = vals.some((v) => String(v) === String(l));
+          return op === "IN" ? has : !has;
+        }
+      }
+
+      const r = evalExprAst(expr.right, resolve);
       if (l == null || r == null) {
         if (op === "IS") return l == null && r == null;
         if (op === "IS NOT") return !(l == null && r == null);
@@ -98,24 +120,6 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
       if (op === "<=") return Number(l) <= Number(r);
       if (op === "IS") return String(l) === String(r);
       if (op === "IS NOT") return String(l) !== String(r);
-
-      if (op === "BETWEEN" || op === "NOT BETWEEN") {
-        if (expr.right.kind === "function" && expr.right.name === "RANGE") {
-          const a = evalExprAst(expr.right.args[0]!, resolve);
-          const b = evalExprAst(expr.right.args[1]!, resolve);
-          if (a == null || b == null) return null;
-          const ok = Number(l) >= Number(a) && Number(l) <= Number(b);
-          return op === "BETWEEN" ? ok : !ok;
-        }
-      }
-
-      if (op === "IN" || op === "NOT IN") {
-        if (expr.right.kind === "function" && expr.right.name === "LIST") {
-          const vals = expr.right.args.map((a) => evalExprAst(a, resolve));
-          const has = vals.some((v) => String(v) === String(l));
-          return op === "IN" ? has : !has;
-        }
-      }
 
       if (op === "LIKE" || op === "NOT LIKE") {
         const pat = String(r).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");

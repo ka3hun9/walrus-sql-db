@@ -1376,6 +1376,10 @@ export class WalrusSqlClient {
   private evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
     const expr = this.trimOuterParentheses(exprRaw.trim());
 
+    if (/^NULL$/i.test(expr)) return null;
+    if (/^TRUE$/i.test(expr)) return true;
+    if (/^FALSE$/i.test(expr)) return false;
+
     const caseMatch = expr.match(/^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+END$/i);
     if (caseMatch) {
       const cond = this.evaluateWhereTree(row, this.parseWhereTree(caseMatch[1]!));

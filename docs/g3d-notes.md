@@ -18,6 +18,16 @@
 - `examples/sql-g3d-setop-error-regression.ts`
   - validates malformed set-op SQL fails deterministically with syntax code
   - scenarios: dangling `UNION`, right branch missing SELECT
+- `examples/sql-g3d-in-literal-ast-regression.ts`
+  - validates `IN` / `NOT IN` literal-list semantics on AST predicate path
+  - guards against premature NULL short-circuit in binary eval
+
+## Differential fixture mapping
+- Added `g3d-fixture` category in `examples/sql-compare-matrix.ts`
+  - set-op distinct + outer order/limit/offset
+  - set-op all + outer order/limit/offset
+  - set-op + window composition through derived table
+- Current PR profile check: `g3d-fixture` 3/3 PASS
 
 ## Status
 - Initial G3-D combo regression is passing in simulator path.

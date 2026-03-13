@@ -20,6 +20,7 @@ const cases: RunnerCase[] = [
   { name: "g3d-setop-projection-order", script: "examples/sql-g3d-setop-projection-order-regression.ts" },
   { name: "g3d-setop-order-limit-offset", script: "examples/sql-g3d-setop-order-limit-offset-regression.ts" },
   { name: "g3d-setop-error", script: "examples/sql-g3d-setop-error-regression.ts" },
+  { name: "g3d-in-literal-ast", script: "examples/sql-g3d-in-literal-ast-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

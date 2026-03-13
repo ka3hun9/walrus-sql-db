@@ -98,6 +98,23 @@ const baseCases: Case[] = [
     walrusSql: "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE status = 'paid') ORDER BY id",
   },
 
+  {
+    category: "g3d-fixture",
+    name: "setop distinct outer order limit offset",
+    walrusSql: "SELECT amount AS v FROM orders WHERE amount <= 25 UNION SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v DESC LIMIT 3 OFFSET 1",
+  },
+  {
+    category: "g3d-fixture",
+    name: "setop all outer order limit offset",
+    walrusSql: "SELECT amount AS v FROM orders WHERE amount <= 25 UNION ALL SELECT amount AS x FROM orders WHERE amount >= 25 ORDER BY v ASC LIMIT 4 OFFSET 1",
+  },
+  {
+    category: "g3d-fixture",
+    name: "setop window combo derived",
+    walrusSql:
+      "SELECT uid, amt, ROW_NUMBER() OVER (PARTITION BY uid ORDER BY amt DESC) AS rn FROM (SELECT user_id AS uid, amount AS amt FROM orders WHERE user_id IN ('u1','u4') UNION ALL SELECT user_id AS uid, amount AS amt FROM orders WHERE id='o1') u ORDER BY uid, rn",
+  },
+
   { category: "expr", name: "arith precedence", walrusSql: "SELECT id FROM orders WHERE amount + 5 * 2 >= 30 ORDER BY id" },
   { category: "expr", name: "coalesce", walrusSql: "SELECT id FROM orders WHERE COALESCE(note, 'x') = 'x' ORDER BY id" },
   { category: "expr", name: "nullif", walrusSql: "SELECT id FROM users WHERE NULLIF(name, 'Bob') IS NULL ORDER BY id" },
