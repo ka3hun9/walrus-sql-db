@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
+import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
 import type {
   ExecuteResult,
   QueryProofResult,
@@ -1456,7 +1457,7 @@ export class WalrusSqlClient {
   }
 
   private resolveRowValue(row: SqlRow, field: string): SqlPrimitive | undefined {
-    return row[field] as SqlPrimitive | undefined;
+    return resolveIdentifierValue(row, field);
   }
 
   private compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
@@ -1504,15 +1505,13 @@ export class WalrusSqlClient {
   }
 
   private valueToTruth(value: SqlPrimitive | undefined): TruthValue {
-    if (value === null || value === undefined) return "UNKNOWN";
-    if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-    const s = String(value).toUpperCase();
-    if (s === "TRUE") return "TRUE";
-    if (s === "FALSE") return "FALSE";
-    return "UNKNOWN";
+    return toTruthValue(value);
   }
 
   private evaluateWhereAst(row: SqlRow, expr: ExprAst, fallbackSql?: string): TruthValue {
+    // prefer semantic 3VL evaluator for non-raw AST
+    if (expr.kind !== "raw") return evalPredicate3VL(expr, row);
+
     const sql = (fallbackSql && fallbackSql.trim()) || this.exprAstToSql(expr);
     if (!sql) return "UNKNOWN";
     return this.evaluateWhereTree(row, this.parseWhereTree(sql));
