@@ -102,8 +102,8 @@ type SqlErrorCode =
   | "ERR_UNSUPPORTED_SELECT_CLAUSES"
   | "ERR_UNSUPPORTED_ORDER_BY"
   | "ERR_UNSUPPORTED_WHERE"
-  | "ERR_UNSUPPORTED_SUBQUERY"
-  | "ERR_UNSUPPORTED_AST_FROM";
+  | "ERR_UNSUPPORTED_AST_FROM"
+  | "ERR_UNSUPPORTED_RAW_EXPR";
 
 function sqlError(code: SqlErrorCode, detail: string): Error {
   return new Error(`${code}: ${detail}`);
@@ -421,10 +421,59 @@ export class WalrusSqlClient {
     return exprAstToSql(expr);
   }
 
+  private isAllowedRawExpr(sql: string): boolean {
+    const s = sql.trim();
+    if (!s) return false;
+
+    // currently supported raw expression buckets in evaluator path
+    if (/\bOVER\s*\(/i.test(s)) return true; // window expressions in select list
+    if (/\bIS\s+NOT\s+DISTINCT\s+FROM\b/i.test(s) || /\bIS\s+DISTINCT\s+FROM\b/i.test(s)) return true;
+    if (/\bLIKE\b[\s\S]*\bESCAPE\b/i.test(s)) return true;
+    if (/^CASE\b/i.test(s)) return true;
+    if (/\bCAST\s*\(/i.test(s)) return true;
+    if (/\b(?:NOT\s+)?EXISTS\s*\(\s*SELECT\b/i.test(s)) return true;
+    if (/\b(?:ANY|SOME|ALL)\s*\(\s*SELECT\b/i.test(s)) return true;
+    if (/\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(s)) return true;
+    if (/[=<>!]\s*\(\s*SELECT\b/i.test(s)) return true;
+
+    return false;
+  }
+
+  private validateExprAst(expr?: ExprAst): void {
+    if (!expr) return;
+
+    switch (expr.kind) {
+      case "raw": {
+        if (!this.isAllowedRawExpr(expr.text)) {
+          throw sqlError("ERR_UNSUPPORTED_RAW_EXPR", expr.text);
+        }
+        return;
+      }
+      case "binary":
+        this.validateExprAst(expr.left);
+        this.validateExprAst(expr.right);
+        return;
+      case "unary":
+        this.validateExprAst(expr.expr);
+        return;
+      case "function":
+        for (const arg of expr.args) this.validateExprAst(arg);
+        return;
+      default:
+        return;
+    }
+  }
+
   private astSelectToParsedSelect(ast: SelectStatementAst): AstParsedSelect {
     if (ast.from.kind !== "table") {
       throw sqlError("ERR_UNSUPPORTED_AST_FROM", ast.from.kind);
     }
+    this.validateExprAst(ast.where);
+    this.validateExprAst(ast.having);
+    for (const it of ast.selectItems) this.validateExprAst(it.expr);
+    for (const ob of ast.orderBy ?? []) this.validateExprAst(ob.expr);
+    for (const gb of ast.groupBy ?? []) this.validateExprAst(gb);
+
     const table = ast.from.name;
     const where = ast.whereText ?? this.exprAstToSql(ast.where);
     const having = ast.havingText ?? this.exprAstToSql(ast.having);
