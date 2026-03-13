@@ -2,5 +2,8 @@ export * from "./types.js";
 export * from "./onchain.js";
 export * from "./query-replay.js";
 export * from "./sql-ast.js";
+export * from "./sql-ast-eval.js";
+export * from "./sql-errors.js";
+export * from "./sql-semantics.js";
 export * from "./sql-parser.js";
 export * from "./client.js";
