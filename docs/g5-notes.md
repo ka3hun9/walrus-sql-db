@@ -23,6 +23,15 @@ Implemented:
 - malformed `TOP` (non-numeric) returns `SQL_SYNTAX_INCOMPLETE_STATEMENT`
 - non-sqlserver dialects keep `SQL_DIALECT_UNSUPPORTED_SYNTAX`
 
+## G5-C: FETCH FIRST/NEXT row limiter
+
+Implemented:
+- parser tail now accepts `FETCH FIRST|NEXT <n> ROW|ROWS ONLY`
+- enabled dialect profiles: `postgres`, `mysql`, `sqlserver`
+- blocked dialect profiles: `ansi`, `sqlite` -> `SQL_DIALECT_UNSUPPORTED_SYNTAX`
+- malformed FETCH shape returns deterministic `SQL_SYNTAX_INCOMPLETE_STATEMENT`
+- mixed row-limiter conflict (`TOP/LIMIT/FETCH` simultaneously) returns `SQL_SYNTAX_INVALID_CLAUSE_ORDER`
+
 Regression:
-- `examples/sql-g5-sqlserver-top-regression.ts`
+- `examples/sql-g5-fetch-regression.ts`
 

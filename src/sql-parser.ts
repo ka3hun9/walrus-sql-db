@@ -578,10 +578,25 @@ export function parseSqlToAst(
   const { from, tail } = fromParsed;
 
   const { join, rest } = parseJoin(tail);
+  const hasFetchToken = /\bFETCH\b/i.test(rest);
+  if (hasFetchToken && !(dialect === "postgres" || dialect === "mysql" || dialect === "sqlserver")) {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message: "FETCH FIRST/NEXT is not enabled for current dialect profile",
+      token: "FETCH",
+      dialect,
+    });
+  }
+
   const tm = rest.match(
-    /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?\s*$/i,
+    /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?(?:\s*FETCH\s+(FIRST|NEXT)\s+(\d+)\s+ROWS?\s+ONLY)?\s*$/i,
   );
   if (!tm) {
+    if (hasFetchToken) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "FETCH clause must be: FETCH FIRST|NEXT <n> ROW(S) ONLY",
+        token: "FETCH",
+      });
+    }
     throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
       message: "Invalid clause order or unsupported trailing syntax after FROM/JOIN segment",
       hint: "Expected order: WHERE -> GROUP BY -> HAVING -> ORDER BY -> LIMIT -> OFFSET",
@@ -592,8 +607,26 @@ export function parseSqlToAst(
   const groupBy = tm[2]?.trim();
   const having = tm[3]?.trim();
   const orderBy = tm[4]?.trim();
-  const limit = topLimit ?? (tm[5] ? Number(tm[5]) : undefined);
+  const limitFromLimit = tm[5] ? Number(tm[5]) : undefined;
   const offset = tm[6] ? Number(tm[6]) : undefined;
+  const limitFromFetch = tm[8] ? Number(tm[8]) : undefined;
+
+  if (hasFetchToken && !tm[8]) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "FETCH clause must be: FETCH FIRST|NEXT <n> ROW(S) ONLY",
+      token: "FETCH",
+    });
+  }
+
+  const rowLimiterCount = [topLimit, limitFromLimit, limitFromFetch].filter((v) => v !== undefined).length;
+  if (rowLimiterCount > 1) {
+    throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+      message: "Multiple row-limiting clauses are not allowed together (TOP/LIMIT/FETCH)",
+      hint: "Use only one of TOP, LIMIT, or FETCH",
+    });
+  }
+
+  const limit = topLimit ?? limitFromLimit ?? limitFromFetch;
 
   const ast: SelectStatementAst = {
     kind: "select",
