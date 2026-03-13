@@ -115,8 +115,12 @@ export function toTruthValue(value: SqlPrimitive | undefined): TruthValue {
   return "UNKNOWN";
 }
 
-export function evalPredicate3VL(expr: ExprAst, row: Record<string, unknown>): TruthValue {
-  const value = evalExprAst(expr, (name) => resolveIdentifierValue(row, name));
+export function evalPredicate3VL(
+  expr: ExprAst,
+  row: Record<string, unknown>,
+  mode: "lenient" | "strict" = "lenient",
+): TruthValue {
+  const value = evalExprAst(expr, (name) => resolveIdentifierValue(row, name, mode));
   return toTruthValue(value);
 }
 

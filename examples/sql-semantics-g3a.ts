@@ -75,6 +75,15 @@ const nullExpr: ExprAst = {
 };
 assert.equal(evalPredicate3VL(nullExpr, row), "UNKNOWN");
 
+let strictPredicateErr: unknown;
+try {
+  evalPredicate3VL(nullExpr, row, "strict");
+} catch (e) {
+  strictPredicateErr = e;
+}
+assert.ok(strictPredicateErr instanceof SqlEngineError);
+assert.equal((strictPredicateErr as SqlEngineError).code, "SQL_SEMANTIC_UNKNOWN_IDENTIFIER");
+
 const andExpr: ExprAst = {
   kind: "binary",
   op: "AND",
