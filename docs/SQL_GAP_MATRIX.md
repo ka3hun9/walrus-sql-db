@@ -4,20 +4,31 @@
 
 | Area | Status | Notes |
 |---|---|---|
-| SELECT/WHERE/ORDER/LIMIT/OFFSET | ✅ | Baseline stable + 3VL filter semantics + expression first-cut (`+ - * / %`, CASE, COALESCE, NULLIF, CAST) |
+| SELECT/WHERE/ORDER/LIMIT/OFFSET | ✅ | Baseline stable + 3VL filter semantics + expression first-cut (`+ - * / %`, CASE, COALESCE, NULLIF, CAST) + dialect gating for TOP/FETCH/LIMIT clause-shape by profile |
 | Aggregates + GROUP BY/HAVING | ✅ | COUNT/SUM/AVG/MIN/MAX |
 | JOIN | 🟡 | INNER/LEFT/RIGHT (first-cut) |
 | Subquery | 🟡 | IN/EXISTS/scalar/ANY/ALL first-cut + correlated WHERE refs via `outer.<col>` + FROM subquery first-cut; scalar MIN-subquery NULL semantics aligned for current matrix |
 | UNION | 🟡 | UNION / UNION ALL first-cut |
 | Window | 🟡 | ROW_NUMBER first-cut |
-| NULL/LIKE | ✅ | 3VL, IS NULL/IS NOT NULL, LIKE/NOT LIKE, LIKE ESCAPE |
+| NULL/LIKE | ✅ | 3VL, IS NULL/IS NOT NULL, LIKE/NOT LIKE, LIKE ESCAPE + postgres `ILIKE` dialect-gated |
 | Distinctness predicates | ✅ | IS DISTINCT FROM / IS NOT DISTINCT FROM |
 | Boolean truth predicates | ✅ | IS [NOT] TRUE/FALSE/UNKNOWN |
 | Transaction semantics | ❌ | Not implemented |
 | Full SQL parser/AST | ❌ | Lightweight parser, not SQL-complete |
 | Cost-based optimizer | ❌ | Not implemented |
 
-## Next milestones
+## G5 completion snapshot (2026-03-14)
+
+- Dialect profiles wired: `ansi | sqlite | postgres | mysql | sqlserver`
+- Explicit leak guards in parser for:
+  - keywords/clause forms (`TOP`, `FETCH`, sqlserver clause-shape)
+  - identifier quoting (backtick/bracket)
+  - functions (`IFNULL`, `ISNULL`, `IIF`, `DATE_TRUNC`, `PRINTF`)
+  - operators (`ILIKE`, `REGEXP`, postgres regex operators)
+  - CAST target dialect types (`UNSIGNED`, `NVARCHAR`, `BYTEA`, etc.)
+- UNION tail execution now honors parser dialect constraints.
+- Compare matrix includes `g5-fixture` category with PR + nightly reports.
+
 
 1. **Sprint E/F (implemented baseline)**
    - ✅ Matrix coverage expanded (PR profile + nightly profile)

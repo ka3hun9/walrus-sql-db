@@ -33,8 +33,14 @@ jobs:
       - name: SQLite matrix compare (nightly profile)
         run: npm run sql:compare:matrix:nightly
 
+      - name: G5 dialect fixture compare (nightly profile)
+        run: npm run sql:compare:matrix:g5:nightly
+
       - name: SQL budget gate (nightly)
         run: npm run sql:budget:gate -- reports/sql-compare-nightly.json nightly
+
+      - name: SQL budget gate (nightly g5 fixture)
+        run: npm run sql:budget:gate -- reports/sql-compare-g5-fixture-nightly.json nightly
 
       - name: SQL semantic grouped regressions
         run: npm run sql:semantic:grouped
@@ -48,6 +54,14 @@ jobs:
         with:
           name: sql-compare-nightly-report
           path: reports/sql-compare-nightly.json
+          if-no-files-found: ignore
+
+      - name: Upload nightly g5 compare report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-compare-g5-nightly-report
+          path: reports/sql-compare-g5-fixture-nightly.json
           if-no-files-found: ignore
 
       - name: Upload nightly MRE files (if any)

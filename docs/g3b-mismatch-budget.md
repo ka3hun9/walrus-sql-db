@@ -37,5 +37,13 @@ Define acceptable mismatch budget while G3-B semantics continue converging, and 
 - Run full matrix (nightly):
   - `npm run sql:compare:matrix:nightly`
 
-## Exit condition for removing budget note
-- When PostgreSQL/MySQL differential tracks are online and category budgets are folded into CI policy docs, this note can be replaced by CI-enforced thresholds.
+## G5 fixture budget alignment
+
+- `g5-fixture` is now included in PR category matrix (0 fail budget).
+- Nightly now runs dedicated G5 fixture report + budget gate:
+  - report: `reports/sql-compare-g5-fixture-nightly.json`
+  - gate: `npm run sql:budget:gate -- reports/sql-compare-g5-fixture-nightly.json nightly`
+- Policy remains:
+  - PR: `maxFailed=0`, `maxMismatchRatio=0`, `maxXpass=0`
+  - Nightly: `maxMismatchRatio<=0.02`, `maxXpass=0`
+

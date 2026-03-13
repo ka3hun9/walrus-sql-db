@@ -96,6 +96,8 @@ Status: Complete (2026-03-13)
 
 ## G5 (P5) Dialect Plugins (Last)
 
+Status: Complete (2026-03-14)
+
 Target order (configurable): PostgreSQL / MySQL / SQLite / SQL Server
 
 ### Deliverables

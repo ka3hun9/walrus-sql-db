@@ -96,7 +96,13 @@ Implemented:
 - added script: `npm run sql:compare:matrix:g5`
 - CI category matrix now includes `g5-fixture`
 
-Validation:
-- `g5-fixture` category compare: 3/3 pass
-  - output: `reports/sql-compare-g5-fixture.json`
+## G5-K: Nightly + budget integration
+
+Implemented:
+- added nightly G5 fixture script:
+  - `npm run sql:compare:matrix:g5:nightly`
+- nightly workflow now runs G5 fixture compare and its own budget gate:
+  - `reports/sql-compare-g5-fixture-nightly.json`
+  - `npm run sql:budget:gate -- reports/sql-compare-g5-fixture-nightly.json nightly`
+- nightly workflow uploads dedicated G5 compare report artifact.
 
