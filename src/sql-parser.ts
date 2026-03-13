@@ -1,5 +1,5 @@
 import { createSqlError } from "./sql-errors.js";
-import { inspectSqlGrammarSkeleton, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
+import { inspectSqlGrammarSkeleton, type SqlDialectProfile, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
   ExprAst,
   JoinAst,
@@ -463,19 +463,35 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
   return null;
 }
 
+export type ParseSqlToAstOptions = {
+  dialect?: SqlDialectProfile;
+};
+
 export type ParseSqlToAstResult = {
   ast: SqlAstStatement;
   grammar: SqlGrammarSkeleton;
 };
 
-export function parseSqlToAstWithMeta(sql: string): ParseSqlToAstResult {
-  const grammar = inspectSqlGrammarSkeleton(sql);
-  const ast = parseSqlToAst(sql, grammar);
+export function parseSqlToAstWithMeta(sql: string, options?: ParseSqlToAstOptions): ParseSqlToAstResult {
+  const grammar = inspectSqlGrammarSkeleton(sql, { dialect: options?.dialect });
+  const ast = parseSqlToAst(sql, { grammar, dialect: options?.dialect });
   return { ast, grammar };
 }
 
-export function parseSqlToAst(sql: string, precomputedSkeleton?: SqlGrammarSkeleton): SqlAstStatement {
-  const skeleton = precomputedSkeleton ?? inspectSqlGrammarSkeleton(sql);
+export function parseSqlToAst(
+  sql: string,
+  precomputedOrOptions?: SqlGrammarSkeleton | ParseSqlToAstOptions | { grammar?: SqlGrammarSkeleton; dialect?: SqlDialectProfile },
+): SqlAstStatement {
+  const dialect =
+    precomputedOrOptions && "dialect" in precomputedOrOptions ? precomputedOrOptions.dialect : undefined;
+  const precomputedSkeleton =
+    precomputedOrOptions && "clauses" in precomputedOrOptions
+      ? precomputedOrOptions
+      : precomputedOrOptions && "grammar" in precomputedOrOptions
+        ? precomputedOrOptions.grammar
+        : undefined;
+
+  const skeleton = precomputedSkeleton ?? inspectSqlGrammarSkeleton(sql, { dialect });
   if (skeleton.unsupported.length > 0) {
     const first = skeleton.unsupported[0]!;
     throw createSqlError(first.code, {

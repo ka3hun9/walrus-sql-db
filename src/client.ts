@@ -234,7 +234,7 @@ export class WalrusSqlClient {
   }
 
   async query(sql: string): Promise<QueryResult> {
-    const ast = parseSqlToAst(sql);
+    const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
     if (ast.kind === "union") {
       const rightPlan = this.splitSelectTail(ast.rightSql);
@@ -586,7 +586,7 @@ export class WalrusSqlClient {
   }
 
   private inferUnionColumns(selectSql: string): string[] | undefined {
-    const ast = parseSqlToAst(selectSql);
+    const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
     if (ast.kind !== "select") return undefined;
 
     return ast.selectItems.map((it, idx) => {
@@ -646,7 +646,7 @@ export class WalrusSqlClient {
   }
 
   private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
-    const ast = parseSqlToAst(rawSql);
+    const ast = parseSqlToAst(rawSql, { dialect: this.opts.dialect ?? "ansi" });
     if (ast.kind === "select") {
       return this.astSelectToParsedSelect(ast);
     }

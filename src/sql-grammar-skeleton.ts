@@ -1,5 +1,7 @@
 import type { SqlErrorCode } from "./sql-errors.js";
 
+export type SqlDialectProfile = "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";
+
 export type StatementKind = "select" | "union" | "other";
 
 export type ClauseStatus = "present" | "absent";
@@ -28,6 +30,10 @@ export type SqlGrammarSkeleton = {
     top: ClauseStatus;
   };
   unsupported: UnsupportedFeature[];
+};
+
+type InspectOptions = {
+  dialect?: SqlDialectProfile;
 };
 
 function collapse(sql: string): string {
@@ -62,8 +68,9 @@ function hasFetch(sqlUpper: string): boolean {
   return /\bFETCH\s+(FIRST|NEXT)\b/i.test(sqlUpper);
 }
 
-export function inspectSqlGrammarSkeleton(sql: string): SqlGrammarSkeleton {
+export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions): SqlGrammarSkeleton {
   const up = upper(sql);
+  const dialect = options?.dialect ?? "ansi";
 
   const statement: StatementKind = hasWord(up, "UNION")
     ? "union"
@@ -98,19 +105,27 @@ export function inspectSqlGrammarSkeleton(sql: string): SqlGrammarSkeleton {
   }
 
   if (clauses.fetch === "present") {
-    unsupported.push({
-      feature: "fetch",
-      code: "SQL_DIALECT_UNSUPPORTED_SYNTAX",
-      message: "FETCH FIRST/NEXT grammar recognized but not enabled in baseline v1",
-    });
+    if (dialect === "postgres" || dialect === "mysql" || dialect === "sqlserver") {
+      // dialect-staged: recognized surface, parser/executor support lands in later G5 blocks
+    } else {
+      unsupported.push({
+        feature: "fetch",
+        code: "SQL_DIALECT_UNSUPPORTED_SYNTAX",
+        message: "FETCH FIRST/NEXT grammar recognized but not enabled in baseline v1",
+      });
+    }
   }
 
   if (clauses.top === "present") {
-    unsupported.push({
-      feature: "top",
-      code: "SQL_DIALECT_UNSUPPORTED_SYNTAX",
-      message: "TOP grammar recognized but not enabled in baseline v1",
-    });
+    if (dialect === "sqlserver") {
+      // dialect-staged: recognized surface, parser/executor support lands in later G5 blocks
+    } else {
+      unsupported.push({
+        feature: "top",
+        code: "SQL_DIALECT_UNSUPPORTED_SYNTAX",
+        message: "TOP grammar recognized but not enabled in baseline v1",
+      });
+    }
   }
 
   return {

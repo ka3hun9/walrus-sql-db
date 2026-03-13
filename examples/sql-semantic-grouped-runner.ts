@@ -21,6 +21,7 @@ const cases: RunnerCase[] = [
   { name: "g3d-setop-order-limit-offset", script: "examples/sql-g3d-setop-order-limit-offset-regression.ts" },
   { name: "g3d-setop-error", script: "examples/sql-g3d-setop-error-regression.ts" },
   { name: "g3d-in-literal-ast", script: "examples/sql-g3d-in-literal-ast-regression.ts" },
+  { name: "g5-dialect-gating", script: "examples/sql-g5-dialect-gating-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
