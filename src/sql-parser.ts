@@ -10,6 +10,28 @@ import type {
   TableRefAst,
 } from "./sql-ast.js";
 
+function detectUnsupportedDialectCastType(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
+  const text = sql.toUpperCase();
+  const castTargets = Array.from(text.matchAll(/\bCAST\s*\(.*?\bAS\s+([A-Z_][A-Z0-9_]*)\b.*?\)/g)).map(
+    (m) => m[1]!,
+  );
+  if (castTargets.length === 0) return null;
+
+  const mysqlOnly = new Set(["UNSIGNED", "SIGNED"]);
+  const sqlserverOnly = new Set(["NVARCHAR", "DATETIME2"]);
+  const postgresOnly = new Set(["BYTEA"]);
+  const sqliteOnly = new Set(["NONE"]);
+
+  for (const t of castTargets) {
+    if (mysqlOnly.has(t) && dialect !== "mysql") return t;
+    if (sqlserverOnly.has(t) && dialect !== "sqlserver") return t;
+    if (postgresOnly.has(t) && dialect !== "postgres") return t;
+    if (sqliteOnly.has(t) && dialect !== "sqlite") return t;
+  }
+
+  return null;
+}
+
 function detectUnsupportedDialectOperator(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
   const textUpper = sql.toUpperCase();
 
@@ -569,6 +591,15 @@ export function parseSqlToAst(
   }
 
   const normalized = normalizeDialectQuotedIdentifiers(sql, dialect).trim().replace(/\s+/g, " ");
+  const unsupportedCastType = detectUnsupportedDialectCastType(normalized, dialect);
+  if (unsupportedCastType) {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message: `CAST target type ${unsupportedCastType} is not enabled for current dialect profile`,
+      token: unsupportedCastType,
+      dialect,
+    });
+  }
+
   const unsupportedOp = detectUnsupportedDialectOperator(normalized, dialect);
   if (unsupportedOp) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_OPERATOR", {

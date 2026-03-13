@@ -59,6 +59,16 @@ Implemented:
   - mysql/sqlite-only: `REGEXP`
 - non-target dialect operator use fails fast with `SQL_DIALECT_UNSUPPORTED_OPERATOR`
 
+## G5-G: CAST target type dialect gating
+
+Implemented:
+- parser adds CAST target-type gating to reject cross-dialect type leaks:
+  - mysql-only: `UNSIGNED`, `SIGNED`
+  - sqlserver-only: `NVARCHAR`, `DATETIME2`
+  - postgres-only: `BYTEA`
+  - sqlite-only: `NONE`
+- non-target dialect CAST targets fail fast with deterministic `SQL_DIALECT_UNSUPPORTED_SYNTAX`
+
 Regression:
-- `examples/sql-g5-operator-gating-regression.ts`
+- `examples/sql-g5-cast-type-gating-regression.ts`
 
