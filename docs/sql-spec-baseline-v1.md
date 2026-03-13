@@ -126,6 +126,7 @@ Regression examples:
 - `examples/sql-g3b-expr-edge-regression.ts`
 - `examples/sql-g3b-cast-case-regression.ts`
 - `examples/sql-g3b-composed-expr-regression.ts`
+- `examples/sql-g3c-window-row-number.ts`
 
 ## 9) G3-B expression/subquery edge notes
 

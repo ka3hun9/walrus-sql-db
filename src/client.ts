@@ -92,6 +92,10 @@ type ParsedSelect = {
     rightField: string;
   };
   rowNumberAlias?: string;
+  rowNumberSpec?: {
+    partitionBy: string[];
+    orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  };
 };
 
 type SqlErrorCode =
@@ -333,11 +337,11 @@ export class WalrusSqlClient {
       };
     }
 
-    const ordered = this.applyOrder(filtered, parsed.orderByList);
     const withWindow = parsed.rowNumberAlias
-      ? ordered.map((row, idx) => ({ ...row, [parsed.rowNumberAlias!]: idx + 1 }))
-      : ordered;
-    const paged = this.applyPage(withWindow, parsed.offset, parsed.limit);
+      ? this.applyRowNumber(filtered, parsed.rowNumberAlias, parsed.rowNumberSpec)
+      : filtered;
+    const ordered = this.applyOrder(withWindow, parsed.orderByList);
+    const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
 
     return {
       rows: paged.map((row) => this.pickFields(row, parsed.fields)),
@@ -492,6 +496,9 @@ export class WalrusSqlClient {
       (it) => it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text),
     );
     const rowNumberAlias = rowNumberItem?.alias ?? (rowNumberItem ? "row_number" : undefined);
+    const rowNumberSpec = rowNumberItem?.expr.kind === "raw"
+      ? this.parseRowNumberSpec(rowNumberItem.expr.text)
+      : undefined;
 
     const rawFieldTexts = ast.selectItems.map((it) => {
       if (it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text)) {
@@ -556,6 +563,7 @@ export class WalrusSqlClient {
           }
         : undefined,
       rowNumberAlias,
+      rowNumberSpec,
     };
   }
 
@@ -617,6 +625,7 @@ export class WalrusSqlClient {
     const rawFieldList = selectFields.split(",").map((x) => x.trim());
     const rowNumberExpr = rawFieldList.find((f) => /^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f));
     const rowNumberAlias = rowNumberExpr?.match(/\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i)?.[1] ?? "row_number";
+    const rowNumberSpec = rowNumberExpr ? this.parseRowNumberSpec(rowNumberExpr) : undefined;
 
     const aggregateFieldExpr = rawFieldList.find((f) =>
       /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f),
@@ -668,6 +677,7 @@ export class WalrusSqlClient {
         having,
         join,
         rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
+        rowNumberSpec,
       };
     }
 
@@ -688,6 +698,7 @@ export class WalrusSqlClient {
         having,
         join,
         rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
+        rowNumberSpec,
       };
     }
 
@@ -707,6 +718,7 @@ export class WalrusSqlClient {
       having,
       join,
       rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
+      rowNumberSpec,
     };
   }
 
@@ -1690,6 +1702,75 @@ export class WalrusSqlClient {
       default:
         return "FALSE";
     }
+  }
+
+  private parseRowNumberSpec(rawExpr: string): ParsedSelect["rowNumberSpec"] {
+    const m = rawExpr.match(/ROW_NUMBER\(\)\s+OVER\s*\((.+)\)/i);
+    if (!m) return undefined;
+
+    const inside = m[1].trim();
+    const pm = inside.match(/PARTITION\s+BY\s+(.+?)(?:\s+ORDER\s+BY\s+(.+))?$/i);
+    const om = inside.match(/ORDER\s+BY\s+(.+)$/i);
+
+    const partitionBy = pm
+      ? pm[1]
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean)
+      : [];
+
+    const orderExpr = pm ? pm[2] : om?.[1];
+    const orderBy = orderExpr
+      ? orderExpr
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((part) => {
+            const mm = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)((?:\s+(?:ASC|DESC))?)$/i);
+            if (!mm) return { field: part, direction: "ASC" as const };
+            const dir = mm[2]?.trim().toUpperCase() as "ASC" | "DESC" | "";
+            return { field: mm[1], direction: (dir || "ASC") as "ASC" | "DESC" };
+          })
+      : [];
+
+    return { partitionBy, orderBy };
+  }
+
+  private applyRowNumber(
+    rows: SqlRow[],
+    alias: string,
+    spec?: ParsedSelect["rowNumberSpec"],
+  ): SqlRow[] {
+    if (!spec || (!spec.partitionBy.length && !spec.orderBy.length)) {
+      return rows.map((row, idx) => ({ ...row, [alias]: idx + 1 }));
+    }
+
+    const groups = new Map<string, Array<{ row: SqlRow; idx: number }>>();
+    rows.forEach((row, idx) => {
+      const key = spec.partitionBy.map((f) => String(this.resolveRowValue(row, f) ?? "")).join("||");
+      const arr = groups.get(key) ?? [];
+      arr.push({ row, idx });
+      groups.set(key, arr);
+    });
+
+    const byOriginalIndex = new Map<number, SqlRow>();
+    for (const groupRows of groups.values()) {
+      const sorted = [...groupRows].sort((a, b) => {
+        for (const ord of spec.orderBy) {
+          const av = this.resolveRowValue(a.row, ord.field);
+          const bv = this.resolveRowValue(b.row, ord.field);
+          const c = this.compare(av, bv);
+          if (c !== 0) return ord.direction === "DESC" ? -c : c;
+        }
+        return a.idx - b.idx;
+      });
+
+      sorted.forEach((entry, i) => {
+        byOriginalIndex.set(entry.idx, { ...entry.row, [alias]: i + 1 });
+      });
+    }
+
+    return rows.map((_, idx) => byOriginalIndex.get(idx) ?? { ...rows[idx], [alias]: idx + 1 });
   }
 
   private applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>): SqlRow[] {
