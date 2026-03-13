@@ -1,6 +1,13 @@
 import type { ExprAst } from "./sql-ast.js";
 import type { SqlPrimitive } from "./types.js";
 
+function maybeWrap(child?: ExprAst): string {
+  const rendered = exprAstToSql(child) ?? "";
+  if (!child) return rendered;
+  if (child.kind === "binary") return `(${rendered})`;
+  return rendered;
+}
+
 export function exprAstToSql(expr?: ExprAst): string | undefined {
   if (!expr) return undefined;
   switch (expr.kind) {
@@ -20,7 +27,7 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       }
       return `${expr.name}(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})`;
     case "binary":
-      return `${exprAstToSql(expr.left)} ${expr.op} ${exprAstToSql(expr.right)}`;
+      return `${maybeWrap(expr.left)} ${expr.op} ${maybeWrap(expr.right)}`;
     case "unary":
       if (expr.op.toUpperCase() === "NOT") return `NOT (${exprAstToSql(expr.expr)})`;
       return `${expr.op}${exprAstToSql(expr.expr)}`;
