@@ -1,3 +1,5 @@
+import { createSqlError } from "./sql-errors.js";
+import { inspectSqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
   ExprAst,
   JoinAst,
@@ -447,6 +449,16 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
 }
 
 export function parseSqlToAst(sql: string): SqlAstStatement {
+  const skeleton = inspectSqlGrammarSkeleton(sql);
+  if (skeleton.unsupported.length > 0) {
+    const first = skeleton.unsupported[0]!;
+    throw createSqlError(first.code, {
+      message: first.message,
+      hint: `feature=${first.feature}`,
+      token: first.feature,
+    });
+  }
+
   const normalized = sql.trim().replace(/\s+/g, " ");
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
