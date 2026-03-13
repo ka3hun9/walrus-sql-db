@@ -474,11 +474,29 @@ export function parseSqlToAst(sql: string): SqlAstStatement {
     };
   }
 
+  const selectLike = /^SELECT\b/i.test(base);
+  if (!selectLike) {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message: "Only SELECT/UNION statements are currently accepted by parser baseline",
+      token: base.split(/\s+/)[0],
+    });
+  }
+
   const fromParsed = parseFromRef(base);
-  if (!fromParsed) return { kind: "unknown", rawSql: sql };
+  if (!fromParsed) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "SELECT statement is missing or has invalid FROM clause",
+      token: "FROM",
+    });
+  }
 
   const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+/i);
-  if (!m) return { kind: "unknown", rawSql: sql };
+  if (!m) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "SELECT list is missing or malformed before FROM",
+      token: "SELECT",
+    });
+  }
 
   const selectFields = m[1]!.trim();
   const { from, tail } = fromParsed;
@@ -487,7 +505,12 @@ export function parseSqlToAst(sql: string): SqlAstStatement {
   const tm = rest.match(
     /^(?:\s*WHERE\s+(.+?))?(?:\s*GROUP BY\s+(.+?))?(?:\s*HAVING\s+(.+?))?(?:\s*ORDER BY\s+(.+?))?(?:\s*LIMIT\s+(\d+))?(?:\s*OFFSET\s+(\d+))?\s*$/i,
   );
-  if (!tm) return { kind: "unknown", rawSql: sql };
+  if (!tm) {
+    throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+      message: "Invalid clause order or unsupported trailing syntax after FROM/JOIN segment",
+      hint: "Expected order: WHERE -> GROUP BY -> HAVING -> ORDER BY -> LIMIT -> OFFSET",
+    });
+  }
 
   const where = tm[1]?.trim();
   const groupBy = tm[2]?.trim();
