@@ -122,8 +122,16 @@ Regression examples:
 - `examples/sql-semantics-g3a.ts`
 - `examples/sql-client-g3a-strict-where.ts`
 - `examples/sql-client-g3a-ast-tree-consistency.ts`
+- `examples/sql-g3b-subquery-edge-regression.ts`
+- `examples/sql-g3b-expr-edge-regression.ts`
 
-## 9) Change-control rules
+## 9) G3-B expression/subquery edge notes
+
+Current additions:
+- subquery edge regressions (correlated EXISTS, NOT IN + NULL propagation, scalar subquery null-compare)
+- AST function eval support for `COALESCE` / `NULLIF` in predicate path
+
+## 10) Change-control rules
 
 Any baseline-breaking change requires:
 1. contract note (what changed and why)

@@ -125,8 +125,26 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
 
       return null;
     }
-    case "function":
+    case "function": {
+      const fn = expr.name.toUpperCase();
+      const args = expr.args.map((a) => evalExprAst(a, resolve));
+
+      if (fn === "COALESCE") {
+        for (const v of args) {
+          if (v !== null && v !== undefined) return v;
+        }
+        return null;
+      }
+
+      if (fn === "NULLIF") {
+        const a = args[0];
+        const b = args[1];
+        if (a == null || b == null) return a ?? null;
+        return String(a) === String(b) ? null : a;
+      }
+
       return null;
+    }
     case "raw":
       return null;
     default:
