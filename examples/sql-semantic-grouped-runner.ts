@@ -17,6 +17,7 @@ const cases: RunnerCase[] = [
   { name: "g3c-window-edge", script: "examples/sql-g3c-window-edge-regression.ts" },
   { name: "g3c-setop", script: "examples/sql-g3c-setop-regression.ts" },
   { name: "g3d-setop-window-combo", script: "examples/sql-g3d-setop-window-combo.ts" },
+  { name: "g3d-setop-projection-order", script: "examples/sql-g3d-setop-projection-order-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

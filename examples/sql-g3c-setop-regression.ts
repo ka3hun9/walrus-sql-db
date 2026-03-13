@@ -15,7 +15,10 @@ async function main() {
   const unionDistinct = await db.query(
     "SELECT amount, id FROM t WHERE id = 'a' UNION SELECT id, amount FROM t WHERE id = 'a'",
   );
-  assert.equal(unionDistinct.rows.length, 1);
+  assert.deepEqual(unionDistinct.rows, [
+    { amount: 10, id: "a" },
+    { amount: "a", id: 10 },
+  ]);
 
   const unionAll = await db.query(
     "SELECT id FROM t WHERE amount >= 10 UNION ALL SELECT id FROM t WHERE amount >= 20 ORDER BY id",

@@ -130,6 +130,7 @@ Regression examples:
 - `examples/sql-g3c-window-edge-regression.ts`
 - `examples/sql-g3c-setop-regression.ts`
 - `examples/sql-g3d-setop-window-combo.ts`
+- `examples/sql-g3d-setop-projection-order-regression.ts`
 
 ## 9) G3-B expression/subquery edge notes
 

@@ -239,11 +239,20 @@ export class WalrusSqlClient {
     if (ast.kind === "union") {
       const left = await this.query(ast.leftSql);
       const right = await this.query(ast.rightSql);
+
+      const inferredLeftColumns = this.inferUnionColumns(ast.leftSql);
+      const leftColumns =
+        inferredLeftColumns
+        ?? (left.rows[0] ? Object.keys(left.rows[0]) : right.rows[0] ? Object.keys(right.rows[0]) : undefined);
+
+      const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
+      const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
+
       if (ast.all) {
-        return { rows: [...left.rows, ...right.rows] };
+        return { rows: [...normalizedLeft, ...normalizedRight] };
       }
       const dedup = new Map<string, SqlRow>();
-      for (const row of [...left.rows, ...right.rows]) {
+      for (const row of [...normalizedLeft, ...normalizedRight]) {
         dedup.set(this.makeRowKey(row), row);
       }
       return { rows: [...dedup.values()] };
@@ -567,6 +576,33 @@ export class WalrusSqlClient {
       rowNumberAlias,
       rowNumberSpec,
     };
+  }
+
+  private inferUnionColumns(selectSql: string): string[] | undefined {
+    const ast = parseSqlToAst(selectSql);
+    if (ast.kind !== "select") return undefined;
+
+    return ast.selectItems.map((it, idx) => {
+      if (it.alias) return it.alias;
+      if (it.expr.kind === "identifier") {
+        const parts = it.expr.name.split(".");
+        return parts[parts.length - 1] ?? `col${idx + 1}`;
+      }
+      if (it.expr.kind === "raw") {
+        const asMatch = it.expr.text.match(/\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+        if (asMatch) return asMatch[1]!;
+      }
+      return `col${idx + 1}`;
+    });
+  }
+
+  private normalizeUnionRow(row: SqlRow, columns: string[]): SqlRow {
+    const values = Object.values(row);
+    const out: SqlRow = {};
+    columns.forEach((col, idx) => {
+      out[col] = values[idx] ?? null;
+    });
+    return out;
   }
 
   private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
