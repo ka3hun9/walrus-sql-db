@@ -44,26 +44,35 @@ function normalizeIdentifier(name: string): string {
   return name.trim();
 }
 
-export function resolveIdentifierValue(row: Record<string, unknown>, identifier: string): SqlPrimitive | undefined {
+export function resolveIdentifierBinding(availableKeys: string[], identifier: string): NameResolutionResult {
   const raw = normalizeIdentifier(identifier);
-
-  if (Object.prototype.hasOwnProperty.call(row, raw)) {
-    return row[raw] as SqlPrimitive | undefined;
-  }
-
   const isOuterRef = /^outer\./i.test(raw);
   const canonical = isOuterRef ? raw.replace(/^outer\./i, "") : raw;
 
-  if (Object.prototype.hasOwnProperty.call(row, canonical)) {
-    return row[canonical] as SqlPrimitive | undefined;
+  // exact match has highest priority
+  if (availableKeys.includes(raw)) {
+    return {
+      resolved: { name: raw },
+      isOuterRef,
+    };
   }
 
-  // Unqualified identifier fallback: match `<alias>.<column>` keys.
+  if (availableKeys.includes(canonical)) {
+    return {
+      resolved: { name: canonical },
+      isOuterRef,
+    };
+  }
+
+  // unqualified identifier fallback: match `<alias>.<column>` uniquely
   if (!canonical.includes(".")) {
     const suffix = `.${canonical}`;
-    const matches = Object.keys(row).filter((k) => k.endsWith(suffix));
+    const matches = availableKeys.filter((k) => k.endsWith(suffix));
     if (matches.length === 1) {
-      return row[matches[0]!] as SqlPrimitive | undefined;
+      return {
+        resolved: { name: matches[0]! },
+        isOuterRef,
+      };
     }
     if (matches.length > 1) {
       throw createSqlError("SQL_SEMANTIC_AMBIGUOUS_IDENTIFIER", {
@@ -73,7 +82,25 @@ export function resolveIdentifierValue(row: Record<string, unknown>, identifier:
     }
   }
 
-  return undefined;
+  throw createSqlError("SQL_SEMANTIC_UNKNOWN_IDENTIFIER", {
+    message: `Unknown identifier: ${canonical}`,
+    token: canonical,
+  });
+}
+
+export function resolveIdentifierValue(
+  row: Record<string, unknown>,
+  identifier: string,
+  mode: "lenient" | "strict" = "lenient",
+): SqlPrimitive | undefined {
+  const keys = Object.keys(row);
+  try {
+    const binding = resolveIdentifierBinding(keys, identifier);
+    return row[binding.resolved.name] as SqlPrimitive | undefined;
+  } catch (e) {
+    if (mode === "strict") throw e;
+    return undefined;
+  }
 }
 
 export function toTruthValue(value: SqlPrimitive | undefined): TruthValue {
@@ -96,16 +123,11 @@ export function evalPredicate3VL(expr: ExprAst, row: Record<string, unknown>): T
 export function createRowNameResolver(row: Record<string, unknown>): NameResolver {
   return {
     resolveIdentifier(id: IdentifierRef): NameResolutionResult {
-      const name = normalizeIdentifier(id.name);
-      const isOuterRef = /^outer\./i.test(name);
-      const canonical = isOuterRef ? name.replace(/^outer\./i, "") : name;
-
-      // Trigger ambiguity check via resolver helper.
-      resolveIdentifierValue(row, name);
-
+      const keys = Object.keys(row);
+      const binding = resolveIdentifierBinding(keys, id.name);
       return {
-        resolved: { name: canonical, source: id.source },
-        isOuterRef,
+        resolved: { name: binding.resolved.name, source: id.source },
+        isOuterRef: binding.isOuterRef,
       };
     },
   };
