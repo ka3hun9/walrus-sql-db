@@ -77,6 +77,14 @@ Implemented (sqlserver profile):
 - `FETCH` requires both `ORDER BY` and `OFFSET` (`SQL_SYNTAX_INVALID_CLAUSE_ORDER`)
 - valid shape accepted: `ORDER BY ... OFFSET n FETCH NEXT m ROW(S) ONLY`
 
+## G5-I: UNION tail dialect constraints
+
+Implemented:
+- UNION execution tail planning now reuses parser/dialect constraints instead of regex-only splitting.
+- right-branch SELECT tail (`ORDER/LIMIT/OFFSET/FETCH`) follows profile-aware parser rules.
+- sqlserver UNION tail supports valid `ORDER BY ... OFFSET ... FETCH ...` shape.
+- invalid sqlserver tail shape and ansi FETCH leakage produce deterministic explicit errors.
+
 Regression:
-- `examples/sql-g5-clause-shape-regression.ts`
+- `examples/sql-g5-union-tail-dialect-regression.ts`
 

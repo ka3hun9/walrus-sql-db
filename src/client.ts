@@ -11,6 +11,7 @@ import type {
 import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
+import { createSqlError } from "./sql-errors.js";
 import type { ExprAst, SelectStatementAst } from "./sql-ast.js";
 
 type CompareOp =
@@ -618,31 +619,45 @@ export class WalrusSqlClient {
     limit?: number;
     offset?: number;
   } {
-    const trimmed = sql.trim();
-    const m = trimmed.match(
-      /^(.*?)(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?(?:\s+OFFSET\s+(\d+))?\s*$/i,
-    );
-    if (!m) return { baseSql: trimmed };
+    const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind !== "select") {
+      throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+        message: "UNION right branch must be a SELECT statement for tail planning",
+        token: "UNION",
+        dialect: this.opts.dialect ?? "ansi",
+      });
+    }
 
-    const baseSql = m[1]!.trim();
-    const orderByText = m[2]?.trim();
-    const limit = m[3] ? Number(m[3]) : undefined;
-    const offset = m[4] ? Number(m[4]) : undefined;
-
-    const orderByList = orderByText
-      ? orderByText
-          .split(",")
-          .map((x) => x.trim())
-          .filter(Boolean)
-          .map((part) => {
-            const om = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)((?:\s+(?:ASC|DESC))?)$/i);
-            if (!om) throw sqlError("ERR_UNSUPPORTED_ORDER_BY", part);
-            const dir = om[2]?.trim().toUpperCase() as "ASC" | "DESC" | "";
-            return { field: om[1], direction: (dir || "ASC") as "ASC" | "DESC" };
-          })
+    const orderByList = ast.orderBy
+      ? ast.orderBy.map((o) => {
+          let field: string;
+          if (o.expr.kind === "identifier") {
+            field = o.expr.name;
+          } else {
+            const rendered = exprAstToSql(o.expr);
+            if (!rendered) {
+              throw createSqlError("SQL_SEMANTIC_UNKNOWN_IDENTIFIER", {
+                message: "Unable to render ORDER BY expression in UNION tail",
+                token: "ORDER BY",
+              });
+            }
+            field = rendered;
+          }
+          return { field, direction: o.direction };
+        })
       : undefined;
 
-    return { baseSql, orderByList, limit, offset };
+    const normalized = sql.trim().replace(/\s+/g, " ");
+    const tailMatch = normalized.match(
+      /^(.*?)(?:\s+ORDER\s+BY\s+.+?)?(?:\s+LIMIT\s+\d+)?(?:\s+OFFSET\s+\d+)?(?:\s+FETCH\s+(?:FIRST|NEXT)\s+\d+\s+ROWS?\s+ONLY)?\s*$/i,
+    );
+
+    return {
+      baseSql: (tailMatch?.[1] ?? normalized).trim(),
+      orderByList,
+      limit: ast.limit,
+      offset: ast.offset,
+    };
   }
 
   private parseSelect(normalizedSql: string, rawSql: string): ParsedSelect {
