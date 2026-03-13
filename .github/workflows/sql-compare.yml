@@ -13,7 +13,7 @@ jobs:
     steps:
       - name: Set category matrix
         id: cats
-        run: echo 'categories=["compare","null-3vl","like","in-between","subquery","correlated","expr","logic","having"]' >> $GITHUB_OUTPUT
+        run: echo 'categories=["compare","null-3vl","like","in-between","subquery","correlated","expr","logic","having","g3b-fixture"]' >> $GITHUB_OUTPUT
 
   sql-compare-by-category:
     runs-on: ubuntu-latest
@@ -83,3 +83,6 @@ jobs:
 
       - name: SQL roadmap smoke
         run: npm run sql:roadmap
+
+      - name: SQL semantic grouped regressions
+        run: npm run sql:semantic:grouped

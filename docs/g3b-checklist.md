@@ -28,5 +28,5 @@ Reference:
 ## Remaining before G3-B close
 - [x] add differential fixture mapping for the above scenarios (`docs/g3b-differential-fixtures.md`)
 - [x] wire regressions into grouped SQL semantic runner (`npm run sql:semantic:grouped`)
-- [ ] wire grouped runner into CI grouped SQL suite
+- [x] wire grouped runner into CI grouped SQL suite (`.github/workflows/sql-compare*.yml`)
 - [x] publish mismatch budget note (`docs/g3b-mismatch-budget.md`)
