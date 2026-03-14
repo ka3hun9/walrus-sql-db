@@ -50,6 +50,7 @@ const cases: RunnerCase[] = [
   { name: "phasea22-join-aware-as-alias", script: "examples/sql-phasea22-join-aware-as-alias-regression.ts" },
   { name: "phasea23-join-aware-unique-constraint", script: "examples/sql-phasea23-join-aware-unique-constraint-regression.ts" },
   { name: "phasea24-join-aware-type-constraint", script: "examples/sql-phasea24-join-aware-type-constraint-regression.ts" },
+  { name: "phasea25-join-aware-not-null-constraint", script: "examples/sql-phasea25-join-aware-not-null-constraint-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
