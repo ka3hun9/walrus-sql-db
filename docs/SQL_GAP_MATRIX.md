@@ -4,18 +4,18 @@
 
 | Area | Status | Notes |
 |---|---|---|
-| SELECT/WHERE/ORDER/LIMIT/OFFSET | ‚úÖ | Baseline stable + 3VL filter semantics + expression first-cut (`+ - * / %`, CASE, COALESCE, NULLIF, CAST) + dialect gating for TOP/FETCH/LIMIT clause-shape by profile |
-| Aggregates + GROUP BY/HAVING | ‚úÖ | COUNT/SUM/AVG/MIN/MAX |
+| SELECT/WHERE/ORDER/LIMIT/OFFSET | ‚ú?| Baseline stable + 3VL filter semantics + expression first-cut (`+ - * / %`, CASE, COALESCE, NULLIF, CAST) + dialect gating for TOP/FETCH/LIMIT clause-shape by profile |
+| Aggregates + GROUP BY/HAVING | ‚ú?| COUNT/SUM/AVG/MIN/MAX |
 | JOIN | üü° | INNER/LEFT/RIGHT (first-cut) |
 | Subquery | üü° | IN/EXISTS/scalar/ANY/ALL first-cut + correlated WHERE refs via `outer.<col>` + FROM subquery first-cut; scalar MIN-subquery NULL semantics aligned for current matrix |
 | UNION | üü° | UNION / UNION ALL first-cut |
 | Window | üü° | ROW_NUMBER first-cut |
-| NULL/LIKE | ‚úÖ | 3VL, IS NULL/IS NOT NULL, LIKE/NOT LIKE, LIKE ESCAPE + postgres `ILIKE` dialect-gated |
-| Distinctness predicates | ‚úÖ | IS DISTINCT FROM / IS NOT DISTINCT FROM |
-| Boolean truth predicates | ‚úÖ | IS [NOT] TRUE/FALSE/UNKNOWN |
-| Transaction semantics | ‚ùå | Not implemented |
-| Full SQL parser/AST | ‚ùå | Lightweight parser, not SQL-complete |
-| Cost-based optimizer | ‚ùå | Not implemented |
+| NULL/LIKE | ‚ú?| 3VL, IS NULL/IS NOT NULL, LIKE/NOT LIKE, LIKE ESCAPE + postgres `ILIKE` dialect-gated |
+| Distinctness predicates | ‚ú?| IS DISTINCT FROM / IS NOT DISTINCT FROM |
+| Boolean truth predicates | ‚ú?| IS [NOT] TRUE/FALSE/UNKNOWN |
+| Transaction semantics | ‚ù?| Not implemented |
+| Full SQL parser/AST | ‚ù?| Lightweight parser, not SQL-complete |
+| Cost-based optimizer | ‚ù?| Not implemented |
 
 ## G5 completion snapshot (2026-03-14)
 
@@ -869,6 +869,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA98 in grouped semantic runner.
 
+## Phase A-99 snapshot (2026-03-14)
+
+- Added regression lock for en-quad-space target-token shapes in join-aware DML boundary:
+  - UPDATE ... SET o\u2000.\u2000amount = ..., u\u2000.\u2000tier = ...
+  - DELETE o,\u2000u FROM ...
+- Confirms deterministic behavior boundary:
+  - en-quad-space target-token SET currently rejects with ERR_UNSUPPORTED_UPDATE
+  - en-quad-space multi-target DELETE is rejected with ERR_UNSUPPORTED_DELETE
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA99 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
@@ -889,3 +900,4 @@
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
+
