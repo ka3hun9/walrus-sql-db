@@ -257,6 +257,12 @@
 - Confirms keys released by join-aware DELETE can be deterministically reused by subsequent INSERT.
 - Included phaseA26 in grouped semantic runner.
 
+## Phase A-27 snapshot (2026-03-14)
+
+- Added regression lock that join-aware UPDATE enforces composite UNIQUE groups on left-table writes.
+- Verifies conflicting writes raise `ERR_CONSTRAINT_VIOLATION` and non-conflicting writes remain successful.
+- Included phaseA27 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
