@@ -330,6 +330,12 @@
 - Keeps deterministic delete-path invariants (`conflictChecks = 0`, `rebuildOps = 0`).
 - Included phaseA38 in grouped semantic runner.
 
+## Phase A-39 snapshot (2026-03-14)
+
+- Added regression lock for unsupported join-type rejection cost stability (`LEFT JOIN` path for join-aware UPDATE/DELETE).
+- Verifies deterministic unsupported errors are raised and both left/right constraint-cost counters remain unchanged.
+- Included phaseA39 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
