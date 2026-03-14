@@ -110,7 +110,49 @@ type SqlErrorCode =
   | "ERR_UNSUPPORTED_WHERE"
   | "ERR_UNSUPPORTED_AST_FROM"
   | "ERR_UNSUPPORTED_RAW_EXPR"
-  | "ERR_UNSUPPORTED_SUBQUERY";
+  | "ERR_UNSUPPORTED_SUBQUERY"
+  | "ERR_UNSUPPORTED_DDL"
+  | "ERR_UNSUPPORTED_TYPE"
+  | "ERR_TYPE_CONSTRAINT"
+  | "ERR_CONSTRAINT_VIOLATION";
+
+type SqlTypeName =
+  | "SMALLINT"
+  | "INT"
+  | "BIGINT"
+  | "DECIMAL"
+  | "FLOAT"
+  | "DOUBLE"
+  | "CHAR"
+  | "VARCHAR"
+  | "DATE"
+  | "TIME"
+  | "TIMESTAMP"
+  | "BOOLEAN"
+  | "BLOB"
+  | "TEXT"
+  | "STRING"
+  | "U64";
+
+type ColumnTypeSpec = {
+  name: SqlTypeName;
+  length?: number;
+  precision?: number;
+  scale?: number;
+};
+
+type ColumnSchema = {
+  name: string;
+  type: ColumnTypeSpec;
+  notNull: boolean;
+  primaryKey: boolean;
+  unique: boolean;
+};
+
+type TableSchema = {
+  name: string;
+  columns: ColumnSchema[];
+};
 
 function sqlError(code: SqlErrorCode, detail: string): Error {
   return new Error(`${code}: ${detail}`);
@@ -119,6 +161,7 @@ function sqlError(code: SqlErrorCode, detail: string): Error {
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
+  private readonly schemas = new Map<string, TableSchema>();
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -171,8 +214,9 @@ export class WalrusSqlClient {
     const upper = normalized.toUpperCase();
 
     if (upper.startsWith("CREATE TABLE")) {
-      const table = this.extractTableName(normalized, /CREATE TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      if (!this.tables.has(table)) this.tables.set(table, []);
+      const schema = this.parseCreateTableSchema(normalized);
+      if (!this.tables.has(schema.name)) this.tables.set(schema.name, []);
+      this.schemas.set(schema.name, schema);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "CREATE",
@@ -181,11 +225,32 @@ export class WalrusSqlClient {
       };
     }
 
+    if (upper.startsWith("DROP TABLE")) {
+      const table = this.extractTableName(normalized, /DROP TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      this.tables.delete(table);
+      this.schemas.delete(table);
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("ALTER TABLE")) {
+      this.applyAlterTable(normalized);
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "UPDATE",
+        affectedRows: 0,
+      };
+    }
+
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       const row = this.parseInsert(normalized);
       const bucket = this.requireTable(table);
-      bucket.push(row);
+      const coerced = this.applySchemaOnWrite(table, row, undefined);
+      bucket.push(coerced);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "INSERT",
@@ -201,7 +266,9 @@ export class WalrusSqlClient {
       let touched = 0;
       for (const row of bucket) {
         if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
-          row[setField] = this.castValue(setValue);
+          const next = this.applySchemaOnWrite(table, { ...row, [setField]: this.castValue(setValue) }, row);
+          Object.keys(row).forEach((k) => delete row[k]);
+          Object.assign(row, next);
           touched++;
         }
       }
@@ -408,14 +475,314 @@ export class WalrusSqlClient {
     return m[1];
   }
 
+  private splitTopLevelComma(input: string): string[] {
+    const out: string[] = [];
+    let buf = "";
+    let quote = "";
+    let depth = 0;
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i]!;
+      if (quote) {
+        buf += ch;
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        buf += ch;
+        continue;
+      }
+      if (ch === "(") depth++;
+      else if (ch === ")") depth = Math.max(0, depth - 1);
+
+      if (ch === "," && depth === 0) {
+        out.push(buf.trim());
+        buf = "";
+        continue;
+      }
+      buf += ch;
+    }
+    if (buf.trim()) out.push(buf.trim());
+    return out;
+  }
+
+  private parseSqlTypeSpec(rawType: string): ColumnTypeSpec {
+    const t = rawType.trim().toUpperCase();
+    const m = t.match(/^([A-Z]+)(?:\((.+)\))?$/);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
+
+    const name = m[1] as SqlTypeName;
+    const supported: SqlTypeName[] = [
+      "SMALLINT",
+      "INT",
+      "BIGINT",
+      "DECIMAL",
+      "FLOAT",
+      "DOUBLE",
+      "CHAR",
+      "VARCHAR",
+      "DATE",
+      "TIME",
+      "TIMESTAMP",
+      "BOOLEAN",
+      "BLOB",
+      "TEXT",
+      "STRING",
+      "U64",
+    ];
+    if (!supported.includes(name)) throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
+
+    const params = m[2]?.split(",").map((x) => Number(x.trim()));
+
+    if (name === "DECIMAL") {
+      if (!params || params.length !== 2 || !Number.isInteger(params[0]) || !Number.isInteger(params[1])) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `DECIMAL requires (precision,scale): ${rawType}`);
+      }
+      const precision = params[0]!;
+      const scale = params[1]!;
+      if (precision <= 0 || scale < 0 || scale > precision) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DECIMAL bounds: ${rawType}`);
+      }
+      return { name, precision, scale };
+    }
+
+    if (name === "CHAR" || name === "VARCHAR") {
+      if (!params || params.length !== 1 || !Number.isInteger(params[0]) || params[0]! <= 0) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `${name} requires positive length: ${rawType}`);
+      }
+      return { name, length: params[0]! };
+    }
+
+    if (params && params.length > 0) {
+      throw sqlError("ERR_TYPE_CONSTRAINT", `${name} does not accept parameters: ${rawType}`);
+    }
+
+    return { name };
+  }
+
+  private parseCreateTableSchema(sql: string): TableSchema {
+    const m = sql.match(/^CREATE TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*$/i);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_DDL", sql);
+    const table = m[1]!;
+    const defs = this.splitTopLevelComma(m[2]!);
+    if (defs.length === 0) throw sqlError("ERR_UNSUPPORTED_DDL", `CREATE TABLE has no columns: ${sql}`);
+
+    const columns: ColumnSchema[] = defs.map((d) => {
+      const dm = d.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i);
+      if (!dm) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid column definition: ${d}`);
+      const colName = dm[1]!.trim();
+      const type = this.parseSqlTypeSpec(dm[2]!);
+      const cons = dm[3]!.toUpperCase();
+      const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
+      const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
+      const unique = primaryKey || /\bUNIQUE\b/.test(cons);
+      return { name: colName, type, notNull, primaryKey, unique };
+    });
+
+    const seen = new Set<string>();
+    for (const c of columns) {
+      const key = c.name.toUpperCase();
+      if (seen.has(key)) throw sqlError("ERR_UNSUPPORTED_DDL", `duplicate column: ${c.name}`);
+      seen.add(key);
+    }
+
+    return { name: table, columns };
+  }
+
+  private applyAlterTable(sql: string): void {
+    const add = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ADD\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i,
+    );
+    if (add) {
+      const table = add[1]!;
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+      const column = add[2]!;
+      if (schema.columns.some((c) => c.name.toUpperCase() === column.toUpperCase())) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `column already exists: ${column}`);
+      }
+
+      const type = this.parseSqlTypeSpec(add[3]!);
+      const cons = add[4]!.toUpperCase();
+      const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
+      const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
+      const unique = primaryKey || /\bUNIQUE\b/.test(cons);
+      const col: ColumnSchema = { name: column, type, notNull, primaryKey, unique };
+
+      const rows = this.requireTable(table);
+      if (notNull && rows.length > 0) {
+        throw sqlError("ERR_CONSTRAINT_VIOLATION", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
+      }
+      for (const r of rows) r[column] = null;
+      schema.columns.push(col);
+      return;
+    }
+
+    const drop = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+DROP\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$/i,
+    );
+    if (drop) {
+      const table = drop[1]!;
+      const column = drop[2]!;
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+      const idx = schema.columns.findIndex((c) => c.name.toUpperCase() === column.toUpperCase());
+      if (idx < 0) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
+      if (schema.columns[idx]!.primaryKey) {
+        throw sqlError("ERR_CONSTRAINT_VIOLATION", `cannot DROP primary key column: ${column}`);
+      }
+
+      schema.columns.splice(idx, 1);
+      const rows = this.requireTable(table);
+      for (const r of rows) delete r[column];
+      return;
+    }
+
+    throw sqlError("ERR_UNSUPPORTED_DDL", sql);
+  }
+
+  private coerceByType(type: ColumnTypeSpec, value: SqlPrimitive): SqlPrimitive {
+    if (value === null) return null;
+
+    const toNum = (v: SqlPrimitive): number => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `expected numeric for ${type.name}, got ${String(v)}`);
+      return n;
+    };
+
+    const toInt = (v: SqlPrimitive): number => {
+      const n = toNum(v);
+      if (!Number.isInteger(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `expected integer for ${type.name}, got ${String(v)}`);
+      return n;
+    };
+
+    if (type.name === "SMALLINT") {
+      const n = toInt(value);
+      if (n < -32768 || n > 32767) throw sqlError("ERR_TYPE_CONSTRAINT", `SMALLINT out of range: ${n}`);
+      return n;
+    }
+    if (type.name === "INT") {
+      const n = toInt(value);
+      if (n < -2147483648 || n > 2147483647) throw sqlError("ERR_TYPE_CONSTRAINT", `INT out of range: ${n}`);
+      return n;
+    }
+    if (type.name === "BIGINT") {
+      const n = toInt(value);
+      if (!Number.isSafeInteger(n)) return String(n);
+      return n;
+    }
+    if (type.name === "U64") {
+      const n = toInt(value);
+      if (n < 0) throw sqlError("ERR_TYPE_CONSTRAINT", `U64 must be >= 0: ${n}`);
+      if (!Number.isSafeInteger(n)) return String(n);
+      return n;
+    }
+    if (type.name === "DECIMAL") {
+      const s = String(value).trim();
+      if (!/^-?\d+(?:\.\d+)?$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DECIMAL literal: ${s}`);
+      const [intPartRaw, fracPart = ""] = s.replace(/^-/, "").split(".");
+      const intPart = intPartRaw.replace(/^0+(?=\d)/, "");
+      const digits = (intPart + fracPart).length;
+      const precision = type.precision ?? 0;
+      const scale = type.scale ?? 0;
+      if (digits > precision || fracPart.length > scale) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `DECIMAL(${precision},${scale}) overflow: ${s}`);
+      }
+      return Number(s);
+    }
+    if (type.name === "FLOAT" || type.name === "DOUBLE") {
+      return toNum(value);
+    }
+    if (type.name === "CHAR" || type.name === "VARCHAR") {
+      const str = String(value);
+      const maxLen = type.length ?? 0;
+      if (str.length > maxLen) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `${type.name}(${maxLen}) length overflow: ${str.length}`);
+      }
+      return type.name === "CHAR" ? str.padEnd(maxLen, " ") : str;
+    }
+    if (type.name === "TEXT" || type.name === "STRING" || type.name === "BLOB") {
+      return String(value);
+    }
+    if (type.name === "BOOLEAN") {
+      if (typeof value === "boolean") return value;
+      const v = String(value).toLowerCase();
+      if (v === "true" || v === "1") return true;
+      if (v === "false" || v === "0") return false;
+      throw sqlError("ERR_TYPE_CONSTRAINT", `invalid BOOLEAN: ${String(value)}`);
+    }
+    if (type.name === "DATE") {
+      const s = String(value);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DATE: ${s}`);
+      const d = new Date(`${s}T00:00:00Z`);
+      if (Number.isNaN(d.getTime())) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DATE: ${s}`);
+      return s;
+    }
+    if (type.name === "TIME") {
+      const s = String(value);
+      if (!/^\d{2}:\d{2}:\d{2}$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME: ${s}`);
+      return s;
+    }
+    if (type.name === "TIMESTAMP") {
+      const s = String(value);
+      if (!/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(s)) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
+      }
+      return s.replace(" ", "T");
+    }
+    if (type.name === "BLOB") {
+      return String(value);
+    }
+
+    throw sqlError("ERR_UNSUPPORTED_TYPE", type.name);
+  }
+
+  private applySchemaOnWrite(table: string, candidate: SqlRow, previous?: SqlRow): SqlRow {
+    const schema = this.schemas.get(table);
+    if (!schema) return candidate;
+
+    for (const k of Object.keys(candidate)) {
+      if (!schema.columns.some((c) => c.name === k)) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `unknown column: ${k}`);
+      }
+    }
+
+    const out: SqlRow = {};
+    for (const c of schema.columns) {
+      const raw = Object.prototype.hasOwnProperty.call(candidate, c.name) ? candidate[c.name] : null;
+      const coerced = this.coerceByType(c.type, (raw ?? null) as SqlPrimitive);
+      if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
+        throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}.${c.name} is NOT NULL`);
+      }
+      out[c.name] = coerced;
+    }
+
+    const rows = this.requireTable(table);
+    const uniqueCols = schema.columns.filter((c) => c.unique || c.primaryKey);
+    for (const uc of uniqueCols) {
+      const v = out[uc.name];
+      if (v === null || v === undefined) continue;
+      for (const r of rows) {
+        if (previous && r === previous) continue;
+        if (String(r[uc.name] ?? "") === String(v)) {
+          throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}.${uc.name} violates UNIQUE`);
+        }
+      }
+    }
+
+    return out;
+  }
+
   private parseInsert(sql: string): SqlRow {
     const m = sql.match(/INSERT INTO\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\((.+)\)\s*VALUES\s*\((.+)\)/i);
     if (!m) throw sqlError("ERR_UNSUPPORTED_INSERT", sql);
-    const cols = m[1].split(",").map((c) => c.trim());
+    const cols = this.splitTopLevelComma(m[1]).map((c) => c.trim());
     const vals = this.smartSplit(m[2]).map((v) => this.castValue(v));
     if (cols.length !== vals.length) throw new Error(`INSERT column/value mismatch`);
     const row: SqlRow = {};
-    cols.forEach((c, i) => (row[c] = vals[i]));
+    cols.forEach((c, i) => (row[c] = vals[i] ?? null));
     return row;
   }
 

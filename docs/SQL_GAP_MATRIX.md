@@ -29,8 +29,22 @@
 - UNION tail execution now honors parser dialect constraints.
 - Compare matrix includes `g5-fixture` category with PR + nightly reports.
 
+## Phase A-1 snapshot (2026-03-14)
 
-1. **Sprint E/F (implemented baseline)**
+- Storage schema now tracks column type metadata from `CREATE TABLE`.
+- SQL-92 core type parsing/validation added (including parameter checks):
+  - `SMALLINT`, `INT`, `BIGINT`, `DECIMAL(p,s)`, `FLOAT`, `DOUBLE`, `CHAR(n)`, `VARCHAR(n)`, `DATE`, `TIME`, `TIMESTAMP`, `BOOLEAN`, `BLOB`
+- Write-path type coercion + strict constraint enforcement enabled:
+  - `PRIMARY KEY`, `NOT NULL`, `UNIQUE`
+- Basic DDL mutation support added:
+  - `DROP TABLE`
+  - `ALTER TABLE ADD COLUMN`
+  - `ALTER TABLE DROP COLUMN`
+- Deterministic error families used in simulator layer:
+  - `ERR_UNSUPPORTED_TYPE`, `ERR_TYPE_CONSTRAINT`, `ERR_CONSTRAINT_VIOLATION`, `ERR_UNSUPPORTED_DDL`
+
+## Next milestones
+
    - ✅ Matrix coverage expanded (PR profile + nightly profile)
    - ✅ SQLite dialect mapping extracted to dedicated module (`examples/sql-compare-dialect.ts`)
    - ✅ CI split by profile + PR category parallelization
