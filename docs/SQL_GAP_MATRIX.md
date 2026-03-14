@@ -86,11 +86,21 @@
 - Write-path constraint checks now evaluate composite group uniqueness via indexed keys.
 - Added dedicated composite key regression (including delete/reinsert reuse path).
 
+## Phase A-7 snapshot (2026-03-14)
+
+- Unique constraint index maintenance switched from full rebuild to incremental updates on hot write paths:
+  - `INSERT`: add row keys only
+  - `UPDATE`: replace affected row keys only
+  - `DELETE`: remove matched row keys only
+- Index map now stores row references directly, reducing index-to-row indirection.
+- Full rebuild retained for structural DDL transitions (`ALTER`/schema changes) as a safe fallback.
+- Added dedicated regression for incremental index maintenance across insert/update/delete + composite groups.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
    - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
-   - constraint/index abstraction completion (incremental maintenance + cost model)
+   - constraint/index abstraction completion (cost model visibility + benchmark hooks)
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix

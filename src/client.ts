@@ -164,7 +164,7 @@ export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
-  private readonly uniqueIndexes = new Map<string, Map<string, Map<string, number>>>();
+  private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -256,7 +256,7 @@ export class WalrusSqlClient {
       const bucket = this.requireTable(table);
       const coerced = this.applySchemaOnWrite(table, row, undefined);
       bucket.push(coerced);
-      this.rebuildUniqueIndexes(table);
+      this.addRowToUniqueIndexes(table, coerced);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "INSERT",
@@ -273,12 +273,12 @@ export class WalrusSqlClient {
       for (const row of bucket) {
         if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
           const next = this.applySchemaOnWrite(table, { ...row, [setField]: this.castValue(setValue) }, row);
+          this.replaceRowInUniqueIndexes(table, row, next);
           Object.keys(row).forEach((k) => delete row[k]);
           Object.assign(row, next);
           touched++;
         }
       }
-      if (touched > 0) this.rebuildUniqueIndexes(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "UPDATE",
@@ -291,10 +291,17 @@ export class WalrusSqlClient {
       const { whereExpr } = this.parseDelete(normalized);
       const whereTree = this.parseWhereTree(whereExpr);
       const bucket = this.requireTable(table);
-      const next = bucket.filter((row) => this.evaluateWhereTree(row, whereTree) !== "TRUE");
-      const touched = bucket.length - next.length;
+      let touched = 0;
+      const next: SqlRow[] = [];
+      for (const row of bucket) {
+        if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
+          this.removeRowFromUniqueIndexes(table, row);
+          touched++;
+        } else {
+          next.push(row);
+        }
+      }
       this.tables.set(table, next);
-      this.rebuildUniqueIndexes(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -813,16 +820,15 @@ export class WalrusSqlClient {
 
     const rows = this.requireTable(table);
     this.ensureUniqueIndexMaps(table);
-    const indexByKey = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, number>>();
+    const indexByKey = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, SqlRow>>();
 
     for (const group of this.collectUniqueGroups(schema)) {
       const keyName = this.uniqueGroupName(group);
       const keyVal = this.uniqueGroupValue(out, group);
       if (keyVal === null) continue;
 
-      const hit = indexByKey.get(keyName)?.get(keyVal);
-      if (hit !== undefined) {
-        const hitRow = rows[hit];
+      const hitRow = indexByKey.get(keyName)?.get(keyVal);
+      if (hitRow !== undefined) {
         if (!previous || hitRow !== previous) {
           throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}(${group.join(",")}) violates UNIQUE`);
         }
@@ -868,9 +874,9 @@ export class WalrusSqlClient {
     if (!schema) return;
     if (this.uniqueIndexes.has(table)) return;
 
-    const idxMap = new Map<string, Map<string, number>>();
+    const idxMap = new Map<string, Map<string, SqlRow>>();
     for (const g of this.collectUniqueGroups(schema)) {
-      idxMap.set(this.uniqueGroupName(g), new Map<string, number>());
+      idxMap.set(this.uniqueGroupName(g), new Map<string, SqlRow>());
     }
     this.uniqueIndexes.set(table, idxMap);
   }
@@ -883,17 +889,51 @@ export class WalrusSqlClient {
     }
 
     const rows = this.requireTable(table);
-    const idxMap = new Map<string, Map<string, number>>();
+    const idxMap = new Map<string, Map<string, SqlRow>>();
     for (const g of this.collectUniqueGroups(schema)) {
-      const colMap = new Map<string, number>();
+      const colMap = new Map<string, SqlRow>();
       for (let i = 0; i < rows.length; i++) {
         const key = this.uniqueGroupValue(rows[i]!, g);
         if (key === null) continue;
-        colMap.set(key, i);
+        colMap.set(key, rows[i]!);
       }
       idxMap.set(this.uniqueGroupName(g), colMap);
     }
     this.uniqueIndexes.set(table, idxMap);
+  }
+
+  private addRowToUniqueIndexes(table: string, row: SqlRow): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+    this.ensureUniqueIndexMaps(table);
+    const idxMap = this.uniqueIndexes.get(table);
+    if (!idxMap) return;
+
+    for (const g of this.collectUniqueGroups(schema)) {
+      const keyName = this.uniqueGroupName(g);
+      const keyVal = this.uniqueGroupValue(row, g);
+      if (keyVal === null) continue;
+      idxMap.get(keyName)?.set(keyVal, row);
+    }
+  }
+
+  private removeRowFromUniqueIndexes(table: string, row: SqlRow): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+    const idxMap = this.uniqueIndexes.get(table);
+    if (!idxMap) return;
+
+    for (const g of this.collectUniqueGroups(schema)) {
+      const keyName = this.uniqueGroupName(g);
+      const keyVal = this.uniqueGroupValue(row, g);
+      if (keyVal === null) continue;
+      idxMap.get(keyName)?.delete(keyVal);
+    }
+  }
+
+  private replaceRowInUniqueIndexes(table: string, previous: SqlRow, next: SqlRow): void {
+    this.removeRowFromUniqueIndexes(table, previous);
+    this.addRowToUniqueIndexes(table, next);
   }
 
   private parseInsert(sql: string): SqlRow {
