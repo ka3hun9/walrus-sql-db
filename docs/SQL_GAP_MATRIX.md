@@ -224,6 +224,15 @@
 - Keeps behavior explicit and prevents ambiguous semantics before dedicated self-join execution model exists.
 - Added dedicated phaseA21 regression and grouped-runner coverage.
 
+## Phase A-22 snapshot (2026-03-14)
+
+- Added regression lock for explicit `AS` alias forms in first-cut join-aware DML:
+  - `UPDATE <table> AS <alias> INNER JOIN ...`
+  - `DELETE <alias> FROM <table> AS <alias> INNER JOIN ...`
+- Confirms parity between `AS` aliases and bare aliases under current join-aware planner/executor behavior.
+- Keeps deterministic boundaries intact (e.g., invalid DELETE target alias still rejected).
+- Included phaseA22 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

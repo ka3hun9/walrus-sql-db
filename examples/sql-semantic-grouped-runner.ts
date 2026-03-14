@@ -47,6 +47,7 @@ const cases: RunnerCase[] = [
   { name: "phasea19-join-aware-on-field-validation", script: "examples/sql-phasea19-join-aware-on-field-validation-regression.ts" },
   { name: "phasea20-join-aware-alias-safety", script: "examples/sql-phasea20-join-aware-alias-safety-regression.ts" },
   { name: "phasea21-join-aware-self-join-boundary", script: "examples/sql-phasea21-join-aware-self-join-boundary-regression.ts" },
+  { name: "phasea22-join-aware-as-alias", script: "examples/sql-phasea22-join-aware-as-alias-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
