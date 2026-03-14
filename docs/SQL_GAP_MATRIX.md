@@ -404,6 +404,12 @@
 - Confirms current deterministic behavior: reversed ON-side ordering is rejected (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) with no constraint-cost side effects.
 - Included phaseA50 in grouped semantic runner.
 
+## Phase A-51 snapshot (2026-03-14)
+
+- Added regression lock for unqualified ON fields (`ON id = user_id`) in join-aware UPDATE/DELETE.
+- Confirms deterministic supported behavior for unambiguous unqualified ON fields: left-table cost counters move (`updateOps`/`deleteOps`), `rebuildOps = 0`, right-table counters unchanged.
+- Included phaseA51 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
