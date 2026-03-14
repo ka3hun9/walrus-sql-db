@@ -52,10 +52,18 @@
   - unsupported `ALTER TABLE` forms fail explicitly with `ERR_UNSUPPORTED_DDL`
 - Added dedicated regression coverage for DML/DDL clause-shape behavior.
 
+## Phase A-3 snapshot (2026-03-14)
+
+- DML subquery predicate path validated for data modification:
+  - `UPDATE ... WHERE ... IN (SELECT ...)`
+  - `DELETE ... WHERE EXISTS (SELECT ... correlated ...)`
+- malformed DML subquery shape continues to fail deterministically via `ERR_UNSUPPORTED_SUBQUERY`.
+- Added dedicated regression for DML subquery behavior.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - DML with subquery predicates (`IN/EXISTS/ANY/ALL`) for UPDATE/DELETE
+   - DML subquery predicates completion for UPDATE/DELETE (`ANY/ALL` and edge-shape matrix)
    - DDL surface hardening + deterministic error map for unsupported forms
    - constraint/index abstraction prep for PK/UNIQUE acceleration
 
