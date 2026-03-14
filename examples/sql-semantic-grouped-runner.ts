@@ -95,6 +95,7 @@ const cases: RunnerCase[] = [
   { name: "phasea67-rightfirst-mixed-set-rejection-cost-stability", script: "examples/sql-phasea67-rightfirst-mixed-set-rejection-cost-stability-regression.ts" },
   { name: "phasea68-rightfirst-mixed-table-set-rejection-cost-stability", script: "examples/sql-phasea68-rightfirst-mixed-table-set-rejection-cost-stability-regression.ts" },
   { name: "phasea69-right-table-name-with-right-alias-rejection-cost-stability", script: "examples/sql-phasea69-right-table-name-with-right-alias-rejection-cost-stability-regression.ts" },
+  { name: "phasea70-right-alias-plus-left-tablename-mix-rejection-cost-stability", script: "examples/sql-phasea70-right-alias-plus-left-tablename-mix-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
