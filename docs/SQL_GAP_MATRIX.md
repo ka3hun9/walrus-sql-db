@@ -781,6 +781,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA90 in grouped semantic runner.
 
+## Phase A-91 snapshot (2026-03-14)
+
+- Added regression lock for ideographic-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\u3000.\u3000amount = ..., u\u3000.\u3000tier = ...`
+  - `DELETE o,\u3000u FROM ...`
+- Confirms deterministic behavior boundary:
+  - ideographic-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - ideographic-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA91 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
