@@ -572,6 +572,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA71 in grouped semantic runner.
 
+## Phase A-72 snapshot (2026-03-14)
+
+- Added regression lock for mixed left table-name + right alias targets in join-aware DML boundary:
+  - `UPDATE users u JOIN orders o ... SET users.tier = ..., o.amount = ...`
+  - `DELETE users, o FROM users u JOIN orders o ...`
+- Confirms deterministic behavior boundary:
+  - mixed SET with right alias target currently fails with `ERR_TYPE_CONSTRAINT`
+  - mixed table-name+alias multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA72 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
