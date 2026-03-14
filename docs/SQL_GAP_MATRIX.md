@@ -305,6 +305,12 @@
 - Validates row-level mutation dedup semantics functionally (single left-row result change) while preserving deterministic non-rebuild cost behavior.
 - Included phaseA34 in grouped semantic runner.
 
+## Phase A-35 snapshot (2026-03-14)
+
+- Added regression lock for join-aware UPDATE conflict-path state stability.
+- Verifies UNIQUE-conflict failure keeps row state unchanged while preserving deterministic cost behavior (`conflictChecks > 0`, `deleteOps = 0`, `rebuildOps = 0`).
+- Included phaseA35 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
