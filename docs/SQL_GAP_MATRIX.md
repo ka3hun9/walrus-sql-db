@@ -460,6 +460,12 @@
 - Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
 - Included phaseA59 in grouped semantic runner.
 
+## Phase A-60 snapshot (2026-03-14)
+
+- Added regression lock for target alias conflicting with left table name (e.g. `UPDATE users u JOIN orders users ... SET users.tier = ...`) in join-aware UPDATE/DELETE.
+- Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
+- Included phaseA60 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

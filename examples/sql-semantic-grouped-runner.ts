@@ -85,6 +85,7 @@ const cases: RunnerCase[] = [
   { name: "phasea57-join-alias-conflict-rejection-cost-stability", script: "examples/sql-phasea57-join-alias-conflict-rejection-cost-stability-regression.ts" },
   { name: "phasea58-right-alias-left-table-conflict-rejection-cost-stability", script: "examples/sql-phasea58-right-alias-left-table-conflict-rejection-cost-stability-regression.ts" },
   { name: "phasea59-left-alias-right-table-conflict-rejection-cost-stability", script: "examples/sql-phasea59-left-alias-right-table-conflict-rejection-cost-stability-regression.ts" },
+  { name: "phasea60-target-alias-left-name-conflict-rejection-cost-stability", script: "examples/sql-phasea60-target-alias-left-name-conflict-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
