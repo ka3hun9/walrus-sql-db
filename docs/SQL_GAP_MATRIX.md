@@ -144,10 +144,23 @@
   - apply existing write-path schema/constraint/index checks to those target rows
 - Added dedicated regression for first-cut join-aware UPDATE + deterministic boundary retention.
 
+## Phase A-12 snapshot (2026-03-14)
+
+- Added first-cut join-aware DELETE execution semantics for minimal shape:
+  - supported: `DELETE <left> FROM <left> JOIN <right> ON <leftKey>=<rightKey> [WHERE ...]`
+- Planner now distinguishes:
+  - supported JOIN-delete shape above (target must match left table)
+  - still-unsupported `DELETE FROM ... USING ...` (deterministic `ERR_UNSUPPORTED_DELETE`)
+- Target-row derivation for first-cut JOIN-delete:
+  - derive left-table target set from INNER JOIN matches (deduplicated)
+  - apply WHERE filtering on target-side rows
+  - keep existing unique-index cleanup path on deleted rows
+- Added dedicated regression for first-cut join-aware DELETE behavior + deterministic boundary retention.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - extend join-aware DML semantics coverage (multi-shape UPDATE/DELETE)
+   - extend join-aware DML semantics coverage (outer-join/alias variants + deterministic boundaries)
    - promote constraint/index cost gate into primary CI workflow + threshold tuning from nightly trend
 
 2. **M1 (stabilize+)**

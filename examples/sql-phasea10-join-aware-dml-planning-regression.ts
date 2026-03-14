@@ -34,12 +34,7 @@ async function main() {
     "ERR_UNSUPPORTED_UPDATE",
   );
 
-  // join-aware delete shapes should fail deterministically for now
-  await expectErr(
-    () => db.execute("DELETE users FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 100"),
-    "ERR_UNSUPPORTED_DELETE",
-  );
-
+  // join-aware delete USING shape should still fail deterministically for now
   await expectErr(
     () => db.execute("DELETE FROM users USING orders WHERE users.id = orders.user_id"),
     "ERR_UNSUPPORTED_DELETE",

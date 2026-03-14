@@ -172,7 +172,13 @@ type UpdatePlan = DmlPlan & {
   };
 };
 
-type DeletePlan = DmlPlan;
+type DeletePlan = DmlPlan & {
+  join?: {
+    table: string;
+    leftField: string;
+    rightField: string;
+  };
+};
 
 type ConstraintIndexCostStats = {
   insertOps: number;
@@ -373,12 +379,30 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DELETE")) {
       const plan = this.planDelete(normalized);
-      const whereTree = this.parseWhereTree(plan.whereExpr);
       const bucket = this.requireTable(plan.table);
+
+      const targetRows = plan.join
+        ? (() => {
+            const rightRows = this.requireTable(plan.join.table);
+            const leftField = plan.join.leftField.includes(".") ? plan.join.leftField.split(".").at(-1)! : plan.join.leftField;
+            const rightField = plan.join.rightField.includes(".") ? plan.join.rightField.split(".").at(-1)! : plan.join.rightField;
+            const seen = new Set<SqlRow>();
+            for (const l of bucket) {
+              for (const r of rightRows) {
+                if (String(l[leftField]) !== String(r[rightField])) continue;
+                seen.add(l);
+              }
+            }
+            return seen;
+          })()
+        : new Set(bucket);
+
+      const whereTree = this.parseWhereTree(plan.whereExpr);
       let touched = 0;
       const next: SqlRow[] = [];
       for (const row of bucket) {
-        if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
+        const matchedTarget = targetRows.has(row);
+        if (matchedTarget && this.evaluateWhereTree(row, whereTree) === "TRUE") {
           this.removeRowFromUniqueIndexes(plan.table, row);
           touched++;
         } else {
@@ -1074,7 +1098,28 @@ export class WalrusSqlClient {
   }
 
   private planDelete(sql: string): DeletePlan {
-    if (/\bDELETE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+FROM\b/i.test(sql) || /\bDELETE\s+FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+USING\b/i.test(sql)) {
+    const joinM = sql.match(
+      /^DELETE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(?:WHERE\s+(.+))?$/i,
+    );
+    if (joinM) {
+      const targetAlias = joinM[1]!.trim();
+      const leftTable = joinM[2]!.trim();
+      if (targetAlias.toUpperCase() !== leftTable.toUpperCase()) {
+        throw sqlError("ERR_UNSUPPORTED_DELETE", `DELETE target must equal left table: ${sql}`);
+      }
+      return {
+        table: leftTable,
+        whereExpr: joinM[6]?.trim() ?? "1 = 1",
+        joinAware: true,
+        join: {
+          table: joinM[3]!.trim(),
+          leftField: joinM[4]!.trim(),
+          rightField: joinM[5]!.trim(),
+        },
+      };
+    }
+
+    if (/\bDELETE\s+FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+USING\b/i.test(sql)) {
       throw sqlError("ERR_UNSUPPORTED_DELETE", `join-aware DELETE not supported yet: ${sql}`);
     }
 
