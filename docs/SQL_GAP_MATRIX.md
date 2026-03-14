@@ -671,6 +671,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA80 in grouped semantic runner.
 
+## Phase A-81 snapshot (2026-03-14)
+
+- Added regression lock for CRLF-broken target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\r\n.\r\namount = ..., u\r\n.\r\ntier = ...`
+  - `DELETE o,\r\n u FROM ...`
+- Confirms deterministic behavior boundary:
+  - CRLF-broken mixed SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - CRLF-broken multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA81 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
