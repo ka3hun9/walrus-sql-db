@@ -649,6 +649,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA78 in grouped semantic runner.
 
+## Phase A-79 snapshot (2026-03-14)
+
+- Added regression lock for tab-broken target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\t.\tamount = ..., u\t.\ttier = ...`
+  - `DELETE o,\t u FROM ...`
+- Confirms deterministic behavior boundary:
+  - tab-broken mixed SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - tab-broken multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA79 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
