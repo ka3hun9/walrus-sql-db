@@ -472,6 +472,12 @@
 - Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
 - Included phaseA61 in grouped semantic runner.
 
+## Phase A-62 snapshot (2026-03-14)
+
+- Added regression lock for left-table-name target usage while left alias exists (e.g. `SET users.tier = ...` / `DELETE users ...`) in join-aware UPDATE/DELETE.
+- Confirms current deterministic behavior: this shape follows supported hot path (left-table mutation only), with left-table counters moving (`updateOps`/`deleteOps`) and `rebuildOps = 0`, while right-table counters remain unchanged.
+- Included phaseA62 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
