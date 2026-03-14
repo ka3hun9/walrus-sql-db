@@ -82,6 +82,7 @@ const cases: RunnerCase[] = [
   { name: "phasea54-on-prefix-cross-side-rejection-cost-stability", script: "examples/sql-phasea54-on-prefix-cross-side-rejection-cost-stability-regression.ts" },
   { name: "phasea55-on-literal-shape-rejection-cost-stability", script: "examples/sql-phasea55-on-literal-shape-rejection-cost-stability-regression.ts" },
   { name: "phasea56-on-expression-shape-rejection-cost-stability", script: "examples/sql-phasea56-on-expression-shape-rejection-cost-stability-regression.ts" },
+  { name: "phasea57-join-alias-conflict-rejection-cost-stability", script: "examples/sql-phasea57-join-alias-conflict-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

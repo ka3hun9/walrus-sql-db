@@ -442,6 +442,12 @@
 - Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
 - Included phaseA56 in grouped semantic runner.
 
+## Phase A-57 snapshot (2026-03-14)
+
+- Added regression lock for conflicting join aliases (left and right alias both `u`) in join-aware UPDATE/DELETE.
+- Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
+- Included phaseA57 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
