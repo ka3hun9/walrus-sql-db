@@ -715,6 +715,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA84 in grouped semantic runner.
 
+## Phase A-85 snapshot (2026-03-14)
+
+- Added regression lock for repeated-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o  .   amount = ..., u  .   tier = ...`
+  - `DELETE o  ,   u FROM ...`
+- Confirms deterministic behavior boundary:
+  - repeated-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - repeated-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA85 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
