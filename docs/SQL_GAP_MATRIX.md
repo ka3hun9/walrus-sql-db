@@ -924,6 +924,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA103 in grouped semantic runner.
 
+## Phase A-104 snapshot (2026-03-15)
+
+- Added regression lock for zero-width-non-joiner target-token shapes in join-aware DML boundary:
+  - UPDATE ... SET o\u200C.\u200Camount = ..., u\u200C.\u200Ctier = ...
+  - DELETE o,\u200Cu FROM ...
+- Confirms deterministic behavior boundary:
+  - zero-width-non-joiner target-token SET currently rejects with ERR_UNSUPPORTED_UPDATE
+  - zero-width-non-joiner multi-target DELETE is rejected with ERR_UNSUPPORTED_DELETE
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA104 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
@@ -944,6 +955,7 @@
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
+
 
 
 
