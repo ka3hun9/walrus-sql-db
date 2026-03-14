@@ -410,6 +410,12 @@
 - Confirms deterministic supported behavior for unambiguous unqualified ON fields: left-table cost counters move (`updateOps`/`deleteOps`), `rebuildOps = 0`, right-table counters unchanged.
 - Included phaseA51 in grouped semantic runner.
 
+## Phase A-52 snapshot (2026-03-14)
+
+- Added regression lock for same-name unqualified ON fields (`ON id = id`) in join-aware UPDATE/DELETE.
+- Confirms current deterministic behavior: this shape follows the supported hot path, mutating left-table counters (`updateOps`/`deleteOps`) with `rebuildOps = 0`, while right-table counters remain unchanged.
+- Included phaseA52 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
