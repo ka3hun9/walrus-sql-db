@@ -281,6 +281,12 @@
 - Verifies UNIQUE-conflict path increments `conflictChecks` and does not trigger structural index rebuild (`rebuildOps == 0`).
 - Included phaseA30 in grouped semantic runner.
 
+## Phase A-31 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DML constraint-cost isolation to left/target table only.
+- Verifies join-aware UPDATE/DELETE mutate left-table cost counters while right-table counters remain unchanged.
+- Included phaseA31 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
