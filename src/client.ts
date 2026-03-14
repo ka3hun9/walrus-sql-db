@@ -1205,12 +1205,20 @@ export class WalrusSqlClient {
     sql: string,
   ): void {
     const norm = (s: string) => s.trim().toUpperCase();
-    const leftNames = new Set<string>([norm(leftTable), norm(leftAlias)]);
-    const rightNames = new Set<string>([norm(rightTable), norm(rightAlias)]);
+    const leftTableNorm = norm(leftTable);
+    const rightTableNorm = norm(rightTable);
+
+    const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
+
+    if (leftTableNorm === rightTableNorm) {
+      throw sqlError(code, `self-join in join-aware ${op} is not supported yet: ${sql}`);
+    }
+
+    const leftNames = new Set<string>([leftTableNorm, norm(leftAlias)]);
+    const rightNames = new Set<string>([rightTableNorm, norm(rightAlias)]);
 
     for (const name of leftNames) {
       if (rightNames.has(name)) {
-        const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
         throw sqlError(code, `conflicting join aliases/tables are not supported: ${sql}`);
       }
     }

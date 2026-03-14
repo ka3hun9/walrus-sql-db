@@ -217,6 +217,13 @@
 - Rejects conflicting cross-side naming (left table/alias collides with right table/alias), while preserving no-alias and normal distinct-alias forms.
 - Added phaseA20 regression and grouped-runner coverage.
 
+## Phase A-21 snapshot (2026-03-14)
+
+- Added deterministic self-join boundary for first-cut join-aware UPDATE/DELETE planning.
+- Self-join forms (`leftTable == rightTable`) are now explicitly rejected with existing unsupported error family.
+- Keeps behavior explicit and prevents ambiguous semantics before dedicated self-join execution model exists.
+- Added dedicated phaseA21 regression and grouped-runner coverage.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

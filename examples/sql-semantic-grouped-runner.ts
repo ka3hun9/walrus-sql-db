@@ -46,6 +46,7 @@ const cases: RunnerCase[] = [
   { name: "phasea18-join-aware-ambiguous-where", script: "examples/sql-phasea18-join-aware-ambiguous-where-regression.ts" },
   { name: "phasea19-join-aware-on-field-validation", script: "examples/sql-phasea19-join-aware-on-field-validation-regression.ts" },
   { name: "phasea20-join-aware-alias-safety", script: "examples/sql-phasea20-join-aware-alias-safety-regression.ts" },
+  { name: "phasea21-join-aware-self-join-boundary", script: "examples/sql-phasea21-join-aware-self-join-boundary-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
