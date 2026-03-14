@@ -880,6 +880,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA99 in grouped semantic runner.
 
+## Phase A-100 snapshot (2026-03-14)
+
+- Added regression lock for em-quad-space target-token shapes in join-aware DML boundary:
+  - UPDATE ... SET o\u2001.\u2001amount = ..., u\u2001.\u2001tier = ...
+  - DELETE o,\u2001u FROM ...
+- Confirms deterministic behavior boundary:
+  - em-quad-space target-token SET currently rejects with ERR_UNSUPPORTED_UPDATE
+  - em-quad-space multi-target DELETE is rejected with ERR_UNSUPPORTED_DELETE
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA100 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
@@ -900,4 +911,5 @@
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
+
 
