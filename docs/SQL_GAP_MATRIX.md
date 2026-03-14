@@ -68,11 +68,20 @@
 - malformed ANY/ALL subquery forms continue deterministic failure with `ERR_UNSUPPORTED_SUBQUERY`.
 - Added dedicated regression for ANY/ALL behavior in DML.
 
+## Phase A-5 snapshot (2026-03-14)
+
+- Unique/PK constraint path refactored toward index abstraction:
+  - table-scoped unique maps introduced and rebuilt on write-path mutations (`INSERT/UPDATE/DELETE/ALTER/DROP`).
+  - uniqueness checks in write validation now use indexed lookup path instead of full row scan.
+- DDL unsupported boundary matrix extended (deterministic `ERR_UNSUPPORTED_DDL`):
+  - e.g. unsupported `ALTER COLUMN`, `RENAME COLUMN`, duplicate `ADD COLUMN`.
+- Added dedicated regression for DDL unsupported shapes + unique-index behavior after mutations.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - DDL surface hardening + deterministic error map for unsupported forms
-   - constraint/index abstraction prep for PK/UNIQUE acceleration
+   - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
+   - constraint/index abstraction completion (composite key + maintenance costs)
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix

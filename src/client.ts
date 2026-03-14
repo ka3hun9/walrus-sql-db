@@ -162,6 +162,7 @@ export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
+  private readonly uniqueIndexes = new Map<string, Map<string, Map<string, number>>>();
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -217,6 +218,7 @@ export class WalrusSqlClient {
       const schema = this.parseCreateTableSchema(normalized);
       if (!this.tables.has(schema.name)) this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      this.ensureUniqueIndexMaps(schema.name);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "CREATE",
@@ -229,6 +231,7 @@ export class WalrusSqlClient {
       const table = this.extractTableName(normalized, /DROP TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.tables.delete(table);
       this.schemas.delete(table);
+      this.uniqueIndexes.delete(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -251,6 +254,7 @@ export class WalrusSqlClient {
       const bucket = this.requireTable(table);
       const coerced = this.applySchemaOnWrite(table, row, undefined);
       bucket.push(coerced);
+      this.rebuildUniqueIndexes(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "INSERT",
@@ -272,6 +276,7 @@ export class WalrusSqlClient {
           touched++;
         }
       }
+      if (touched > 0) this.rebuildUniqueIndexes(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "UPDATE",
@@ -287,6 +292,7 @@ export class WalrusSqlClient {
       const next = bucket.filter((row) => this.evaluateWhereTree(row, whereTree) !== "TRUE");
       const touched = bucket.length - next.length;
       this.tables.set(table, next);
+      this.rebuildUniqueIndexes(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -616,6 +622,7 @@ export class WalrusSqlClient {
       }
       for (const r of rows) r[column] = null;
       schema.columns.push(col);
+      this.rebuildUniqueIndexes(table);
       return;
     }
 
@@ -637,6 +644,7 @@ export class WalrusSqlClient {
       schema.columns.splice(idx, 1);
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
+      this.rebuildUniqueIndexes(table);
       return;
     }
 
@@ -760,19 +768,58 @@ export class WalrusSqlClient {
     }
 
     const rows = this.requireTable(table);
+    this.ensureUniqueIndexMaps(table);
+    const indexByColumn = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, number>>();
     const uniqueCols = schema.columns.filter((c) => c.unique || c.primaryKey);
     for (const uc of uniqueCols) {
       const v = out[uc.name];
       if (v === null || v === undefined) continue;
-      for (const r of rows) {
-        if (previous && r === previous) continue;
-        if (String(r[uc.name] ?? "") === String(v)) {
+
+      const colIndex = indexByColumn.get(uc.name);
+      const hit = colIndex?.get(String(v));
+      if (hit !== undefined) {
+        const hitRow = rows[hit];
+        if (!previous || hitRow !== previous) {
           throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}.${uc.name} violates UNIQUE`);
         }
       }
     }
 
     return out;
+  }
+
+  private ensureUniqueIndexMaps(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+    if (this.uniqueIndexes.has(table)) return;
+
+    const idxMap = new Map<string, Map<string, number>>();
+    for (const c of schema.columns) {
+      if (c.unique || c.primaryKey) idxMap.set(c.name, new Map<string, number>());
+    }
+    this.uniqueIndexes.set(table, idxMap);
+  }
+
+  private rebuildUniqueIndexes(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) {
+      this.uniqueIndexes.delete(table);
+      return;
+    }
+
+    const idxMap = new Map<string, Map<string, number>>();
+    for (const c of schema.columns) {
+      if (!c.unique && !c.primaryKey) continue;
+      const colMap = new Map<string, number>();
+      const rows = this.requireTable(table);
+      for (let i = 0; i < rows.length; i++) {
+        const v = rows[i]![c.name];
+        if (v === null || v === undefined) continue;
+        colMap.set(String(v), i);
+      }
+      idxMap.set(c.name, colMap);
+    }
+    this.uniqueIndexes.set(table, idxMap);
   }
 
   private parseInsert(sql: string): SqlRow {
