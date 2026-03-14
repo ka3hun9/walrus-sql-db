@@ -132,10 +132,22 @@
   - single-table compatibility
   - deterministic rejection of join-aware DML forms
 
+## Phase A-11 snapshot (2026-03-14)
+
+- Added first-cut join-aware UPDATE execution semantics for one minimal shape:
+  - supported: `UPDATE <left> JOIN <right> ON <leftKey>=<rightKey> SET <col>=<expr> [WHERE ...]`
+- Planner now distinguishes:
+  - supported JOIN-update shape above
+  - still-unsupported `UPDATE ... FROM ...` (deterministic `ERR_UNSUPPORTED_UPDATE`)
+- Target-row derivation for first-cut JOIN-update:
+  - derive left-table target row set from INNER JOIN matches (deduplicated)
+  - apply existing write-path schema/constraint/index checks to those target rows
+- Added dedicated regression for first-cut join-aware UPDATE + deterministic boundary retention.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - join-aware DML execution semantics (target-row derivation from join plans)
+   - extend join-aware DML semantics coverage (multi-shape UPDATE/DELETE)
    - promote constraint/index cost gate into primary CI workflow + threshold tuning from nightly trend
 
 2. **M1 (stabilize+)**

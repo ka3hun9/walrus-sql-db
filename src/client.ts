@@ -165,6 +165,11 @@ type DmlPlan = {
 type UpdatePlan = DmlPlan & {
   setField: string;
   setValue: string;
+  join?: {
+    table: string;
+    leftField: string;
+    rightField: string;
+  };
 };
 
 type DeletePlan = DmlPlan;
@@ -328,15 +333,34 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("UPDATE")) {
       const plan = this.planUpdate(normalized);
-      const whereTree = this.parseWhereTree(plan.whereExpr);
       const bucket = this.requireTable(plan.table);
+
+      const targetRows = plan.join
+        ? (() => {
+            const rightRows = this.requireTable(plan.join.table);
+            const leftField = plan.join.leftField.includes(".") ? plan.join.leftField.split(".").at(-1)! : plan.join.leftField;
+            const rightField = plan.join.rightField.includes(".") ? plan.join.rightField.split(".").at(-1)! : plan.join.rightField;
+            const seen = new Set<SqlRow>();
+            for (const l of bucket) {
+              for (const r of rightRows) {
+                if (String(l[leftField]) !== String(r[rightField])) continue;
+                seen.add(l);
+              }
+            }
+            return [...seen];
+          })()
+        : bucket;
+
+      const whereTree = this.parseWhereTree(plan.whereExpr);
       let touched = 0;
-      for (const row of bucket) {
+      for (const row of targetRows) {
         if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
           const next = this.applySchemaOnWrite(plan.table, { ...row, [plan.setField]: this.castValue(plan.setValue) }, row);
-          this.replaceRowInUniqueIndexes(plan.table, row, next);
+          this.removeRowFromUniqueIndexes(plan.table, row);
           Object.keys(row).forEach((k) => delete row[k]);
           Object.assign(row, next);
+          this.addRowToUniqueIndexes(plan.table, row);
+          this.bumpConstraintCost(plan.table, { updateOps: 1 });
           touched++;
         }
       }
@@ -1014,8 +1038,22 @@ export class WalrusSqlClient {
   }
 
   private planUpdate(sql: string): UpdatePlan {
-    if (/\bUPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+JOIN\b/i.test(sql)) {
-      throw sqlError("ERR_UNSUPPORTED_UPDATE", `join-aware UPDATE not supported yet: ${sql}`);
+    const joinM = sql.match(
+      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
+    );
+    if (joinM) {
+      return {
+        table: joinM[1]!.trim(),
+        setField: joinM[5]!.trim(),
+        setValue: this.trimQuoted(joinM[6]!.trim()),
+        whereExpr: joinM[7]?.trim() ?? "1 = 1",
+        joinAware: true,
+        join: {
+          table: joinM[2]!.trim(),
+          leftField: joinM[3]!.trim(),
+          rightField: joinM[4]!.trim(),
+        },
+      };
     }
 
     const upper = sql.toUpperCase();

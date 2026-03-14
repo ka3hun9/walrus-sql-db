@@ -28,12 +28,7 @@ async function main() {
   await db.execute("UPDATE users SET tier = 3 WHERE id = 2");
   await db.execute("DELETE FROM orders WHERE id = 10");
 
-  // join-aware update shapes should fail deterministically for now
-  await expectErr(
-    () => db.execute("UPDATE users JOIN orders ON users.id = orders.user_id SET tier = 9 WHERE orders.amount > 100"),
-    "ERR_UNSUPPORTED_UPDATE",
-  );
-
+  // UPDATE ... FROM remains unsupported in planning stage
   await expectErr(
     () => db.execute("UPDATE users SET tier = 9 FROM orders WHERE users.id = orders.user_id"),
     "ERR_UNSUPPORTED_UPDATE",

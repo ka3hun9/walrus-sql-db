@@ -39,6 +39,7 @@ const cases: RunnerCase[] = [
   { name: "phasea7-index-incremental", script: "examples/sql-phasea7-index-incremental-regression.ts" },
   { name: "phasea8-constraint-cost", script: "examples/sql-phasea8-constraint-cost-regression.ts" },
   { name: "phasea10-join-aware-dml-planning", script: "examples/sql-phasea10-join-aware-dml-planning-regression.ts" },
+  { name: "phasea11-join-aware-dml-exec", script: "examples/sql-phasea11-join-aware-dml-exec-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
