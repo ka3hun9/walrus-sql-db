@@ -61,6 +61,26 @@ async function main() {
     { id: 3, tier: 3 },
   ]);
 
+  // explicit INNER JOIN keyword should be accepted
+  await db.execute("UPDATE users u INNER JOIN orders o ON u.id = o.user_id SET u.tier = 6 WHERE o.amount = 50 AND u.id = 3");
+
+  users = await db.query("SELECT id, tier FROM users ORDER BY id");
+  assert.deepEqual(users.rows, [
+    { id: 1, tier: 1 },
+    { id: 3, tier: 6 },
+  ]);
+
+  // deterministic boundary: non-inner join forms are still unsupported
+  await expectErr(
+    () => db.execute("UPDATE users u LEFT JOIN orders o ON u.id = o.user_id SET u.tier = 1 WHERE u.id = 1"),
+    "ERR_UNSUPPORTED_UPDATE",
+  );
+
+  await expectErr(
+    () => db.execute("DELETE u FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.id = 1"),
+    "ERR_UNSUPPORTED_DELETE",
+  );
+
   // deterministic boundary: ON left field prefix must bind to left table/alias
   await expectErr(
     () => db.execute("UPDATE users u JOIN orders o ON o.id = o.user_id SET u.tier = 1 WHERE u.id = 3"),

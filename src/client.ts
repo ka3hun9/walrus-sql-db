@@ -1104,8 +1104,12 @@ export class WalrusSqlClient {
   }
 
   private planUpdate(sql: string): UpdatePlan {
+    if (/^UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?\s+(LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+JOIN\b/i.test(sql)) {
+      throw sqlError("ERR_UNSUPPORTED_UPDATE", `non-inner join UPDATE not supported yet: ${sql}`);
+    }
+
     const joinM = sql.match(
-      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
+      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+(?:INNER\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (joinM) {
       return {
@@ -1142,8 +1146,12 @@ export class WalrusSqlClient {
   }
 
   private planDelete(sql: string): DeletePlan {
+    if (/^DELETE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+FROM\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?\s+(LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+JOIN\b/i.test(sql)) {
+      throw sqlError("ERR_UNSUPPORTED_DELETE", `non-inner join DELETE not supported yet: ${sql}`);
+    }
+
     const joinM = sql.match(
-      /^DELETE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(?:WHERE\s+(.+))?$/i,
+      /^DELETE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+(?:INNER\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(?:WHERE\s+(.+))?$/i,
     );
     if (joinM) {
       const targetAlias = joinM[1]!.trim();

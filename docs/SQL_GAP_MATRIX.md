@@ -187,6 +187,14 @@
 - This enables mixed-prefix SQL in ON/WHERE (table-prefix + alias-prefix combinations) to evaluate deterministically in first-cut join-aware UPDATE/DELETE.
 - Added dedicated regression for mixed-prefix join-aware DML behavior and included it in grouped semantic runner.
 
+## Phase A-17 snapshot (2026-03-14)
+
+- Hardened join-aware DML parser boundaries around join-type forms:
+  - explicit `INNER JOIN` now accepted for first-cut join-aware UPDATE/DELETE
+  - non-inner forms (`LEFT/RIGHT/FULL [OUTER] JOIN`) are deterministically rejected
+- This prevents accidental silent fallback on unsupported join semantics while keeping first-cut behavior explicit.
+- Added regression coverage for both acceptance (`INNER JOIN`) and deterministic rejection (non-inner joins).
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
