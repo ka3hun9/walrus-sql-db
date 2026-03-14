@@ -92,6 +92,7 @@ const cases: RunnerCase[] = [
   { name: "phasea64-mixed-target-and-multidelete-rejection-cost-stability", script: "examples/sql-phasea64-mixed-target-and-multidelete-rejection-cost-stability-regression.ts" },
   { name: "phasea65-mixed-table-target-boundary-cost-stability", script: "examples/sql-phasea65-mixed-table-target-boundary-cost-stability-regression.ts" },
   { name: "phasea66-mixed-table-target-noalias-boundary-cost-stability", script: "examples/sql-phasea66-mixed-table-target-noalias-boundary-cost-stability-regression.ts" },
+  { name: "phasea67-rightfirst-mixed-set-rejection-cost-stability", script: "examples/sql-phasea67-rightfirst-mixed-set-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

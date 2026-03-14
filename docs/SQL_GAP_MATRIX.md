@@ -517,6 +517,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA66 in grouped semantic runner.
 
+## Phase A-67 snapshot (2026-03-14)
+
+- Added regression lock for right-first mixed SET ordering in join-aware DML boundary:
+  - `UPDATE users u JOIN orders o ... SET o.amount = ..., u.tier = ...`
+  - `DELETE o, u FROM users u JOIN orders o ...`
+- Confirms deterministic behavior boundary:
+  - right-first mixed SET rejects with `ERR_UNSUPPORTED_UPDATE` and explicit target-side message (`SET target must reference left table/alias: o.amount`)
+  - reversed-order multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA67 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
