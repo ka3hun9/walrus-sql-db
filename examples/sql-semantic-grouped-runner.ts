@@ -99,6 +99,7 @@ const cases: RunnerCase[] = [
   { name: "phasea71-leftfirst-right-tablename-with-right-alias-boundary-cost-stability", script: "examples/sql-phasea71-leftfirst-right-tablename-with-right-alias-boundary-cost-stability-regression.ts" },
   { name: "phasea72-left-tablename-plus-right-alias-mix-boundary-cost-stability", script: "examples/sql-phasea72-left-tablename-plus-right-alias-mix-boundary-cost-stability-regression.ts" },
   { name: "phasea73-backtick-target-shape-rejection-cost-stability", script: "examples/sql-phasea73-backtick-target-shape-rejection-cost-stability-regression.ts" },
+  { name: "phasea74-doublequote-target-shape-rejection-cost-stability", script: "examples/sql-phasea74-doublequote-target-shape-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
