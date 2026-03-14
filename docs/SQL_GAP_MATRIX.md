@@ -287,6 +287,12 @@
 - Verifies join-aware UPDATE/DELETE mutate left-table cost counters while right-table counters remain unchanged.
 - Included phaseA31 in grouped semantic runner.
 
+## Phase A-32 snapshot (2026-03-14)
+
+- Added regression lock for no-op stability on join-aware DML cost path.
+- Verifies join-aware UPDATE/DELETE with non-matching WHERE produce no row mutation and keep cost counters stable (`updateOps=0`, `deleteOps=0`, `rebuildOps=0`).
+- Included phaseA32 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
