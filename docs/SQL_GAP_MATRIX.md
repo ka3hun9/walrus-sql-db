@@ -269,6 +269,12 @@
 - Confirms composite key tuples released by join-aware DELETE are reusable by subsequent INSERT.
 - Included phaseA28 in grouped semantic runner.
 
+## Phase A-29 snapshot (2026-03-14)
+
+- Added regression lock for constraint/index cost-path behavior under join-aware DML hot path.
+- Verifies join-aware UPDATE/DELETE mutate counters (`updateOps`, `deleteOps`) while keeping `rebuildOps == 0`.
+- Included phaseA29 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
