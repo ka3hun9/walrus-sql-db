@@ -61,6 +61,18 @@ async function main() {
     { id: 3, tier: 3 },
   ]);
 
+  // deterministic boundary: ON left field prefix must bind to left table/alias
+  await expectErr(
+    () => db.execute("UPDATE users u JOIN orders o ON o.id = o.user_id SET u.tier = 1 WHERE u.id = 3"),
+    "ERR_UNSUPPORTED_UPDATE",
+  );
+
+  // deterministic boundary: ON right field prefix must bind to right table/alias
+  await expectErr(
+    () => db.execute("DELETE u FROM users u JOIN orders o ON u.id = u.id WHERE o.amount = 50"),
+    "ERR_UNSUPPORTED_DELETE",
+  );
+
   // deterministic boundary: delete target must be left table or alias
   await expectErr(
     () => db.execute("DELETE x FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount = 50"),

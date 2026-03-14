@@ -170,6 +170,15 @@
   - DELETE target must match left table or left alias.
 - Added dedicated alias/qualified regression and kept earlier join-aware phase regressions green.
 
+## Phase A-15 snapshot (2026-03-14)
+
+- Normalized join-aware DML ON-field binding semantics for deterministic alias/table-prefix behavior.
+- Added strict ON-side prefix validation:
+  - ON left expression may reference only left table/left alias (or unqualified column)
+  - ON right expression may reference only right table/right alias (or unqualified column)
+  - cross-side or malformed prefixes fail deterministically (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`).
+- Join-aware UPDATE/DELETE row matching now evaluates WHERE over all matched join pairs per left row, then mutates/deletes each left row at most once.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

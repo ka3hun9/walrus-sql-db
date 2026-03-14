@@ -345,22 +345,17 @@ export class WalrusSqlClient {
       const plan = this.planUpdate(normalized);
       const bucket = this.requireTable(plan.table);
 
-      const targetRows = plan.join
+      const joinedRows = plan.join
         ? (() => {
             const rightRows = this.requireTable(plan.join.table);
-            const leftField = plan.join.leftField.includes(".") ? plan.join.leftField.split(".").at(-1)! : plan.join.leftField;
-            const rightField = plan.join.rightField.includes(".") ? plan.join.rightField.split(".").at(-1)! : plan.join.rightField;
+            const { leftField, rightField } = this.normalizeJoinOnFields(plan, "update");
             const leftAlias = plan.join.leftAlias ?? plan.table;
             const rightAlias = plan.join.rightAlias ?? plan.join.table;
 
-            const out: Array<{ left: SqlRow; merged: SqlRow }> = [];
-            const seen = new Set<SqlRow>();
+            const out = new Map<SqlRow, SqlRow[]>();
             for (const l of bucket) {
               for (const r of rightRows) {
                 if (String(l[leftField]) !== String(r[rightField])) continue;
-                if (seen.has(l)) continue;
-                seen.add(l);
-
                 const merged: SqlRow = {};
                 for (const [k, v] of Object.entries(l)) {
                   merged[k] = v;
@@ -369,30 +364,35 @@ export class WalrusSqlClient {
                 for (const [k, v] of Object.entries(r)) {
                   merged[`${rightAlias}.${k}`] = v;
                 }
-                out.push({ left: l, merged });
+                const arr = out.get(l);
+                if (arr) arr.push(merged);
+                else out.set(l, [merged]);
               }
             }
             return out;
           })()
-        : bucket.map((row) => ({ left: row, merged: row }));
+        : new Map(bucket.map((row) => [row, [row]] as const));
 
       const whereTree = this.parseWhereTree(plan.whereExpr);
       const targetSetField = this.resolveUpdateSetField(plan);
       let touched = 0;
-      for (const hit of targetRows) {
-        if (this.evaluateWhereTree(hit.merged, whereTree) === "TRUE") {
-          const next = this.applySchemaOnWrite(
-            plan.table,
-            { ...hit.left, [targetSetField]: this.castValue(plan.setValue) },
-            hit.left,
-          );
-          this.removeRowFromUniqueIndexes(plan.table, hit.left);
-          Object.keys(hit.left).forEach((k) => delete hit.left[k]);
-          Object.assign(hit.left, next);
-          this.addRowToUniqueIndexes(plan.table, hit.left);
-          this.bumpConstraintCost(plan.table, { updateOps: 1 });
-          touched++;
-        }
+      for (const row of bucket) {
+        const mergedHits = joinedRows.get(row);
+        if (!mergedHits || mergedHits.length === 0) continue;
+        const matched = mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE");
+        if (!matched) continue;
+
+        const next = this.applySchemaOnWrite(
+          plan.table,
+          { ...row, [targetSetField]: this.castValue(plan.setValue) },
+          row,
+        );
+        this.removeRowFromUniqueIndexes(plan.table, row);
+        Object.keys(row).forEach((k) => delete row[k]);
+        Object.assign(row, next);
+        this.addRowToUniqueIndexes(plan.table, row);
+        this.bumpConstraintCost(plan.table, { updateOps: 1 });
+        touched++;
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -405,19 +405,17 @@ export class WalrusSqlClient {
       const plan = this.planDelete(normalized);
       const bucket = this.requireTable(plan.table);
 
-      const targetRows = plan.join
+      const joinedRows = plan.join
         ? (() => {
             const rightRows = this.requireTable(plan.join.table);
-            const leftField = plan.join.leftField.includes(".") ? plan.join.leftField.split(".").at(-1)! : plan.join.leftField;
-            const rightField = plan.join.rightField.includes(".") ? plan.join.rightField.split(".").at(-1)! : plan.join.rightField;
+            const { leftField, rightField } = this.normalizeJoinOnFields(plan, "delete");
             const leftAlias = plan.join.leftAlias ?? plan.table;
             const rightAlias = plan.join.rightAlias ?? plan.join.table;
 
-            const out = new Map<SqlRow, SqlRow>();
+            const out = new Map<SqlRow, SqlRow[]>();
             for (const l of bucket) {
               for (const r of rightRows) {
                 if (String(l[leftField]) !== String(r[rightField])) continue;
-                if (out.has(l)) continue;
 
                 const merged: SqlRow = {};
                 for (const [k, v] of Object.entries(l)) {
@@ -427,19 +425,22 @@ export class WalrusSqlClient {
                 for (const [k, v] of Object.entries(r)) {
                   merged[`${rightAlias}.${k}`] = v;
                 }
-                out.set(l, merged);
+                const arr = out.get(l);
+                if (arr) arr.push(merged);
+                else out.set(l, [merged]);
               }
             }
             return out;
           })()
-        : new Map(bucket.map((row) => [row, row] as const));
+        : new Map(bucket.map((row) => [row, [row]] as const));
 
       const whereTree = this.parseWhereTree(plan.whereExpr);
       let touched = 0;
       const next: SqlRow[] = [];
       for (const row of bucket) {
-        const merged = targetRows.get(row);
-        if (merged && this.evaluateWhereTree(merged, whereTree) === "TRUE") {
+        const mergedHits = joinedRows.get(row);
+        const matched = mergedHits ? mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE") : false;
+        if (matched) {
           this.removeRowFromUniqueIndexes(plan.table, row);
           touched++;
         } else {
@@ -1170,6 +1171,40 @@ export class WalrusSqlClient {
       table: parsed.table,
       whereExpr: parsed.whereExpr,
       joinAware: false,
+    };
+  }
+
+  private normalizeJoinOnFields(plan: UpdatePlan | DeletePlan, op: "update" | "delete"): { leftField: string; rightField: string } {
+    const join = plan.join;
+    if (!join) throw sqlError(op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE", `${op} join missing`);
+
+    const split = (s: string): string[] => s.split(".").map((x) => x.trim()).filter(Boolean);
+    const leftParts = split(join.leftField);
+    const rightParts = split(join.rightField);
+
+    const leftAllow = new Set<string>([plan.table.toUpperCase()]);
+    if (join.leftAlias) leftAllow.add(join.leftAlias.toUpperCase());
+
+    const rightAllow = new Set<string>([join.table.toUpperCase()]);
+    if (join.rightAlias) rightAllow.add(join.rightAlias.toUpperCase());
+
+    const resolve = (parts: string[], allow: Set<string>, side: "left" | "right"): string => {
+      if (parts.length === 1) return parts[0]!;
+      if (parts.length === 2) {
+        const [prefix, col] = parts;
+        if (!allow.has(prefix.toUpperCase())) {
+          const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
+          throw sqlError(code, `ON ${side} field prefix must reference ${side} table/alias: ${prefix}`);
+        }
+        return col;
+      }
+      const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
+      throw sqlError(code, `invalid ON ${side} field: ${parts.join(".")}`);
+    };
+
+    return {
+      leftField: resolve(leftParts, leftAllow, "left"),
+      rightField: resolve(rightParts, rightAllow, "right"),
     };
   }
 
