@@ -60,10 +60,17 @@
 - malformed DML subquery shape continues to fail deterministically via `ERR_UNSUPPORTED_SUBQUERY`.
 - Added dedicated regression for DML subquery behavior.
 
+## Phase A-4 snapshot (2026-03-14)
+
+- DML ANY/ALL subquery predicates validated on write paths:
+  - `UPDATE ... WHERE expr >= ALL (SELECT ...)`
+  - `DELETE ... WHERE expr < ANY (SELECT ...)`
+- malformed ANY/ALL subquery forms continue deterministic failure with `ERR_UNSUPPORTED_SUBQUERY`.
+- Added dedicated regression for ANY/ALL behavior in DML.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - DML subquery predicates completion for UPDATE/DELETE (`ANY/ALL` and edge-shape matrix)
    - DDL surface hardening + deterministic error map for unsupported forms
    - constraint/index abstraction prep for PK/UNIQUE acceleration
 

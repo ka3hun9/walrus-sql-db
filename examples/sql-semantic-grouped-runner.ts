@@ -33,6 +33,7 @@ const cases: RunnerCase[] = [
   { name: "phasea1-type-ddl-constraint", script: "examples/sql-phasea1-type-ddl-constraint-regression.ts" },
   { name: "phasea2-dml-ddl-shape", script: "examples/sql-phasea2-dml-ddl-shape-regression.ts" },
   { name: "phasea3-dml-subquery", script: "examples/sql-phasea3-dml-subquery-regression.ts" },
+  { name: "phasea4-dml-any-all", script: "examples/sql-phasea4-dml-any-all-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
