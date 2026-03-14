@@ -263,6 +263,12 @@
 - Verifies conflicting writes raise `ERR_CONSTRAINT_VIOLATION` and non-conflicting writes remain successful.
 - Included phaseA27 in grouped semantic runner.
 
+## Phase A-28 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DELETE cleanup on composite UNIQUE groups.
+- Confirms composite key tuples released by join-aware DELETE are reusable by subsequent INSERT.
+- Included phaseA28 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
