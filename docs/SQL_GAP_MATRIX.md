@@ -275,6 +275,12 @@
 - Verifies join-aware UPDATE/DELETE mutate counters (`updateOps`, `deleteOps`) while keeping `rebuildOps == 0`.
 - Included phaseA29 in grouped semantic runner.
 
+## Phase A-30 snapshot (2026-03-14)
+
+- Added regression lock for conflict-path constraint/index cost behavior under join-aware UPDATE.
+- Verifies UNIQUE-conflict path increments `conflictChecks` and does not trigger structural index rebuild (`rebuildOps == 0`).
+- Included phaseA30 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
