@@ -77,11 +77,20 @@
   - e.g. unsupported `ALTER COLUMN`, `RENAME COLUMN`, duplicate `ADD COLUMN`.
 - Added dedicated regression for DDL unsupported shapes + unique-index behavior after mutations.
 
+## Phase A-6 snapshot (2026-03-14)
+
+- Composite key constraints introduced in schema model:
+  - table-level `PRIMARY KEY (c1, c2, ...)`
+  - table-level `UNIQUE (c1, c2, ...)`
+- Unique index abstraction extended from single-column to grouped key signatures.
+- Write-path constraint checks now evaluate composite group uniqueness via indexed keys.
+- Added dedicated composite key regression (including delete/reinsert reuse path).
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
    - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
-   - constraint/index abstraction completion (composite key + maintenance costs)
+   - constraint/index abstraction completion (incremental maintenance + cost model)
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix

@@ -152,6 +152,8 @@ type ColumnSchema = {
 type TableSchema = {
   name: string;
   columns: ColumnSchema[];
+  uniqueGroups?: string[][];
+  primaryKeyGroup?: string[];
 };
 
 function sqlError(code: SqlErrorCode, detail: string): Error {
@@ -573,7 +575,27 @@ export class WalrusSqlClient {
     const defs = this.splitTopLevelComma(m[2]!);
     if (defs.length === 0) throw sqlError("ERR_UNSUPPORTED_DDL", `CREATE TABLE has no columns: ${sql}`);
 
-    const columns: ColumnSchema[] = defs.map((d) => {
+    const columns: ColumnSchema[] = [];
+    const tableUniqueGroups: string[][] = [];
+    let primaryKeyGroup: string[] | undefined;
+
+    for (const d of defs) {
+      const pkMatch = d.match(/^PRIMARY\s+KEY\s*\((.+)\)$/i);
+      if (pkMatch) {
+        if (primaryKeyGroup) throw sqlError("ERR_UNSUPPORTED_DDL", `duplicate PRIMARY KEY definition`);
+        primaryKeyGroup = this.splitTopLevelComma(pkMatch[1]!).map((x) => x.trim());
+        if (!primaryKeyGroup.length) throw sqlError("ERR_UNSUPPORTED_DDL", `empty PRIMARY KEY definition`);
+        continue;
+      }
+
+      const uqMatch = d.match(/^UNIQUE\s*\((.+)\)$/i);
+      if (uqMatch) {
+        const cols = this.splitTopLevelComma(uqMatch[1]!).map((x) => x.trim());
+        if (!cols.length) throw sqlError("ERR_UNSUPPORTED_DDL", `empty UNIQUE definition`);
+        tableUniqueGroups.push(cols);
+        continue;
+      }
+
       const dm = d.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i);
       if (!dm) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid column definition: ${d}`);
       const colName = dm[1]!.trim();
@@ -582,8 +604,8 @@ export class WalrusSqlClient {
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
-      return { name: colName, type, notNull, primaryKey, unique };
-    });
+      columns.push({ name: colName, type, notNull, primaryKey, unique });
+    }
 
     const seen = new Set<string>();
     for (const c of columns) {
@@ -592,7 +614,26 @@ export class WalrusSqlClient {
       seen.add(key);
     }
 
-    return { name: table, columns };
+    const colByUpper = new Map(columns.map((c) => [c.name.toUpperCase(), c] as const));
+
+    if (primaryKeyGroup) {
+      for (const k of primaryKeyGroup) {
+        const col = colByUpper.get(k.toUpperCase());
+        if (!col) throw sqlError("ERR_UNSUPPORTED_DDL", `PRIMARY KEY column not found: ${k}`);
+        col.notNull = true;
+        if (primaryKeyGroup.length === 1) col.primaryKey = true;
+      }
+    }
+
+    for (const grp of tableUniqueGroups) {
+      for (const k of grp) {
+        if (!colByUpper.has(k.toUpperCase())) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `UNIQUE column not found: ${k}`);
+        }
+      }
+    }
+
+    return { name: table, columns, uniqueGroups: tableUniqueGroups, primaryKeyGroup };
   }
 
   private applyAlterTable(sql: string): void {
@@ -642,6 +683,9 @@ export class WalrusSqlClient {
       }
 
       schema.columns.splice(idx, 1);
+      schema.uniqueGroups = (schema.uniqueGroups ?? []).filter(
+        (g) => !g.some((c) => c.toUpperCase() === column.toUpperCase()),
+      );
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
       this.rebuildUniqueIndexes(table);
@@ -769,23 +813,54 @@ export class WalrusSqlClient {
 
     const rows = this.requireTable(table);
     this.ensureUniqueIndexMaps(table);
-    const indexByColumn = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, number>>();
-    const uniqueCols = schema.columns.filter((c) => c.unique || c.primaryKey);
-    for (const uc of uniqueCols) {
-      const v = out[uc.name];
-      if (v === null || v === undefined) continue;
+    const indexByKey = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, number>>();
 
-      const colIndex = indexByColumn.get(uc.name);
-      const hit = colIndex?.get(String(v));
+    for (const group of this.collectUniqueGroups(schema)) {
+      const keyName = this.uniqueGroupName(group);
+      const keyVal = this.uniqueGroupValue(out, group);
+      if (keyVal === null) continue;
+
+      const hit = indexByKey.get(keyName)?.get(keyVal);
       if (hit !== undefined) {
         const hitRow = rows[hit];
         if (!previous || hitRow !== previous) {
-          throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}.${uc.name} violates UNIQUE`);
+          throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}(${group.join(",")}) violates UNIQUE`);
         }
       }
     }
 
     return out;
+  }
+
+  private collectUniqueGroups(schema: TableSchema): string[][] {
+    const groups: string[][] = [];
+    const pushGroup = (g: string[]) => {
+      if (!g.length) return;
+      const norm = g.map((x) => x.trim());
+      const key = norm.map((x) => x.toUpperCase()).join("|");
+      if (!groups.some((ex) => ex.map((x) => x.toUpperCase()).join("|") === key)) groups.push(norm);
+    };
+
+    for (const c of schema.columns) {
+      if (c.primaryKey || c.unique) pushGroup([c.name]);
+    }
+    if (schema.primaryKeyGroup?.length) pushGroup(schema.primaryKeyGroup);
+    for (const g of schema.uniqueGroups ?? []) pushGroup(g);
+    return groups;
+  }
+
+  private uniqueGroupName(group: string[]): string {
+    return group.map((x) => x.toUpperCase()).join("+");
+  }
+
+  private uniqueGroupValue(row: SqlRow, group: string[]): string | null {
+    const vals: string[] = [];
+    for (const c of group) {
+      const v = row[c];
+      if (v === null || v === undefined) return null;
+      vals.push(String(v));
+    }
+    return vals.join("||");
   }
 
   private ensureUniqueIndexMaps(table: string): void {
@@ -794,8 +869,8 @@ export class WalrusSqlClient {
     if (this.uniqueIndexes.has(table)) return;
 
     const idxMap = new Map<string, Map<string, number>>();
-    for (const c of schema.columns) {
-      if (c.unique || c.primaryKey) idxMap.set(c.name, new Map<string, number>());
+    for (const g of this.collectUniqueGroups(schema)) {
+      idxMap.set(this.uniqueGroupName(g), new Map<string, number>());
     }
     this.uniqueIndexes.set(table, idxMap);
   }
@@ -807,17 +882,16 @@ export class WalrusSqlClient {
       return;
     }
 
+    const rows = this.requireTable(table);
     const idxMap = new Map<string, Map<string, number>>();
-    for (const c of schema.columns) {
-      if (!c.unique && !c.primaryKey) continue;
+    for (const g of this.collectUniqueGroups(schema)) {
       const colMap = new Map<string, number>();
-      const rows = this.requireTable(table);
       for (let i = 0; i < rows.length; i++) {
-        const v = rows[i]![c.name];
-        if (v === null || v === undefined) continue;
-        colMap.set(String(v), i);
+        const key = this.uniqueGroupValue(rows[i]!, g);
+        if (key === null) continue;
+        colMap.set(key, i);
       }
-      idxMap.set(c.name, colMap);
+      idxMap.set(this.uniqueGroupName(g), colMap);
     }
     this.uniqueIndexes.set(table, idxMap);
   }
