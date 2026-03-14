@@ -24,44 +24,34 @@ async function main() {
   await db.execute("INSERT INTO users (id, tier) VALUES (3, 3)");
 
   await db.execute("INSERT INTO orders (id, user_id, amount) VALUES (10, 2, 200)");
+  await db.execute("INSERT INTO orders (id, user_id, amount) VALUES (11, 3, 50)");
 
-  // first-cut join-aware update: derive target rows from INNER JOIN pairs, then apply SET
-  await db.execute("UPDATE users JOIN orders ON users.id = orders.user_id SET tier = 9");
-
-  let users = await db.query("SELECT id, tier FROM users ORDER BY id");
-  assert.deepEqual(users.rows, [
-    { id: 1, tier: 1 },
-    { id: 2, tier: 9 },
-    { id: 3, tier: 3 },
-  ]);
-
-  // WHERE still applies on target side rows
-  await db.execute("UPDATE users JOIN orders ON users.id = orders.user_id SET tier = 8 WHERE id = 2");
-
-  users = await db.query("SELECT id, tier FROM users ORDER BY id");
-  assert.deepEqual(users.rows, [
-    { id: 1, tier: 1 },
-    { id: 2, tier: 8 },
-    { id: 3, tier: 3 },
-  ]);
-
-  // qualified WHERE with aliases should resolve on merged join row
+  // alias + qualified fields in ON/WHERE for join-aware UPDATE
   await db.execute("UPDATE users u JOIN orders o ON u.id = o.user_id SET tier = 7 WHERE o.amount = 200 AND u.id = 2");
 
-  users = await db.query("SELECT id, tier FROM users ORDER BY id");
+  let users = await db.query("SELECT id, tier FROM users ORDER BY id");
   assert.deepEqual(users.rows, [
     { id: 1, tier: 1 },
     { id: 2, tier: 7 },
     { id: 3, tier: 3 },
   ]);
 
-  // UPDATE ... FROM remains unsupported for deterministic boundary
+  // alias target + qualified fields for join-aware DELETE
+  await db.execute("DELETE u FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount = 200 AND u.id = 2");
+
+  users = await db.query("SELECT id, tier FROM users ORDER BY id");
+  assert.deepEqual(users.rows, [
+    { id: 1, tier: 1 },
+    { id: 3, tier: 3 },
+  ]);
+
+  // deterministic boundary: delete target must be left table or alias
   await expectErr(
-    () => db.execute("UPDATE users SET tier = 9 FROM orders WHERE users.id = orders.user_id"),
-    "ERR_UNSUPPORTED_UPDATE",
+    () => db.execute("DELETE x FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount = 50"),
+    "ERR_UNSUPPORTED_DELETE",
   );
 
-  console.log("sql-phasea11-join-aware-dml-exec-regression ok");
+  console.log("sql-phasea13-join-aware-alias-qualified-regression ok");
 }
 
 main().catch((e) => {

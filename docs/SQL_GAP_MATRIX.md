@@ -157,6 +157,18 @@
   - keep existing unique-index cleanup path on deleted rows
 - Added dedicated regression for first-cut join-aware DELETE behavior + deterministic boundary retention.
 
+## Phase A-13 snapshot (2026-03-14)
+
+- Extended join-aware DML first-cut to support alias + qualified-field forms:
+  - `UPDATE users u JOIN orders o ON u.id = o.user_id SET ... WHERE o.amount = ...`
+  - `DELETE u FROM users u JOIN orders o ON u.id = o.user_id WHERE ...`
+- Join planning now tracks optional `leftAlias/rightAlias` and feeds merged alias-qualified row views to WHERE evaluation.
+- Deterministic boundaries retained:
+  - `UPDATE ... FROM ...` remains unsupported (`ERR_UNSUPPORTED_UPDATE`)
+  - `DELETE FROM ... USING ...` remains unsupported (`ERR_UNSUPPORTED_DELETE`)
+  - DELETE target must match left table or left alias.
+- Added dedicated alias/qualified regression and kept earlier join-aware phase regressions green.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
