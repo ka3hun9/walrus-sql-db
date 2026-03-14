@@ -788,23 +788,23 @@ export class WalrusSqlClient {
 
   private parseUpdate(sql: string): { setField: string; setValue: string; whereExpr: string } {
     const m = sql.match(
-      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)\s+WHERE\s+(.+)/i,
+      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (!m) throw sqlError("ERR_UNSUPPORTED_UPDATE", sql);
     return {
       setField: m[1].trim(),
       setValue: this.trimQuoted(m[2].trim()),
-      whereExpr: m[3].trim(),
+      whereExpr: m[3]?.trim() ?? "1 = 1",
     };
   }
 
   private parseDelete(sql: string): { whereExpr: string } {
     const m = sql.match(
-      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+WHERE\s+(.+)/i,
+      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+WHERE\s+(.+))?$/i,
     );
     if (!m) throw sqlError("ERR_UNSUPPORTED_DELETE", sql);
     return {
-      whereExpr: m[1].trim(),
+      whereExpr: m[1]?.trim() ?? "1 = 1",
     };
   }
 

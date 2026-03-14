@@ -31,6 +31,7 @@ const cases: RunnerCase[] = [
   { name: "g5-clause-shape", script: "examples/sql-g5-clause-shape-regression.ts" },
   { name: "g5-union-tail-dialect", script: "examples/sql-g5-union-tail-dialect-regression.ts" },
   { name: "phasea1-type-ddl-constraint", script: "examples/sql-phasea1-type-ddl-constraint-regression.ts" },
+  { name: "phasea2-dml-ddl-shape", script: "examples/sql-phasea2-dml-ddl-shape-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

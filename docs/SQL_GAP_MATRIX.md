@@ -43,13 +43,21 @@
 - Deterministic error families used in simulator layer:
   - `ERR_UNSUPPORTED_TYPE`, `ERR_TYPE_CONSTRAINT`, `ERR_CONSTRAINT_VIOLATION`, `ERR_UNSUPPORTED_DDL`
 
+## Phase A-2 snapshot (2026-03-14)
+
+- DML clause-shape improved:
+  - `UPDATE ... SET ...` now supports omitted `WHERE` (applies to all rows)
+  - `DELETE FROM ...` now supports omitted `WHERE` (deletes all rows)
+- DDL deterministic unsupported handling tightened:
+  - unsupported `ALTER TABLE` forms fail explicitly with `ERR_UNSUPPORTED_DDL`
+- Added dedicated regression coverage for DML/DDL clause-shape behavior.
+
 ## Next milestones
 
-   - ✅ Matrix coverage expanded (PR profile + nightly profile)
-   - ✅ SQLite dialect mapping extracted to dedicated module (`examples/sql-compare-dialect.ts`)
-   - ✅ CI split by profile + PR category parallelization
-   - ✅ Report supports category summary and XFAIL/XPASS tracking
-   - ✅ Scalar subquery `MIN(...)` comparison case aligned for current nightly matrix
+1. **M0 (Phase A continue)**
+   - DML with subquery predicates (`IN/EXISTS/ANY/ALL`) for UPDATE/DELETE
+   - DDL surface hardening + deterministic error map for unsupported forms
+   - constraint/index abstraction prep for PK/UNIQUE acceleration
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix
