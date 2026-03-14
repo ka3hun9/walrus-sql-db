@@ -360,9 +360,11 @@ export class WalrusSqlClient {
                 for (const [k, v] of Object.entries(l)) {
                   merged[k] = v;
                   merged[`${leftAlias}.${k}`] = v;
+                  merged[`${plan.table}.${k}`] = v;
                 }
                 for (const [k, v] of Object.entries(r)) {
                   merged[`${rightAlias}.${k}`] = v;
+                  merged[`${plan.join!.table}.${k}`] = v;
                 }
                 const arr = out.get(l);
                 if (arr) arr.push(merged);
@@ -421,9 +423,11 @@ export class WalrusSqlClient {
                 for (const [k, v] of Object.entries(l)) {
                   merged[k] = v;
                   merged[`${leftAlias}.${k}`] = v;
+                  merged[`${plan.table}.${k}`] = v;
                 }
                 for (const [k, v] of Object.entries(r)) {
                   merged[`${rightAlias}.${k}`] = v;
+                  merged[`${plan.join!.table}.${k}`] = v;
                 }
                 const arr = out.get(l);
                 if (arr) arr.push(merged);
@@ -2846,3 +2850,4 @@ export class WalrusSqlClient {
     return v;
   }
 }
+

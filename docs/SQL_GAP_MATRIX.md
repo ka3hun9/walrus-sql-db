@@ -179,6 +179,14 @@
   - cross-side or malformed prefixes fail deterministically (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`).
 - Join-aware UPDATE/DELETE row matching now evaluates WHERE over all matched join pairs per left row, then mutates/deletes each left row at most once.
 
+## Phase A-16 snapshot (2026-03-14)
+
+- Extended join-aware DML merged-row projection to include both alias-qualified and table-qualified keys simultaneously.
+  - left side: `<leftAlias>.<col>` and `<leftTable>.<col>`
+  - right side: `<rightAlias>.<col>` and `<rightTable>.<col>`
+- This enables mixed-prefix SQL in ON/WHERE (table-prefix + alias-prefix combinations) to evaluate deterministically in first-cut join-aware UPDATE/DELETE.
+- Added dedicated regression for mixed-prefix join-aware DML behavior and included it in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
