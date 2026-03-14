@@ -21,6 +21,8 @@
     "sql:compare:sqlite": "tsx examples/sql-compare-sqlite.ts",
     "sql:compare:matrix": "tsx examples/sql-compare-matrix.ts",
     "sql:budget:gate": "tsx examples/sql-budget-gate.ts",
+    "sql:constraint:cost:bench": "tsx examples/sql-constraint-cost-benchmark.ts reports/sql-constraint-cost.json pr",
+    "sql:constraint:cost:gate": "tsx examples/sql-constraint-cost-gate.ts reports/sql-constraint-cost.json pr",
     "sql:fuzz": "tsx examples/sql-fuzz.ts",
     "sql:compare:matrix:category": "tsx examples/sql-compare-matrix.ts reports/sql-compare-category.json reports/mre pr",
     "sql:compare:matrix:g5": "tsx examples/sql-compare-matrix.ts reports/sql-compare-g5-fixture.json reports/mre pr g5-fixture",

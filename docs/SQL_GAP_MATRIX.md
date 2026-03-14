@@ -106,11 +106,24 @@
 - Wired cost accumulation into incremental DML index maintenance + structural rebuild paths.
 - Added regression to assert DML path stays rebuild-free and DDL path triggers rebuild counters.
 
+## Phase A-9 snapshot (2026-03-14)
+
+- Added constraint/index cost benchmark + gate scripts for CI integration:
+  - `examples/sql-constraint-cost-benchmark.ts`
+  - `examples/sql-constraint-cost-gate.ts`
+- Added npm scripts:
+  - `sql:constraint:cost:bench`
+  - `sql:constraint:cost:gate`
+- Benchmark emits report JSON (`reports/sql-constraint-cost.json`) with scenario-level counters.
+- Gate enforces policy:
+  - incremental DML path must keep `rebuildOps == 0`
+  - structural ALTER path must produce `rebuildOps >= 1`
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
    - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
-   - constraint/index cost hooks integration into benchmark and CI perf tracks
+   - promote constraint/index cost gate into primary CI workflow + threshold tuning from nightly trend
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix
