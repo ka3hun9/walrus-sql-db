@@ -392,6 +392,12 @@
 - Verifies supported implicit-join flow mutates left-table counters (`updateOps`/`deleteOps`) with `rebuildOps = 0`, while right-table counters remain unchanged.
 - Included phaseA48 in grouped semantic runner.
 
+## Phase A-49 snapshot (2026-03-14)
+
+- Added regression lock for unsupported `NATURAL JOIN` rejection cost stability in join-aware UPDATE/DELETE.
+- Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
+- Included phaseA49 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
