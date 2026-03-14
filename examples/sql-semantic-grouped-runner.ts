@@ -90,6 +90,7 @@ const cases: RunnerCase[] = [
   { name: "phasea62-left-table-name-target-when-aliased-rejection-cost-stability", script: "examples/sql-phasea62-left-table-name-target-when-aliased-rejection-cost-stability-regression.ts" },
   { name: "phasea63-nonleft-target-table-rejection-cost-stability", script: "examples/sql-phasea63-nonleft-target-table-rejection-cost-stability-regression.ts" },
   { name: "phasea64-mixed-target-and-multidelete-rejection-cost-stability", script: "examples/sql-phasea64-mixed-target-and-multidelete-rejection-cost-stability-regression.ts" },
+  { name: "phasea65-mixed-table-target-boundary-cost-stability", script: "examples/sql-phasea65-mixed-table-target-boundary-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
