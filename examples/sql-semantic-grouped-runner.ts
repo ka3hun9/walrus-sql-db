@@ -79,6 +79,7 @@ const cases: RunnerCase[] = [
   { name: "phasea51-unqualified-on-field-rejection-cost-stability", script: "examples/sql-phasea51-unqualified-on-field-rejection-cost-stability-regression.ts" },
   { name: "phasea52-unqualified-same-name-on-hot-path-cost", script: "examples/sql-phasea52-unqualified-same-name-on-hot-path-cost-regression.ts" },
   { name: "phasea53-invalid-on-field-shape-rejection-cost-stability", script: "examples/sql-phasea53-invalid-on-field-shape-rejection-cost-stability-regression.ts" },
+  { name: "phasea54-on-prefix-cross-side-rejection-cost-stability", script: "examples/sql-phasea54-on-prefix-cross-side-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

@@ -422,6 +422,14 @@
 - Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
 - Included phaseA53 in grouped semantic runner.
 
+## Phase A-54 snapshot (2026-03-14)
+
+- Added regression lock for ON prefix cross-side misuse in join-aware UPDATE/DELETE:
+  - left ON side prefixed with right alias (`o.user_id = o.id`)
+  - right ON side prefixed with left alias (`u.id = u.id`)
+- Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
+- Included phaseA54 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
