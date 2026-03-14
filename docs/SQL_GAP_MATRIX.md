@@ -478,6 +478,12 @@
 - Confirms current deterministic behavior: this shape follows supported hot path (left-table mutation only), with left-table counters moving (`updateOps`/`deleteOps`) and `rebuildOps = 0`, while right-table counters remain unchanged.
 - Included phaseA62 in grouped semantic runner.
 
+## Phase A-63 snapshot (2026-03-14)
+
+- Added regression lock for non-left target table writes (e.g. `SET orders.amount = ...` / `DELETE orders ...`) in join-aware UPDATE/DELETE.
+- Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
+- Included phaseA63 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
