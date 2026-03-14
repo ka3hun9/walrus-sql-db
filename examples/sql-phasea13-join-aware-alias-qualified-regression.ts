@@ -36,6 +36,22 @@ async function main() {
     { id: 3, tier: 3 },
   ]);
 
+  // qualified left target in SET should be accepted
+  await db.execute("UPDATE users u JOIN orders o ON u.id = o.user_id SET u.tier = 8 WHERE o.amount = 200 AND u.id = 2");
+
+  users = await db.query("SELECT id, tier FROM users ORDER BY id");
+  assert.deepEqual(users.rows, [
+    { id: 1, tier: 1 },
+    { id: 2, tier: 8 },
+    { id: 3, tier: 3 },
+  ]);
+
+  // deterministic boundary: SET target cannot point to right-side alias
+  await expectErr(
+    () => db.execute("UPDATE users u JOIN orders o ON u.id = o.user_id SET o.amount = 999 WHERE u.id = 2"),
+    "ERR_UNSUPPORTED_UPDATE",
+  );
+
   // alias target + qualified fields for join-aware DELETE
   await db.execute("DELETE u FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount = 200 AND u.id = 2");
 

@@ -162,6 +162,7 @@
 - Extended join-aware DML first-cut to support alias + qualified-field forms:
   - `UPDATE users u JOIN orders o ON u.id = o.user_id SET ... WHERE o.amount = ...`
   - `DELETE u FROM users u JOIN orders o ON u.id = o.user_id WHERE ...`
+  - qualified left-target `SET` forms (e.g., `SET u.tier = ...`) are accepted; right-side targets remain deterministic unsupported.
 - Join planning now tracks optional `leftAlias/rightAlias` and feeds merged alias-qualified row views to WHERE evaluation.
 - Deterministic boundaries retained:
   - `UPDATE ... FROM ...` remains unsupported (`ERR_UNSUPPORTED_UPDATE`)

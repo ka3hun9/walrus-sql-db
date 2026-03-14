@@ -377,12 +377,13 @@ export class WalrusSqlClient {
         : bucket.map((row) => ({ left: row, merged: row }));
 
       const whereTree = this.parseWhereTree(plan.whereExpr);
+      const targetSetField = this.resolveUpdateSetField(plan);
       let touched = 0;
       for (const hit of targetRows) {
         if (this.evaluateWhereTree(hit.merged, whereTree) === "TRUE") {
           const next = this.applySchemaOnWrite(
             plan.table,
-            { ...hit.left, [plan.setField]: this.castValue(plan.setValue) },
+            { ...hit.left, [targetSetField]: this.castValue(plan.setValue) },
             hit.left,
           );
           this.removeRowFromUniqueIndexes(plan.table, hit.left);
@@ -1099,7 +1100,7 @@ export class WalrusSqlClient {
 
   private planUpdate(sql: string): UpdatePlan {
     const joinM = sql.match(
-      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
+      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (joinM) {
       return {
@@ -1170,6 +1171,26 @@ export class WalrusSqlClient {
       whereExpr: parsed.whereExpr,
       joinAware: false,
     };
+  }
+
+  private resolveUpdateSetField(plan: UpdatePlan): string {
+    const raw = plan.setField.trim();
+    if (!raw.includes(".")) return raw;
+
+    const parts = raw.split(".").map((x) => x.trim()).filter(Boolean);
+    if (parts.length !== 2) {
+      throw sqlError("ERR_UNSUPPORTED_UPDATE", `unsupported SET target: ${plan.setField}`);
+    }
+
+    const [prefix, col] = parts;
+    const allowed = new Set<string>([plan.table.toUpperCase()]);
+    if (plan.join?.leftAlias) allowed.add(plan.join.leftAlias.toUpperCase());
+
+    if (!allowed.has(prefix.toUpperCase())) {
+      throw sqlError("ERR_UNSUPPORTED_UPDATE", `SET target must reference left table/alias: ${plan.setField}`);
+    }
+
+    return col;
   }
 
   private parseUpdate(sql: string): { table: string; setField: string; setValue: string; whereExpr: string } {
