@@ -902,6 +902,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA101 in grouped semantic runner.
 
+## Phase A-102 snapshot (2026-03-15)
+
+- Added regression lock for mongolian-vowel-separator target-token shapes in join-aware DML boundary:
+  - UPDATE ... SET o\u180E.\u180Eamount = ..., u\u180E.\u180Etier = ...
+  - DELETE o,\u180Eu FROM ...
+- Confirms deterministic behavior boundary:
+  - mongolian-vowel-separator target-token SET currently rejects with ERR_UNSUPPORTED_UPDATE
+  - mongolian-vowel-separator multi-target DELETE is rejected with ERR_UNSUPPORTED_DELETE
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA102 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
@@ -922,6 +933,7 @@
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
+
 
 
 
