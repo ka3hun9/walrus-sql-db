@@ -386,6 +386,12 @@
 - Verifies supported `INNER JOIN` flow mutates left-table counters (`updateOps`/`deleteOps`) with `rebuildOps = 0`, while right-table counters remain unchanged.
 - Included phaseA47 in grouped semantic runner.
 
+## Phase A-48 snapshot (2026-03-14)
+
+- Added regression lock for implicit `JOIN` (without `INNER` keyword) hot-path behavior in join-aware UPDATE/DELETE cost path.
+- Verifies supported implicit-join flow mutates left-table counters (`updateOps`/`deleteOps`) with `rebuildOps = 0`, while right-table counters remain unchanged.
+- Included phaseA48 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

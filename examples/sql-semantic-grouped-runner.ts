@@ -73,6 +73,7 @@ const cases: RunnerCase[] = [
   { name: "phasea45-join-aware-cross-join-cost-stability", script: "examples/sql-phasea45-join-aware-cross-join-cost-stability-regression.ts" },
   { name: "phasea46-unsupported-alt-dml-shape-cost-stability", script: "examples/sql-phasea46-unsupported-alt-dml-shape-cost-stability-regression.ts" },
   { name: "phasea47-inner-join-cost-path", script: "examples/sql-phasea47-inner-join-cost-path-regression.ts" },
+  { name: "phasea48-implicit-join-hot-path-cost", script: "examples/sql-phasea48-implicit-join-hot-path-cost-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
