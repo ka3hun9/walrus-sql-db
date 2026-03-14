@@ -770,6 +770,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA89 in grouped semantic runner.
 
+## Phase A-90 snapshot (2026-03-14)
+
+- Added regression lock for figure-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\u2007.\u2007amount = ..., u\u2007.\u2007tier = ...`
+  - `DELETE o,\u2007u FROM ...`
+- Confirms deterministic behavior boundary:
+  - figure-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - figure-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA90 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
