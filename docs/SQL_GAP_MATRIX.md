@@ -398,6 +398,12 @@
 - Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
 - Included phaseA49 in grouped semantic runner.
 
+## Phase A-50 snapshot (2026-03-14)
+
+- Added regression lock for ON-side reversed field ordering (`o.user_id = u.id`) in join-aware UPDATE/DELETE.
+- Confirms current deterministic behavior: reversed ON-side ordering is rejected (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) with no constraint-cost side effects.
+- Included phaseA50 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

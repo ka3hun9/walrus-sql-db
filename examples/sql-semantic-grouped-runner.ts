@@ -75,6 +75,7 @@ const cases: RunnerCase[] = [
   { name: "phasea47-inner-join-cost-path", script: "examples/sql-phasea47-inner-join-cost-path-regression.ts" },
   { name: "phasea48-implicit-join-hot-path-cost", script: "examples/sql-phasea48-implicit-join-hot-path-cost-regression.ts" },
   { name: "phasea49-natural-join-cost-stability", script: "examples/sql-phasea49-natural-join-cost-stability-regression.ts" },
+  { name: "phasea50-inner-join-on-side-symmetry-cost", script: "examples/sql-phasea50-inner-join-on-side-symmetry-cost-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
