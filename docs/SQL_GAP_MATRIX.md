@@ -430,6 +430,12 @@
 - Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
 - Included phaseA54 in grouped semantic runner.
 
+## Phase A-55 snapshot (2026-03-14)
+
+- Added regression lock for ON field-to-literal shape rejection (`ON u.id = 1`) in join-aware UPDATE/DELETE.
+- Confirms deterministic unsupported errors (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`) and zero constraint-cost side effects on both tables.
+- Included phaseA55 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
