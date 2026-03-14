@@ -342,6 +342,18 @@
 - Verifies deterministic unsupported errors and no mutation to left/right constraint-cost counters.
 - Included phaseA40 in grouped semantic runner.
 
+## Phase A-41 snapshot (2026-03-14)
+
+- Added regression lock for unsupported `FULL JOIN` rejection cost stability in join-aware UPDATE/DELETE.
+- Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
+- Included phaseA41 in grouped semantic runner.
+
+## Phase A-42 snapshot (2026-03-14)
+
+- Added regression lock for unsupported `FULL OUTER JOIN` rejection cost stability in join-aware UPDATE/DELETE.
+- Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
+- Included phaseA42 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
