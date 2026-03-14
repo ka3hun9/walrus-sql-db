@@ -317,6 +317,12 @@
 - Verifies DELETE path mutates delete counters without introducing uniqueness conflict-check cost, and keeps `rebuildOps = 0`.
 - Included phaseA36 in grouped semantic runner.
 
+## Phase A-37 snapshot (2026-03-14)
+
+- Added regression lock for join-aware UPDATE conflict-path cost isolation across join sides.
+- Verifies left-table conflict checks are recorded while right-table cost counters remain unchanged.
+- Included phaseA37 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

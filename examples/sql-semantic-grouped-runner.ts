@@ -62,6 +62,7 @@ const cases: RunnerCase[] = [
   { name: "phasea34-join-aware-dedup-target-cost", script: "examples/sql-phasea34-join-aware-dedup-target-cost-regression.ts" },
   { name: "phasea35-join-aware-conflict-state-stability", script: "examples/sql-phasea35-join-aware-conflict-state-stability-regression.ts" },
   { name: "phasea36-join-aware-delete-conflictcheck-neutral", script: "examples/sql-phasea36-join-aware-delete-conflictcheck-neutral-regression.ts" },
+  { name: "phasea37-join-aware-conflict-cost-isolation", script: "examples/sql-phasea37-join-aware-conflict-cost-isolation-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
