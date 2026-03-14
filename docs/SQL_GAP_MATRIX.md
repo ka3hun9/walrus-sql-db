@@ -792,6 +792,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA91 in grouped semantic runner.
 
+## Phase A-92 snapshot (2026-03-14)
+
+- Added regression lock for medium-mathematical-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\u205F.\u205Famount = ..., u\u205F.\u205Ftier = ...`
+  - `DELETE o,\u205Fu FROM ...`
+- Confirms deterministic behavior boundary:
+  - medium-mathematical-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - medium-mathematical-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA92 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
