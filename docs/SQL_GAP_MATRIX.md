@@ -891,6 +891,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA100 in grouped semantic runner.
 
+## Phase A-101 snapshot (2026-03-15)
+
+- Added regression lock for ogham-space-mark target-token shapes in join-aware DML boundary:
+  - UPDATE ... SET o\u1680.\u1680amount = ..., u\u1680.\u1680tier = ...
+  - DELETE o,\u1680u FROM ...
+- Confirms deterministic behavior boundary:
+  - ogham-space-mark target-token SET currently rejects with ERR_UNSUPPORTED_UPDATE
+  - ogham-space-mark multi-target DELETE is rejected with ERR_UNSUPPORTED_DELETE
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA101 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
@@ -911,5 +922,6 @@
    - Transaction model (simulator)
    - Index/plan optimization
    - Rich EXPLAIN plan tree
+
 
 
