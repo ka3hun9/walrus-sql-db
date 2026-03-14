@@ -156,6 +156,19 @@ type TableSchema = {
   primaryKeyGroup?: string[];
 };
 
+type DmlPlan = {
+  table: string;
+  whereExpr: string;
+  joinAware: boolean;
+};
+
+type UpdatePlan = DmlPlan & {
+  setField: string;
+  setValue: string;
+};
+
+type DeletePlan = DmlPlan;
+
 type ConstraintIndexCostStats = {
   insertOps: number;
   updateOps: number;
@@ -314,15 +327,14 @@ export class WalrusSqlClient {
     }
 
     if (upper.startsWith("UPDATE")) {
-      const table = this.extractTableName(normalized, /UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      const { setField, setValue, whereExpr } = this.parseUpdate(normalized);
-      const whereTree = this.parseWhereTree(whereExpr);
-      const bucket = this.requireTable(table);
+      const plan = this.planUpdate(normalized);
+      const whereTree = this.parseWhereTree(plan.whereExpr);
+      const bucket = this.requireTable(plan.table);
       let touched = 0;
       for (const row of bucket) {
         if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
-          const next = this.applySchemaOnWrite(table, { ...row, [setField]: this.castValue(setValue) }, row);
-          this.replaceRowInUniqueIndexes(table, row, next);
+          const next = this.applySchemaOnWrite(plan.table, { ...row, [plan.setField]: this.castValue(plan.setValue) }, row);
+          this.replaceRowInUniqueIndexes(plan.table, row, next);
           Object.keys(row).forEach((k) => delete row[k]);
           Object.assign(row, next);
           touched++;
@@ -335,22 +347,21 @@ export class WalrusSqlClient {
       };
     }
 
-    if (upper.startsWith("DELETE FROM")) {
-      const table = this.extractTableName(normalized, /DELETE FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      const { whereExpr } = this.parseDelete(normalized);
-      const whereTree = this.parseWhereTree(whereExpr);
-      const bucket = this.requireTable(table);
+    if (upper.startsWith("DELETE")) {
+      const plan = this.planDelete(normalized);
+      const whereTree = this.parseWhereTree(plan.whereExpr);
+      const bucket = this.requireTable(plan.table);
       let touched = 0;
       const next: SqlRow[] = [];
       for (const row of bucket) {
         if (this.evaluateWhereTree(row, whereTree) === "TRUE") {
-          this.removeRowFromUniqueIndexes(table, row);
+          this.removeRowFromUniqueIndexes(plan.table, row);
           touched++;
         } else {
           next.push(row);
         }
       }
-      this.tables.set(table, next);
+      this.tables.set(plan.table, next);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -1002,25 +1013,62 @@ export class WalrusSqlClient {
     return row;
   }
 
-  private parseUpdate(sql: string): { setField: string; setValue: string; whereExpr: string } {
-    const m = sql.match(
-      /UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
-    );
-    if (!m) throw sqlError("ERR_UNSUPPORTED_UPDATE", sql);
+  private planUpdate(sql: string): UpdatePlan {
+    if (/\bUPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+JOIN\b/i.test(sql)) {
+      throw sqlError("ERR_UNSUPPORTED_UPDATE", `join-aware UPDATE not supported yet: ${sql}`);
+    }
+
+    const upper = sql.toUpperCase();
+    const whereIdx = upper.indexOf(" WHERE ");
+    const head = whereIdx >= 0 ? upper.slice(0, whereIdx) : upper;
+    if (/\bUPDATE\s+[A-Z_][A-Z0-9_]*\s+SET\b[\s\S]*\bFROM\b/.test(head)) {
+      throw sqlError("ERR_UNSUPPORTED_UPDATE", `join-aware UPDATE not supported yet: ${sql}`);
+    }
+
+    const parsed = this.parseUpdate(sql);
     return {
-      setField: m[1].trim(),
-      setValue: this.trimQuoted(m[2].trim()),
-      whereExpr: m[3]?.trim() ?? "1 = 1",
+      table: parsed.table,
+      setField: parsed.setField,
+      setValue: parsed.setValue,
+      whereExpr: parsed.whereExpr,
+      joinAware: false,
     };
   }
 
-  private parseDelete(sql: string): { whereExpr: string } {
+  private planDelete(sql: string): DeletePlan {
+    if (/\bDELETE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+FROM\b/i.test(sql) || /\bDELETE\s+FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s+USING\b/i.test(sql)) {
+      throw sqlError("ERR_UNSUPPORTED_DELETE", `join-aware DELETE not supported yet: ${sql}`);
+    }
+
+    const parsed = this.parseDelete(sql);
+    return {
+      table: parsed.table,
+      whereExpr: parsed.whereExpr,
+      joinAware: false,
+    };
+  }
+
+  private parseUpdate(sql: string): { table: string; setField: string; setValue: string; whereExpr: string } {
     const m = sql.match(
-      /DELETE FROM\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+WHERE\s+(.+))?$/i,
+      /UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
+    );
+    if (!m) throw sqlError("ERR_UNSUPPORTED_UPDATE", sql);
+    return {
+      table: m[1].trim(),
+      setField: m[2].trim(),
+      setValue: this.trimQuoted(m[3].trim()),
+      whereExpr: m[4]?.trim() ?? "1 = 1",
+    };
+  }
+
+  private parseDelete(sql: string): { table: string; whereExpr: string } {
+    const m = sql.match(
+      /DELETE FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (!m) throw sqlError("ERR_UNSUPPORTED_DELETE", sql);
     return {
-      whereExpr: m[1]?.trim() ?? "1 = 1",
+      table: m[1].trim(),
+      whereExpr: m[2]?.trim() ?? "1 = 1",
     };
   }
 

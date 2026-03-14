@@ -119,10 +119,23 @@
   - incremental DML path must keep `rebuildOps == 0`
   - structural ALTER path must produce `rebuildOps >= 1`
 
+## Phase A-10 snapshot (2026-03-14)
+
+- Introduced join-aware DML planning entry points:
+  - `planUpdate(...)`
+  - `planDelete(...)`
+- Current planner policy is explicit and deterministic:
+  - allows single-table `UPDATE/DELETE` path
+  - rejects join-aware shapes (`UPDATE ... JOIN`, `UPDATE ... FROM`, `DELETE ... FROM ... JOIN`, `DELETE ... USING`) with existing error families (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`)
+- Execution path now consumes plan objects (table/where + joinAware flag) to prepare for next-stage multi-table semantics.
+- Added dedicated regression covering:
+  - single-table compatibility
+  - deterministic rejection of join-aware DML forms
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
-   - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
+   - join-aware DML execution semantics (target-row derivation from join plans)
    - promote constraint/index cost gate into primary CI workflow + threshold tuning from nightly trend
 
 2. **M1 (stabilize+)**
