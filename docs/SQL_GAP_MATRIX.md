@@ -211,6 +211,12 @@
 - Added dedicated regression covering invalid ON fields and valid-path confirmation.
 - Included phaseA19 in grouped semantic runner.
 
+## Phase A-20 snapshot (2026-03-14)
+
+- Added deterministic alias-conflict guard for join-aware UPDATE/DELETE planning.
+- Rejects conflicting cross-side naming (left table/alias collides with right table/alias), while preserving no-alias and normal distinct-alias forms.
+- Added phaseA20 regression and grouped-runner coverage.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

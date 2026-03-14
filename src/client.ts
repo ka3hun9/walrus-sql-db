@@ -1114,6 +1114,11 @@ export class WalrusSqlClient {
       /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+(?:INNER\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (joinM) {
+      const leftTable = joinM[1]!.trim();
+      const leftAlias = joinM[2]?.trim() || leftTable;
+      const rightTable = joinM[3]!.trim();
+      const rightAlias = joinM[4]?.trim() || rightTable;
+      this.assertJoinAliasSafety(leftTable, leftAlias, rightTable, rightAlias, "update", sql);
       return {
         table: joinM[1]!.trim(),
         setField: joinM[7]!.trim(),
@@ -1159,6 +1164,9 @@ export class WalrusSqlClient {
       const targetAlias = joinM[1]!.trim();
       const leftTable = joinM[2]!.trim();
       const leftAlias = joinM[3]?.trim() || leftTable;
+      const rightTable = joinM[4]!.trim();
+      const rightAlias = joinM[5]?.trim() || rightTable;
+      this.assertJoinAliasSafety(leftTable, leftAlias, rightTable, rightAlias, "delete", sql);
       if (targetAlias.toUpperCase() !== leftTable.toUpperCase() && targetAlias.toUpperCase() !== leftAlias.toUpperCase()) {
         throw sqlError("ERR_UNSUPPORTED_DELETE", `DELETE target must equal left table/alias: ${sql}`);
       }
@@ -1186,6 +1194,26 @@ export class WalrusSqlClient {
       whereExpr: parsed.whereExpr,
       joinAware: false,
     };
+  }
+
+  private assertJoinAliasSafety(
+    leftTable: string,
+    leftAlias: string,
+    rightTable: string,
+    rightAlias: string,
+    op: "update" | "delete",
+    sql: string,
+  ): void {
+    const norm = (s: string) => s.trim().toUpperCase();
+    const leftNames = new Set<string>([norm(leftTable), norm(leftAlias)]);
+    const rightNames = new Set<string>([norm(rightTable), norm(rightAlias)]);
+
+    for (const name of leftNames) {
+      if (rightNames.has(name)) {
+        const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
+        throw sqlError(code, `conflicting join aliases/tables are not supported: ${sql}`);
+      }
+    }
   }
 
   private assertJoinOnFieldsExist(
