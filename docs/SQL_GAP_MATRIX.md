@@ -311,6 +311,12 @@
 - Verifies UNIQUE-conflict failure keeps row state unchanged while preserving deterministic cost behavior (`conflictChecks > 0`, `deleteOps = 0`, `rebuildOps = 0`).
 - Included phaseA35 in grouped semantic runner.
 
+## Phase A-36 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DELETE cost semantics with respect to conflict checking.
+- Verifies DELETE path mutates delete counters without introducing uniqueness conflict-check cost, and keeps `rebuildOps = 0`.
+- Included phaseA36 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
