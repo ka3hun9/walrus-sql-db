@@ -299,6 +299,12 @@
 - Verifies no-op join-aware UPDATE/DELETE keep both left-table mutation counters and right-table cost counters unchanged.
 - Included phaseA33 in grouped semantic runner.
 
+## Phase A-34 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DML multi-match target behavior on constraint-cost path.
+- Validates row-level mutation dedup semantics functionally (single left-row result change) while preserving deterministic non-rebuild cost behavior.
+- Included phaseA34 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
