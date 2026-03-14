@@ -195,6 +195,14 @@
 - This prevents accidental silent fallback on unsupported join semantics while keeping first-cut behavior explicit.
 - Added regression coverage for both acceptance (`INNER JOIN`) and deterministic rejection (non-inner joins).
 
+## Phase A-18 snapshot (2026-03-14)
+
+- Added deterministic handling note + regression for overlapping column names in join-aware DML WHERE evaluation.
+- Current first-cut behavior remains compatible with legacy expectations:
+  - unqualified overlapping columns (e.g., `tier`) resolve to left/target row values in join-aware UPDATE/DELETE
+  - right-side disambiguation remains available via qualified identifiers (e.g., `o.tier`, `orders.tier`)
+- Added dedicated regression and grouped-runner coverage to lock this behavior and prevent accidental semantic drift.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

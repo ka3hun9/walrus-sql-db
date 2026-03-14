@@ -43,6 +43,7 @@ const cases: RunnerCase[] = [
   { name: "phasea12-join-aware-delete-exec", script: "examples/sql-phasea12-join-aware-delete-exec-regression.ts" },
   { name: "phasea13-join-aware-alias-qualified", script: "examples/sql-phasea13-join-aware-alias-qualified-regression.ts" },
   { name: "phasea16-join-aware-mixed-prefix", script: "examples/sql-phasea16-join-aware-mixed-prefix-regression.ts" },
+  { name: "phasea18-join-aware-ambiguous-where", script: "examples/sql-phasea18-join-aware-ambiguous-where-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
