@@ -203,6 +203,14 @@
   - right-side disambiguation remains available via qualified identifiers (e.g., `o.tier`, `orders.tier`)
 - Added dedicated regression and grouped-runner coverage to lock this behavior and prevent accidental semantic drift.
 
+## Phase A-19 snapshot (2026-03-14)
+
+- Added deterministic join-ON field existence validation for join-aware DML:
+  - UPDATE/DELETE now explicitly validate normalized ON left/right fields against table schemas before join matching.
+  - missing left/right ON columns fail early with deterministic error-family (`ERR_UNSUPPORTED_UPDATE` / `ERR_UNSUPPORTED_DELETE`).
+- Added dedicated regression covering invalid ON fields and valid-path confirmation.
+- Included phaseA19 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**

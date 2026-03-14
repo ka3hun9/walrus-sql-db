@@ -349,6 +349,7 @@ export class WalrusSqlClient {
         ? (() => {
             const rightRows = this.requireTable(plan.join.table);
             const { leftField, rightField } = this.normalizeJoinOnFields(plan, "update");
+            this.assertJoinOnFieldsExist(plan, leftField, rightField, "update");
             const leftAlias = plan.join.leftAlias ?? plan.table;
             const rightAlias = plan.join.rightAlias ?? plan.join.table;
 
@@ -411,6 +412,7 @@ export class WalrusSqlClient {
         ? (() => {
             const rightRows = this.requireTable(plan.join.table);
             const { leftField, rightField } = this.normalizeJoinOnFields(plan, "delete");
+            this.assertJoinOnFieldsExist(plan, leftField, rightField, "delete");
             const leftAlias = plan.join.leftAlias ?? plan.table;
             const rightAlias = plan.join.rightAlias ?? plan.join.table;
 
@@ -1184,6 +1186,26 @@ export class WalrusSqlClient {
       whereExpr: parsed.whereExpr,
       joinAware: false,
     };
+  }
+
+  private assertJoinOnFieldsExist(
+    plan: UpdatePlan | DeletePlan,
+    leftField: string,
+    rightField: string,
+    op: "update" | "delete",
+  ): void {
+    const leftSchema = this.schemas.get(plan.table);
+    const rightSchema = plan.join ? this.schemas.get(plan.join.table) : undefined;
+
+    const code = op === "update" ? "ERR_UNSUPPORTED_UPDATE" : "ERR_UNSUPPORTED_DELETE";
+
+    if (leftSchema && !leftSchema.columns.some((c) => c.name.toUpperCase() === leftField.toUpperCase())) {
+      throw sqlError(code, `ON left field not found on table ${plan.table}: ${leftField}`);
+    }
+
+    if (plan.join && rightSchema && !rightSchema.columns.some((c) => c.name.toUpperCase() === rightField.toUpperCase())) {
+      throw sqlError(code, `ON right field not found on table ${plan.join.table}: ${rightField}`);
+    }
   }
 
   private normalizeJoinOnFields(plan: UpdatePlan | DeletePlan, op: "update" | "delete"): { leftField: string; rightField: string } {
