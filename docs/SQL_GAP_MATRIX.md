@@ -825,6 +825,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA94 in grouped semantic runner.
 
+## Phase A-95 snapshot (2026-03-14)
+
+- Added regression lock for three-per-em-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\u2004.\u2004amount = ..., u\u2004.\u2004tier = ...`
+  - `DELETE o,\u2004u FROM ...`
+- Confirms deterministic behavior boundary:
+  - three-per-em-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - three-per-em-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA95 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
