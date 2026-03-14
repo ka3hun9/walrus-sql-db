@@ -49,6 +49,7 @@ const cases: RunnerCase[] = [
   { name: "phasea21-join-aware-self-join-boundary", script: "examples/sql-phasea21-join-aware-self-join-boundary-regression.ts" },
   { name: "phasea22-join-aware-as-alias", script: "examples/sql-phasea22-join-aware-as-alias-regression.ts" },
   { name: "phasea23-join-aware-unique-constraint", script: "examples/sql-phasea23-join-aware-unique-constraint-regression.ts" },
+  { name: "phasea24-join-aware-type-constraint", script: "examples/sql-phasea24-join-aware-type-constraint-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {

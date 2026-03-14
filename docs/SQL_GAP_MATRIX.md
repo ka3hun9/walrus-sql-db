@@ -239,6 +239,12 @@
 - Coverage ensures conflict paths raise `ERR_CONSTRAINT_VIOLATION` and non-conflicting join-aware updates still succeed.
 - Included phaseA23 in grouped semantic runner.
 
+## Phase A-24 snapshot (2026-03-14)
+
+- Added regression lock that join-aware UPDATE writes keep enforcing left-table type constraints (`ERR_TYPE_CONSTRAINT`).
+- Verifies invalid typed writes are rejected while valid typed writes still succeed in join-aware execution path.
+- Included phaseA24 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
