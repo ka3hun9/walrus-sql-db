@@ -759,6 +759,17 @@
   - both paths keep constraint-cost counters unchanged.
 - Included phaseA88 in grouped semantic runner.
 
+## Phase A-89 snapshot (2026-03-14)
+
+- Added regression lock for hair-space target-token shapes in join-aware DML boundary:
+  - `UPDATE ... SET o\u200A.\u200Aamount = ..., u\u200A.\u200Atier = ...`
+  - `DELETE o,\u200Au FROM ...`
+- Confirms deterministic behavior boundary:
+  - hair-space target-token SET currently rejects with `ERR_UNSUPPORTED_UPDATE`
+  - hair-space multi-target DELETE is rejected with `ERR_UNSUPPORTED_DELETE`
+  - both paths keep constraint-cost counters unchanged.
+- Included phaseA89 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
