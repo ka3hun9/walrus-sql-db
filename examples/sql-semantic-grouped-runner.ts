@@ -128,6 +128,7 @@ const cases: RunnerCase[] = [
   { name: "phasea100-emquadspace-target-token-shape-rejection-cost-stability", script: "examples/sql-phasea100-emquadspace-target-token-shape-rejection-cost-stability-regression.ts" },
   { name: "phasea101-oghamspace-target-token-shape-rejection-cost-stability", script: "examples/sql-phasea101-oghamspace-target-token-shape-rejection-cost-stability-regression.ts" },
   { name: "phasea102-mvs-target-token-shape-rejection-cost-stability", script: "examples/sql-phasea102-mvs-target-token-shape-rejection-cost-stability-regression.ts" },
+  { name: "phasea103-zwsp-target-token-shape-rejection-cost-stability", script: "examples/sql-phasea103-zwsp-target-token-shape-rejection-cost-stability-regression.ts" },
 ];
 
 function runCase(c: RunnerCase): Promise<void> {
