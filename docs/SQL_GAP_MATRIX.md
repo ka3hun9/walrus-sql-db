@@ -233,6 +233,12 @@
 - Keeps deterministic boundaries intact (e.g., invalid DELETE target alias still rejected).
 - Included phaseA22 in grouped semantic runner.
 
+## Phase A-23 snapshot (2026-03-14)
+
+- Added regression lock that join-aware UPDATE writes continue to enforce left-table UNIQUE constraints.
+- Coverage ensures conflict paths raise `ERR_CONSTRAINT_VIOLATION` and non-conflicting join-aware updates still succeed.
+- Included phaseA23 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
