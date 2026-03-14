@@ -251,6 +251,12 @@
 - Confirms NULL writes fail with `ERR_CONSTRAINT_VIOLATION` while valid non-null updates succeed.
 - Included phaseA25 in grouped semantic runner.
 
+## Phase A-26 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DELETE unique-index cleanup correctness on left-table target.
+- Confirms keys released by join-aware DELETE can be deterministically reused by subsequent INSERT.
+- Included phaseA26 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
