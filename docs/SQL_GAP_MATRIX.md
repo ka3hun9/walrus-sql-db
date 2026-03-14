@@ -323,6 +323,13 @@
 - Verifies left-table conflict checks are recorded while right-table cost counters remain unchanged.
 - Included phaseA37 in grouped semantic runner.
 
+## Phase A-38 snapshot (2026-03-14)
+
+- Added regression lock for join-aware DELETE cost isolation across join sides.
+- Verifies left-table delete-path counters mutate as expected while right-table counters remain unchanged.
+- Keeps deterministic delete-path invariants (`conflictChecks = 0`, `rebuildOps = 0`).
+- Included phaseA38 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
