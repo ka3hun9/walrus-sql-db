@@ -96,11 +96,21 @@
 - Full rebuild retained for structural DDL transitions (`ALTER`/schema changes) as a safe fallback.
 - Added dedicated regression for incremental index maintenance across insert/update/delete + composite groups.
 
+## Phase A-8 snapshot (2026-03-14)
+
+- Added constraint/index cost visibility APIs on simulator client:
+  - `getConstraintIndexCost(table?)`
+  - `resetConstraintIndexCost(table?)`
+- Introduced cost counters for index maintenance path:
+  - `insertOps`, `updateOps`, `deleteOps`, `rebuildOps`, `conflictChecks`, `rowsIndexed`
+- Wired cost accumulation into incremental DML index maintenance + structural rebuild paths.
+- Added regression to assert DML path stays rebuild-free and DDL path triggers rebuild counters.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
    - join-aware DML planning prep (for future multi-table UPDATE/DELETE semantics)
-   - constraint/index abstraction completion (cost model visibility + benchmark hooks)
+   - constraint/index cost hooks integration into benchmark and CI perf tracks
 
 2. **M1 (stabilize+)**
    - Join correctness test matrix

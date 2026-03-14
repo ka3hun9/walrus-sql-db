@@ -156,6 +156,26 @@ type TableSchema = {
   primaryKeyGroup?: string[];
 };
 
+type ConstraintIndexCostStats = {
+  insertOps: number;
+  updateOps: number;
+  deleteOps: number;
+  rebuildOps: number;
+  conflictChecks: number;
+  rowsIndexed: number;
+};
+
+function emptyConstraintCostStats(): ConstraintIndexCostStats {
+  return {
+    insertOps: 0,
+    updateOps: 0,
+    deleteOps: 0,
+    rebuildOps: 0,
+    conflictChecks: 0,
+    rowsIndexed: 0,
+  };
+}
+
 function sqlError(code: SqlErrorCode, detail: string): Error {
   return new Error(`${code}: ${detail}`);
 }
@@ -165,6 +185,7 @@ export class WalrusSqlClient {
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
+  private readonly constraintCost = new Map<string, ConstraintIndexCostStats>();
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -175,6 +196,33 @@ export class WalrusSqlClient {
       return this.executeOnchain(sql);
     }
     return this.executeSimulator(sql);
+  }
+
+  getConstraintIndexCost(table?: string): ConstraintIndexCostStats | Record<string, ConstraintIndexCostStats> {
+    if (table) return { ...(this.constraintCost.get(table) ?? emptyConstraintCostStats()) };
+    const out: Record<string, ConstraintIndexCostStats> = {};
+    for (const [k, v] of this.constraintCost.entries()) out[k] = { ...v };
+    return out;
+  }
+
+  resetConstraintIndexCost(table?: string): void {
+    if (table) {
+      this.constraintCost.set(table, emptyConstraintCostStats());
+      return;
+    }
+    this.constraintCost.clear();
+  }
+
+  private bumpConstraintCost(table: string, patch: Partial<ConstraintIndexCostStats>): void {
+    const curr = this.constraintCost.get(table) ?? emptyConstraintCostStats();
+    this.constraintCost.set(table, {
+      insertOps: curr.insertOps + (patch.insertOps ?? 0),
+      updateOps: curr.updateOps + (patch.updateOps ?? 0),
+      deleteOps: curr.deleteOps + (patch.deleteOps ?? 0),
+      rebuildOps: curr.rebuildOps + (patch.rebuildOps ?? 0),
+      conflictChecks: curr.conflictChecks + (patch.conflictChecks ?? 0),
+      rowsIndexed: curr.rowsIndexed + (patch.rowsIndexed ?? 0),
+    });
   }
 
   private async executeOnchain(sql: string): Promise<ExecuteResult> {
@@ -234,6 +282,7 @@ export class WalrusSqlClient {
       this.tables.delete(table);
       this.schemas.delete(table);
       this.uniqueIndexes.delete(table);
+      this.constraintCost.delete(table);
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -828,6 +877,7 @@ export class WalrusSqlClient {
       if (keyVal === null) continue;
 
       const hitRow = indexByKey.get(keyName)?.get(keyVal);
+      this.bumpConstraintCost(table, { conflictChecks: 1 });
       if (hitRow !== undefined) {
         if (!previous || hitRow !== previous) {
           throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}(${group.join(",")}) violates UNIQUE`);
@@ -896,10 +946,12 @@ export class WalrusSqlClient {
         const key = this.uniqueGroupValue(rows[i]!, g);
         if (key === null) continue;
         colMap.set(key, rows[i]!);
+        this.bumpConstraintCost(table, { rowsIndexed: 1 });
       }
       idxMap.set(this.uniqueGroupName(g), colMap);
     }
     this.uniqueIndexes.set(table, idxMap);
+    this.bumpConstraintCost(table, { rebuildOps: 1 });
   }
 
   private addRowToUniqueIndexes(table: string, row: SqlRow): void {
@@ -914,6 +966,7 @@ export class WalrusSqlClient {
       const keyVal = this.uniqueGroupValue(row, g);
       if (keyVal === null) continue;
       idxMap.get(keyName)?.set(keyVal, row);
+      this.bumpConstraintCost(table, { insertOps: 1, rowsIndexed: 1 });
     }
   }
 
@@ -928,12 +981,14 @@ export class WalrusSqlClient {
       const keyVal = this.uniqueGroupValue(row, g);
       if (keyVal === null) continue;
       idxMap.get(keyName)?.delete(keyVal);
+      this.bumpConstraintCost(table, { deleteOps: 1 });
     }
   }
 
   private replaceRowInUniqueIndexes(table: string, previous: SqlRow, next: SqlRow): void {
     this.removeRowFromUniqueIndexes(table, previous);
     this.addRowToUniqueIndexes(table, next);
+    this.bumpConstraintCost(table, { updateOps: 1 });
   }
 
   private parseInsert(sql: string): SqlRow {
