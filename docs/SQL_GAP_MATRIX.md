@@ -372,6 +372,14 @@
 - Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
 - Included phaseA45 in grouped semantic runner.
 
+## Phase A-46 snapshot (2026-03-14)
+
+- Added regression lock for unsupported alternative DML join shapes cost stability:
+  - `UPDATE ... FROM ...`
+  - `DELETE ... USING ...`
+- Verifies deterministic unsupported errors and unchanged left/right constraint-cost counters.
+- Included phaseA46 in grouped semantic runner.
+
 ## Next milestones
 
 1. **M0 (Phase A continue)**
