@@ -484,10 +484,15 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("CREATE TABLE")) {
       const schema = this.parseCreateTableSchema(normalized);
-      if (!this.tables.has(schema.name)) this.tables.set(schema.name, []);
+      if (this.tables.has(schema.name) || this.schemas.has(schema.name)) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `table already exists: ${schema.name}`);
+      }
+      this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      this.uniqueIndexes.delete(schema.name);
       this.uniqueGroupsCache.set(schema.name, this.collectUniqueGroups(schema));
       this.ensureUniqueIndexMaps(schema.name);
+      this.constraintCost.set(schema.name, emptyConstraintCostStats());
       this.dirtyTables.add(schema.name);
       this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
