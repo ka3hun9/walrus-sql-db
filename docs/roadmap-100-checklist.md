@@ -30,7 +30,7 @@
 
 ## B. 解析器能力（SELECT/表达式全量）
 
-- [ ] B-PARSE-001 SELECT 语法基线补齐（字段、别名、表达式）
+- [x] B-PARSE-001 SELECT 语法基线补齐（字段、别名、表达式）
 - [ ] B-PARSE-002 FROM 表别名（含 AS/省略 AS）
 - [ ] B-PARSE-003 JOIN：INNER/LEFT/RIGHT/FULL OUTER 解析正确
 - [ ] B-PARSE-004 WHERE：AND/OR/NOT 优先级与括号嵌套
