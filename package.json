@@ -28,8 +28,18 @@
     "sql:compare:matrix:g5": "tsx examples/sql-compare-matrix.ts reports/sql-compare-g5-fixture.json reports/mre pr g5-fixture",
     "sql:compare:matrix:g5:nightly": "tsx examples/sql-compare-matrix.ts reports/sql-compare-g5-fixture-nightly.json reports/mre nightly g5-fixture",
     "sql:compare:matrix:nightly": "tsx examples/sql-compare-matrix.ts reports/sql-compare-nightly.json reports/mre nightly",
+    "sql:perf:bench": "tsx examples/sql-performance-benchmark.ts reports/sql-performance-benchmark.json",
     "sql:ast:smoke": "tsx examples/sql-ast-smoke.ts",
     "sql:semantic:grouped": "tsx examples/sql-semantic-grouped-runner.ts",
+    "sql:logic": "tsx examples/sql-logic-runner.ts test/sqllogic/p1-basic.slt",
+    "sql:logic:p2": "tsx examples/sql-logic-runner.ts test/sqllogic/p2-extended.slt",
+    "sql:logic:all": "tsx test/unit-h-test-005-sqllogic-extension.ts",
+    "test:ci:unit": "tsx scripts/run-ci-tests.ts unit",
+    "test:ci:integration": "tsx scripts/run-ci-tests.ts integration",
+    "test:ci:regression": "tsx scripts/run-ci-tests.ts regression",
+    "test:ci:benchmark": "tsx test/unit-h-test-006-performance-benchmark-gate.ts",
+    "test:ci": "npm run test:ci:unit && npm run test:ci:integration && npm run test:ci:regression",
+    "ci:full": "npm run build && npm run test:ci && npm run test:ci:benchmark",
     "sql:verify:full": "npm run build && npm run sql:compare:matrix && npm run sql:compare:matrix:nightly && npm run sql:roadmap",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
@@ -44,7 +54,9 @@
   "author": "ka3hun9",
   "license": "MIT",
   "dependencies": {
+    "@msgpack/msgpack": "^3.1.3",
     "@mysten/sui": "^1.37.6",
+    "cbor-x": "^1.6.4",
     "dotenv": "^16.6.1"
   },
   "devDependencies": {
