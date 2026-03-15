@@ -79,6 +79,24 @@ export type PersistedReplayCacheEntry = {
 
 export type PersistedReplayCache = Record<string, PersistedReplayCacheEntry>;
 
+type EncodedSqlPrimitive =
+  | { kind: "null" }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "number"; value: string }
+  | { kind: "string"; value: string };
+
+type EncodedSqlRow = Record<string, EncodedSqlPrimitive>;
+
+type PersistedReplayCacheEntryEncoded = Omit<PersistedReplayCacheEntry, "rows"> & {
+  rows: EncodedSqlRow[];
+};
+
+type PersistedReplayCacheEnvelope = {
+  version: 1;
+  encoding: "sql-primitive-v1";
+  entries: Record<string, PersistedReplayCacheEntryEncoded>;
+};
+
 export interface ReplayQueryExecutorOptions {
   client: SuiClient;
   packageId: string;
@@ -90,6 +108,113 @@ export interface ReplayQueryExecutorOptions {
   cacheFormat?: ReplayCacheFormat;
 }
 
+function encodeSqlPrimitive(value: SqlPrimitive): EncodedSqlPrimitive {
+  if (value === null) return { kind: "null" };
+  if (typeof value === "boolean") return { kind: "boolean", value };
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return { kind: "string", value: String(value) };
+    return { kind: "number", value: value.toString() };
+  }
+  return { kind: "string", value };
+}
+
+function decodeSqlPrimitive(value: unknown): SqlPrimitive {
+  if (value && typeof value === "object" && "kind" in (value as Record<string, unknown>)) {
+    const cell = value as { kind?: unknown; value?: unknown };
+    if (cell.kind === "null") return null;
+    if (cell.kind === "boolean") return Boolean(cell.value);
+    if (cell.kind === "number") {
+      const raw = String(cell.value ?? "");
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : raw;
+    }
+    if (cell.kind === "string") return String(cell.value ?? "");
+  }
+
+  if (value === null) return null;
+  if (typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+  if (typeof value === "bigint") {
+    if (value < MIN_SAFE_INTEGER_BIGINT || value > MAX_SAFE_INTEGER_BIGINT) return value.toString();
+    return Number(value);
+  }
+  return String(value);
+}
+
+function encodeSqlRow(row: SqlRow): EncodedSqlRow {
+  const out: EncodedSqlRow = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[k] = encodeSqlPrimitive(v ?? null);
+  }
+  return out;
+}
+
+function decodeSqlRow(row: Record<string, unknown>): SqlRow {
+  const out: SqlRow = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[k] = decodeSqlPrimitive(v);
+  }
+  return out;
+}
+
+function encodePersistedReplayCache(data: PersistedReplayCache): PersistedReplayCacheEnvelope {
+  const entries: Record<string, PersistedReplayCacheEntryEncoded> = {};
+  for (const [tableId, entry] of Object.entries(data)) {
+    entries[tableId] = {
+      cursor: entry.cursor,
+      rows: entry.rows.map((row) => encodeSqlRow(row)),
+      seenDigests: [...entry.seenDigests],
+      initialized: entry.initialized,
+      lastCommitHash: entry.lastCommitHash,
+      invalidPayloads: entry.invalidPayloads,
+    };
+  }
+  return { version: 1, encoding: "sql-primitive-v1", entries };
+}
+
+function decodePersistedReplayCache(payload: unknown): PersistedReplayCache {
+  if (
+    payload
+    && typeof payload === "object"
+    && (payload as Record<string, unknown>).version === 1
+    && (payload as Record<string, unknown>).encoding === "sql-primitive-v1"
+    && typeof (payload as Record<string, unknown>).entries === "object"
+    && (payload as Record<string, unknown>).entries !== null
+  ) {
+    const entries = (payload as PersistedReplayCacheEnvelope).entries;
+    const out: PersistedReplayCache = {};
+    for (const [tableId, entry] of Object.entries(entries)) {
+      out[tableId] = {
+        cursor: entry.cursor,
+        rows: entry.rows.map((row) => decodeSqlRow(row as Record<string, unknown>)),
+        seenDigests: [...entry.seenDigests],
+        initialized: entry.initialized,
+        lastCommitHash: entry.lastCommitHash,
+        invalidPayloads: entry.invalidPayloads,
+      };
+    }
+    return out;
+  }
+
+  // Backward compatibility: previous snapshots stored plain SqlPrimitive rows.
+  const legacy = (payload ?? {}) as Record<string, PersistedReplayCacheEntry>;
+  const out: PersistedReplayCache = {};
+  for (const [tableId, entry] of Object.entries(legacy)) {
+    const rows = Array.isArray(entry.rows)
+      ? entry.rows.map((row) => decodeSqlRow((row ?? {}) as Record<string, unknown>))
+      : [];
+    out[tableId] = {
+      cursor: entry.cursor ?? null,
+      rows,
+      seenDigests: Array.isArray(entry.seenDigests) ? entry.seenDigests.map((d) => String(d)) : [],
+      initialized: Boolean(entry.initialized),
+      lastCommitHash: String(entry.lastCommitHash ?? "GENESIS"),
+      invalidPayloads: Number.isFinite(entry.invalidPayloads) ? entry.invalidPayloads : 0,
+    };
+  }
+  return out;
+}
+
 function inferReplayCacheFormat(path?: string): ReplayCacheFormat {
   if (!path) return "json";
   const p = path.toLowerCase();
@@ -99,15 +224,16 @@ function inferReplayCacheFormat(path?: string): ReplayCacheFormat {
 }
 
 export function serializeReplayCache(data: PersistedReplayCache, format: ReplayCacheFormat): Uint8Array {
-  if (format === "msgpack") return encodeMsgpack(data);
-  if (format === "cbor") return encodeCbor(data);
-  return new TextEncoder().encode(JSON.stringify(data));
+  const encoded = encodePersistedReplayCache(data);
+  if (format === "msgpack") return encodeMsgpack(encoded);
+  if (format === "cbor") return encodeCbor(encoded);
+  return new TextEncoder().encode(JSON.stringify(encoded));
 }
 
 export function deserializeReplayCache(blob: Uint8Array, format: ReplayCacheFormat): PersistedReplayCache {
-  if (format === "msgpack") return decodeMsgpack(blob) as PersistedReplayCache;
-  if (format === "cbor") return decodeCbor(blob) as PersistedReplayCache;
-  return JSON.parse(new TextDecoder().decode(blob)) as PersistedReplayCache;
+  if (format === "msgpack") return decodePersistedReplayCache(decodeMsgpack(blob));
+  if (format === "cbor") return decodePersistedReplayCache(decodeCbor(blob));
+  return decodePersistedReplayCache(JSON.parse(new TextDecoder().decode(blob)));
 }
 
 function trimQuoted(raw: string): string {

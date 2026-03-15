@@ -84,7 +84,7 @@
 
 ## G. 存储层与一致性
 
-- [ ] G-STOR-001 类型值序列化/反序列化与精度无损策略
+- [x] G-STOR-001 类型值序列化/反序列化与精度无损策略
 - [ ] G-STOR-002 增量写入（Incremental write）稳定可回放
 - [ ] G-STOR-003 MessagePack/CBOR 存储格式切换一致性
 - [ ] G-STOR-004 read-after-write 一致性回归（高并发模拟）
