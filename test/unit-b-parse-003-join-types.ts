@@ -24,9 +24,9 @@ await db.execute("CREATE TABLE b (id INT PRIMARY KEY)");
 await db.execute("INSERT INTO a (id) VALUES (1)");
 await db.execute("INSERT INTO b (id) VALUES (1)");
 
-await assert.rejects(
-  db.query("SELECT a.id FROM a FULL OUTER JOIN b ON a.id = b.id"),
-  /ERR_UNSUPPORTED_SELECT: FULL OUTER JOIN execution is not implemented yet/,
-);
+const fullRows = await db.query("SELECT a.id AS aid, b.id AS bid FROM a FULL OUTER JOIN b ON a.id = b.id");
+assert.equal(fullRows.rows.length, 1);
+assert.equal(fullRows.rows[0]!.aid, 1);
+assert.equal(fullRows.rows[0]!.bid, 1);
 
 console.log("ok: B-PARSE-003 JOIN type parsing (INNER/LEFT/RIGHT/FULL OUTER)");

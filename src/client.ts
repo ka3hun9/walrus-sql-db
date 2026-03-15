@@ -2040,10 +2040,6 @@ export class WalrusSqlClient {
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
   ): SqlRow[] {
-    if (join.type === "FULL") {
-      throw sqlError("ERR_UNSUPPORTED_SELECT", "FULL OUTER JOIN execution is not implemented yet");
-    }
-
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
       const syntheticJoin: NonNullable<ParsedSelect["join"]> = {
@@ -2060,11 +2056,14 @@ export class WalrusSqlClient {
     const rightField = join.rightField.includes(".") ? join.rightField.split(".")[1] : join.rightField;
 
     const out: SqlRow[] = [];
+    const matchedRightIndexes = new Set<number>();
     for (const l of leftRows) {
       let matched = false;
-      for (const r of rightRows) {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        const r = rightRows[ri]!;
         if (String(l[leftField]) !== String(r[rightField])) continue;
         matched = true;
+        matchedRightIndexes.add(ri);
         const merged: SqlRow = {};
 
         for (const [k, v] of Object.entries(l)) {
@@ -2079,11 +2078,24 @@ export class WalrusSqlClient {
         out.push(merged);
       }
 
-      if (!matched && join.type === "LEFT") {
+      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
         const merged: SqlRow = {};
         for (const [k, v] of Object.entries(l)) {
           merged[k] = v;
           merged[`${leftTable}.${k}`] = v;
+        }
+        out.push(merged);
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRightIndexes.has(ri)) continue;
+        const r = rightRows[ri]!;
+        const merged: SqlRow = {};
+        for (const [k, v] of Object.entries(r)) {
+          merged[`${join.table}.${k}`] = v;
+          if (!(k in merged)) merged[k] = v;
         }
         out.push(merged);
       }

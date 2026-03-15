@@ -844,10 +844,6 @@ function joinRows(
   leftFieldExpr: string,
   rightFieldExpr: string,
 ): SqlRow[] {
-  if (joinType === "FULL") {
-    throw new Error("ERR_UNSUPPORTED_SELECT: FULL OUTER JOIN execution is not implemented yet");
-  }
-
   if (joinType === "RIGHT") {
     return joinRows("LEFT", rightTable, rightRows, leftTable, leftRows, rightFieldExpr, leftFieldExpr);
   }
@@ -856,11 +852,14 @@ function joinRows(
   const rightField = rightFieldExpr.includes(".") ? rightFieldExpr.split(".")[1] : rightFieldExpr;
 
   const out: SqlRow[] = [];
+  const matchedRightIndexes = new Set<number>();
   for (const l of leftRows) {
     let matched = false;
-    for (const r of rightRows) {
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      const r = rightRows[ri]!;
       if (String(l[leftField]) !== String(r[rightField])) continue;
       matched = true;
+      matchedRightIndexes.add(ri);
       const merged: SqlRow = {};
       for (const [k, v] of Object.entries(l)) {
         merged[k] = v;
@@ -873,11 +872,24 @@ function joinRows(
       out.push(merged);
     }
 
-    if (!matched && joinType === "LEFT") {
+    if (!matched && (joinType === "LEFT" || joinType === "FULL")) {
       const merged: SqlRow = {};
       for (const [k, v] of Object.entries(l)) {
         merged[k] = v;
         merged[`${leftTable}.${k}`] = v;
+      }
+      out.push(merged);
+    }
+  }
+
+  if (joinType === "FULL") {
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      if (matchedRightIndexes.has(ri)) continue;
+      const r = rightRows[ri]!;
+      const merged: SqlRow = {};
+      for (const [k, v] of Object.entries(r)) {
+        merged[`${rightTable}.${k}`] = v;
+        if (!(k in merged)) merged[k] = v;
       }
       out.push(merged);
     }

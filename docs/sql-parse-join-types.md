@@ -7,6 +7,4 @@
   - `RIGHT [OUTER] JOIN`
   - `FULL OUTER JOIN`
 - Bare `JOIN` is parsed as `INNER`.
-- Current execution support remains:
-  - implemented: `INNER/LEFT/RIGHT`
-  - not yet implemented: `FULL OUTER` (explicit `ERR_UNSUPPORTED_SELECT` at execution stage)
+- Execution support includes `INNER/LEFT/RIGHT/FULL OUTER`.
