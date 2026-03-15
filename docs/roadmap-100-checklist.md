@@ -99,7 +99,7 @@
 - [x] H-TEST-005 sqllogic 扩展集（阶段二新增语法）
 - [x] H-TEST-006 性能基准（冷/热查询、写入吞吐）
 - [x] H-TEST-007 CI 自动化：build + unit + integration + regression + benchmark gate
-- [ ] H-TEST-008 失败注入测试（网络/存储/超时/重试）
+- [x] H-TEST-008 失败注入测试（网络/存储/超时/重试）
 
 ## I. 工程化与可运维
 
