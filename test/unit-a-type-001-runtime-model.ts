@@ -3,6 +3,8 @@ import {
   SQL_RUNTIME_TYPE_CANONICAL_NAMES,
   SqlRuntimeType,
   createRuntimeTypeModel,
+  decodeBlob,
+  encodeBlob,
   inferRuntimeTypeModel,
   listRuntimeTypeModels,
   toTypedValue,
@@ -51,6 +53,11 @@ assert.equal(timestampType.metadata.timezonePolicy, "assume-utc-if-absent normal
 
 const boolType = createRuntimeTypeModel(SqlRuntimeType.BOOLEAN);
 assert.deepEqual(boolType.metadata.acceptedLiterals, ["true", "false", "1", "0"]);
+
+const blobType = createRuntimeTypeModel(SqlRuntimeType.BLOB);
+assert.equal(blobType.metadata.storageEncoding, "base64-prefixed");
+assert.equal(encodeBlob("hello"), "base64:aGVsbG8=");
+assert.equal(Buffer.from(decodeBlob("base64:aGVsbG8=")).toString("utf8"), "hello");
 
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);

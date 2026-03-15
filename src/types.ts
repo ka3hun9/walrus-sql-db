@@ -40,6 +40,7 @@ export interface SqlRuntimeTypeMetadata {
   timezonePolicy?: string;
   serializationFormat?: string;
   acceptedLiterals?: string[];
+  storageEncoding?: string;
 }
 
 export interface SqlRuntimeTypeModel {
@@ -138,7 +139,7 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   BLOB: {
     family: "BINARY",
     acceptsParameters: false,
-    metadata: { encoding: "binary" },
+    metadata: { encoding: "binary", storageEncoding: "base64-prefixed" },
   },
   TEXT: {
     family: "CHARACTER",
@@ -196,6 +197,55 @@ export function createRuntimeTypeModel(
 
 export function listRuntimeTypeModels(): SqlRuntimeTypeModel[] {
   return SQL_RUNTIME_TYPE_CANONICAL_NAMES.map((name) => createRuntimeTypeModel(name));
+}
+
+const BLOB_BASE64_PREFIX = "base64:";
+const BLOB_HEX_PREFIX = "hex:";
+
+function normalizeBase64(payload: string): string {
+  const trimmed = payload.trim();
+  if (!trimmed) throw new TypeError("BLOB base64 payload cannot be empty");
+  const raw = Buffer.from(trimmed, "base64");
+  if (raw.length === 0) throw new TypeError("BLOB base64 payload is invalid");
+  const canonical = raw.toString("base64");
+  if (canonical.replace(/=+$/, "") !== trimmed.replace(/=+$/, "")) {
+    throw new TypeError("BLOB base64 payload is invalid");
+  }
+  return canonical;
+}
+
+function hexToBytes(payload: string): Uint8Array {
+  const hex = payload.trim();
+  if (!hex || hex.length % 2 !== 0 || /[^0-9a-f]/i.test(hex)) {
+    throw new TypeError("BLOB hex payload is invalid");
+  }
+  return Buffer.from(hex, "hex");
+}
+
+export function encodeBlob(value: string | Uint8Array): string {
+  if (value instanceof Uint8Array) return `${BLOB_BASE64_PREFIX}${Buffer.from(value).toString("base64")}`;
+
+  const trimmed = value.trim();
+  if (trimmed.toLowerCase().startsWith(BLOB_BASE64_PREFIX)) {
+    const payload = trimmed.slice(BLOB_BASE64_PREFIX.length);
+    return `${BLOB_BASE64_PREFIX}${normalizeBase64(payload)}`;
+  }
+
+  if (trimmed.toLowerCase().startsWith(BLOB_HEX_PREFIX)) {
+    const payload = trimmed.slice(BLOB_HEX_PREFIX.length);
+    return `${BLOB_BASE64_PREFIX}${Buffer.from(hexToBytes(payload)).toString("base64")}`;
+  }
+
+  return `${BLOB_BASE64_PREFIX}${Buffer.from(value, "utf8").toString("base64")}`;
+}
+
+export function decodeBlob(encoded: string): Uint8Array {
+  const trimmed = encoded.trim();
+  if (!trimmed.toLowerCase().startsWith(BLOB_BASE64_PREFIX)) {
+    throw new TypeError("BLOB value must use base64: prefix");
+  }
+  const payload = trimmed.slice(BLOB_BASE64_PREFIX.length);
+  return Buffer.from(normalizeBase64(payload), "base64");
 }
 
 export type SqlPrimitive = string | number | boolean | null;

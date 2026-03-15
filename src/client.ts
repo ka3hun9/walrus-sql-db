@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
+import { encodeBlob } from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
@@ -1198,7 +1199,7 @@ export class WalrusSqlClient {
       }
       return type.name === "CHAR" ? str.padEnd(maxLen, " ") : str;
     }
-    if (type.name === "TEXT" || type.name === "STRING" || type.name === "BLOB") {
+    if (type.name === "TEXT" || type.name === "STRING") {
       return String(value);
     }
     if (type.name === "BOOLEAN") {
@@ -1255,7 +1256,12 @@ export class WalrusSqlClient {
       return `${dt.toISOString().slice(0, 19)}Z`;
     }
     if (type.name === "BLOB") {
-      return String(value);
+      try {
+        if (typeof value === "string") return encodeBlob(value);
+        return encodeBlob(String(value));
+      } catch {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid BLOB: ${String(value)}`);
+      }
     }
 
     throw sqlError("ERR_UNSUPPORTED_TYPE", type.name);
