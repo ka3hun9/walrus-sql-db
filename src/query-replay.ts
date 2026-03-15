@@ -37,6 +37,8 @@ type Payload =
       ts?: number;
     };
 
+export type ReplayPayload = Payload;
+
 type Cursor = { txDigest: string; eventSeq: string } | null | undefined;
 type CompareOp = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=" | "IN" | "NOT_IN" | "BETWEEN" | "NOT_BETWEEN" | "LIKE" | "NOT_LIKE" | "IS_NULL" | "IS_NOT_NULL";
 type LogicOp = "AND" | "OR";
@@ -1060,7 +1062,7 @@ function verifyPayloadChain(payload: Payload, expectedPreviousHash: string): boo
 }
 
 function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
-  if (payload.op === "INSERT") return [...rows, payload.row];
+  if (payload.op === "INSERT") return [...rows, { ...payload.row }];
 
   if (payload.op === "UPDATE") {
     return rows.map((row) => {
@@ -1070,6 +1072,28 @@ function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
   }
 
   return rows.filter((row) => String(row[payload.where.field]) !== payload.where.value);
+}
+
+export function replayPayloadsIncremental(
+  initialRows: SqlRow[],
+  payloads: ReplayPayload[],
+  initialCommitHash = "GENESIS",
+): { rows: SqlRow[]; lastCommitHash: string; invalidPayloads: number } {
+  let rows = initialRows.map((r) => ({ ...r }));
+  let lastCommitHash = initialCommitHash;
+  let invalidPayloads = 0;
+
+  for (const payload of payloads) {
+    if (!verifyPayloadChain(payload, lastCommitHash)) {
+      invalidPayloads++;
+      continue;
+    }
+
+    rows = applyPayload(rows, payload);
+    if (payload.currentCommitHash) lastCommitHash = payload.currentCommitHash;
+  }
+
+  return { rows, lastCommitHash, invalidPayloads };
 }
 
 async function discoverTableId(options: ReplayQueryExecutorOptions, table: string): Promise<string | undefined> {
