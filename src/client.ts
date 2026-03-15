@@ -969,6 +969,58 @@ export class WalrusSqlClient {
     return out;
   }
 
+  private parseDefaultLiteral(rawConstraints: string): { hasDefault: boolean; value?: SqlPrimitive } {
+    const m = /\bDEFAULT\b/i.exec(rawConstraints);
+    if (!m) return { hasDefault: false };
+
+    let i = m.index + m[0].length;
+    while (i < rawConstraints.length && /\s/.test(rawConstraints[i]!)) i++;
+    if (i >= rawConstraints.length) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `DEFAULT requires a literal: ${rawConstraints}`);
+    }
+
+    let literal = "";
+    const first = rawConstraints[i]!;
+    if (first === "'" || first === "\"") {
+      const quote = first;
+      literal += quote;
+      i++;
+      let closed = false;
+      while (i < rawConstraints.length) {
+        const ch = rawConstraints[i]!;
+        literal += ch;
+        i++;
+        if (ch === quote) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `unterminated DEFAULT literal: ${rawConstraints}`);
+      }
+    } else {
+      while (i < rawConstraints.length && !/\s/.test(rawConstraints[i]!)) {
+        literal += rawConstraints[i]!;
+        i++;
+      }
+    }
+
+    const tail = rawConstraints.slice(i).trim();
+    if (tail.length > 0) {
+      const normalizedTail = tail.toUpperCase();
+      const stripped = normalizedTail
+        .replace(/\bNOT\s+NULL\b/g, "")
+        .replace(/\bPRIMARY\s+KEY\b/g, "")
+        .replace(/\bUNIQUE\b/g, "")
+        .trim();
+      if (stripped.length > 0) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `unsupported DEFAULT clause tail: ${rawConstraints}`);
+      }
+    }
+
+    return { hasDefault: true, value: this.castValue(literal) };
+  }
+
   private parseSqlTypeSpec(rawType: string): ColumnTypeSpec {
     const t = rawType.trim().toUpperCase();
     const m = t.match(/^([A-Z]+)(?:\((.+)\))?$/);
@@ -1059,7 +1111,12 @@ export class WalrusSqlClient {
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
-      columns.push({ name: colName, type, notNull, primaryKey, unique });
+      const defaultParsed = this.parseDefaultLiteral(consRaw);
+      const defaultValue = defaultParsed.hasDefault ? this.coerceByType(type, defaultParsed.value ?? null) : undefined;
+      if (notNull && defaultParsed.hasDefault && (defaultValue === null || defaultValue === undefined)) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `DEFAULT NULL conflicts with NOT NULL: ${colName}`);
+      }
+      columns.push({ name: colName, type, notNull, primaryKey, unique, defaultValue });
 
       const colRefMatch = consRaw.match(/\bREFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)/i);
       if (colRefMatch) {
@@ -1123,17 +1180,25 @@ export class WalrusSqlClient {
       }
 
       const type = this.parseSqlTypeSpec(add[3]!);
-      const cons = add[4]!.toUpperCase();
+      const consRaw = add[4]!.trim();
+      const cons = consRaw.toUpperCase();
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
-      const col: ColumnSchema = { name: column, type, notNull, primaryKey, unique };
+      const defaultParsed = this.parseDefaultLiteral(consRaw);
+      const defaultValue = defaultParsed.hasDefault ? this.coerceByType(type, defaultParsed.value ?? null) : undefined;
+      const col: ColumnSchema = { name: column, type, notNull, primaryKey, unique, defaultValue };
 
       const rows = this.requireTable(table);
-      if (notNull && rows.length > 0) {
+      if (notNull && rows.length > 0 && !defaultParsed.hasDefault) {
         throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
       }
-      for (const r of rows) r[column] = null;
+      if (notNull && (defaultValue === null || defaultValue === undefined)) {
+        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL with NULL DEFAULT`);
+      }
+
+      const seeded = defaultParsed.hasDefault ? defaultValue ?? null : null;
+      for (const r of rows) r[column] = seeded;
       schema.columns.push(col);
       this.uniqueGroupsCache.delete(table);
       this.rebuildUniqueIndexes(table);
@@ -1375,7 +1440,9 @@ export class WalrusSqlClient {
 
     const out: SqlRow = {};
     for (const c of schema.columns) {
-      const raw = Object.prototype.hasOwnProperty.call(candidate, c.name) ? candidate[c.name] : null;
+      const raw = Object.prototype.hasOwnProperty.call(candidate, c.name)
+        ? candidate[c.name]
+        : (c.defaultValue ?? null);
       const coerced = this.coerceByType(c.type, (raw ?? null) as SqlPrimitive);
       if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
         throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`);

@@ -1,4 +1,4 @@
-import type { SqlRow, SqlRuntimeTypeName } from "./types.js";
+import type { SqlPrimitive, SqlRow, SqlRuntimeTypeName } from "./types.js";
 
 export type SqlTypeName = Exclude<SqlRuntimeTypeName, "NULL">;
 
@@ -15,6 +15,7 @@ export type ColumnSchema = {
   notNull: boolean;
   primaryKey: boolean;
   unique: boolean;
+  defaultValue?: SqlPrimitive;
 };
 
 export type ForeignKeySpec = {
