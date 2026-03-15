@@ -41,7 +41,7 @@
 - [x] B-PARSE-009 EXISTS / NOT EXISTS（相关/非相关）
 - [x] B-PARSE-010 子查询比较（=, <>, >, >=, <, <= 与标量子查询）
 - [x] B-PARSE-011 GROUP BY（单列/多列/表达式）
-- [ ] B-PARSE-012 HAVING（聚合与非聚合约束）
+- [x] B-PARSE-012 HAVING（聚合与非聚合约束）
 - [ ] B-PARSE-013 聚合函数 COUNT/SUM/AVG/MIN/MAX 语法覆盖
 - [ ] B-PARSE-014 ORDER BY（多键、ASC/DESC、别名/表达式）
 - [ ] B-PARSE-015 LIMIT/OFFSET（含顺序约束与错误提示）
