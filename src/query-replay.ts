@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
 import { decode as decodeMsgpack, encode as encodeMsgpack } from "@msgpack/msgpack";
 import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
-import { inferRuntimeType, resolveCastPolicy } from "./types.js";
+import { inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
 import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow, SqlRuntimeTypeName } from "./types.js";
 
 type Payload =
@@ -309,7 +309,7 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
   let castValueExpr: string | undefined;
   let castTypeExpr: string | undefined;
 
-  const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL|FLOAT|DOUBLE|BOOLEAN)\)$/i);
+  const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+([A-Z]+)\)$/i);
   if (castAsMatch) {
     castValueExpr = castAsMatch[1]!;
     castTypeExpr = castAsMatch[2]!;
@@ -326,8 +326,11 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
 
   if (castValueExpr && castTypeExpr) {
     const v = evalExpr(row, castValueExpr);
-    const tRaw = castTypeExpr.toUpperCase();
-    const t = tRaw === "INTEGER" ? "INT" : tRaw === "REAL" ? "DOUBLE" : tRaw;
+    const normalizedTarget = normalizeRuntimeTypeName(castTypeExpr);
+    if (!normalizedTarget || normalizedTarget === "NULL") {
+      throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
+    }
+    const t = normalizedTarget;
     if (v == null) return null;
     const sourceType = inferRuntimeType(v);
     if (resolveCastPolicy(sourceType, t as SqlRuntimeTypeName, "explicit") === "reject") {
@@ -350,7 +353,7 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
       if (b === "false" || b === "0") return false;
       throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to BOOLEAN: ${String(v)}`);
     }
-    throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${t}`);
+    throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
   }
 
   if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return row[expr] as SqlPrimitive | undefined;

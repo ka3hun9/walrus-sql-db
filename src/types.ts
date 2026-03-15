@@ -71,6 +71,31 @@ export const SqlRuntimeType = {
   U64: "U64",
 } as const satisfies Record<string, SqlRuntimeTypeName>;
 
+export const SQL_RUNTIME_TYPE_ALIASES: Readonly<Record<string, SqlRuntimeTypeName>> = {
+  INTEGER: "INT",
+  REAL: "DOUBLE",
+  NUMERIC: "DECIMAL",
+};
+
+export function normalizeRuntimeTypeName(raw: string): SqlRuntimeTypeName | null {
+  const key = raw.trim().toUpperCase();
+  if (!key) return null;
+
+  if ((SQL_RUNTIME_TYPE_CANONICAL_NAMES as readonly string[]).includes(key)) {
+    return key as SqlRuntimeTypeName;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(SQL_RUNTIME_TYPE_ALIASES, key)) {
+    return SQL_RUNTIME_TYPE_ALIASES[key]!;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(SqlRuntimeType, key)) {
+    return SqlRuntimeType[key as keyof typeof SqlRuntimeType];
+  }
+
+  return null;
+}
+
 const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRuntimeTypeModel, "name">>> = {
   NULL: { family: "NULL", acceptsParameters: false, metadata: {} },
   SMALLINT: { family: "INTEGER", acceptsParameters: false, metadata: { min: -32768, max: 32767 } },

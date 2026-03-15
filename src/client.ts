@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
-import { encodeBlob, inferRuntimeType, resolveCastPolicy } from "./types.js";
+import { encodeBlob, inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
@@ -917,26 +917,9 @@ export class WalrusSqlClient {
     const m = t.match(/^([A-Z]+)(?:\((.+)\))?$/);
     if (!m) throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
 
-    const name = m[1] as SqlTypeName;
-    const supported: SqlTypeName[] = [
-      "SMALLINT",
-      "INT",
-      "BIGINT",
-      "DECIMAL",
-      "FLOAT",
-      "DOUBLE",
-      "CHAR",
-      "VARCHAR",
-      "DATE",
-      "TIME",
-      "TIMESTAMP",
-      "BOOLEAN",
-      "BLOB",
-      "TEXT",
-      "STRING",
-      "U64",
-    ];
-    if (!supported.includes(name)) throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
+    const normalizedName = normalizeRuntimeTypeName(m[1]!);
+    if (!normalizedName || normalizedName === "NULL") throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
+    const name = normalizedName as SqlTypeName;
 
     const params = m[2]?.split(",").map((x) => Number(x.trim()));
 
@@ -2658,7 +2641,7 @@ export class WalrusSqlClient {
     let castValueExpr: string | undefined;
     let castTypeExpr: string | undefined;
 
-    const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL|FLOAT|DOUBLE|BOOLEAN)\)$/i);
+    const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+([A-Z]+)\)$/i);
     if (castAsMatch) {
       castValueExpr = castAsMatch[1]!;
       castTypeExpr = castAsMatch[2]!;
@@ -2675,11 +2658,14 @@ export class WalrusSqlClient {
 
     if (castValueExpr && castTypeExpr) {
       const v = this.evalExpr(row, castValueExpr);
-      const tRaw = castTypeExpr.toUpperCase();
-      const t = tRaw === "INTEGER" ? "INT" : tRaw === "REAL" ? "DOUBLE" : tRaw;
+      const normalizedTarget = normalizeRuntimeTypeName(castTypeExpr);
+      if (!normalizedTarget || normalizedTarget === "NULL") {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${castTypeExpr}`);
+      }
+      const t = normalizedTarget;
       if (v === null || v === undefined) return null;
       const sourceType = inferRuntimeType(v);
-      if (resolveCastPolicy(sourceType, t as SqlRuntimeTypeName, "explicit") === "reject") {
+      if (resolveCastPolicy(sourceType, t, "explicit") === "reject") {
         throw sqlError("ERR_TYPE_CONSTRAINT", `CAST ${sourceType} -> ${t} not allowed`);
       }
 
@@ -2700,7 +2686,7 @@ export class WalrusSqlClient {
         if (b === "false" || b === "0") return false;
         throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to BOOLEAN: ${String(v)}`);
       }
-      throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${t}`);
+      throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${castTypeExpr}`);
     }
 
     if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return this.resolveRowValue(row, expr);
