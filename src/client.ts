@@ -511,7 +511,11 @@ export class WalrusSqlClient {
       }
       const dropDependents = this.collectDropDependents(table);
       if (dropDependents.length > 0) {
-        throw constraintError("DDL_DEPENDENCY", `cannot DROP TABLE ${table}: referenced by ${dropDependents.join(", ")}`);
+        throw constraintError(
+          "DDL_DEPENDENCY",
+          `cannot DROP TABLE ${table}: referenced by ${dropDependents.join(", ")}`,
+          { token: table, clause: "DROP TABLE" },
+        );
       }
       this.tables.delete(table);
       this.schemas.delete(table);
@@ -1196,10 +1200,18 @@ export class WalrusSqlClient {
 
       const rows = this.requireTable(table);
       if (notNull && rows.length > 0 && !defaultParsed.hasDefault) {
-        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
+        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`, {
+          token: column,
+          clause: "ALTER TABLE ADD COLUMN",
+          field: column,
+        });
       }
       if (notNull && rows.length > 0 && (defaultValue === null || defaultValue === undefined)) {
-        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL with NULL DEFAULT`);
+        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL with NULL DEFAULT`, {
+          token: column,
+          clause: "ALTER TABLE ADD COLUMN",
+          field: column,
+        });
       }
 
       const seeded = defaultParsed.hasDefault ? defaultValue ?? null : null;
@@ -1223,14 +1235,26 @@ export class WalrusSqlClient {
       const idx = schema.columns.findIndex((c) => c.name.toUpperCase() === column.toUpperCase());
       if (idx < 0) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
       if (this.isPrimaryKeyMember(schema, column)) {
-        throw constraintError("PK_DROP", `cannot DROP primary key column: ${column}`);
+        throw constraintError("PK_DROP", `cannot DROP primary key column: ${column}`, {
+          token: column,
+          clause: "ALTER TABLE DROP COLUMN",
+          field: column,
+        });
       }
       if (schema.columns[idx]!.unique) {
-        throw constraintError("UNIQUE_DROP", `cannot DROP UNIQUE column: ${column}`);
+        throw constraintError("UNIQUE_DROP", `cannot DROP UNIQUE column: ${column}`, {
+          token: column,
+          clause: "ALTER TABLE DROP COLUMN",
+          field: column,
+        });
       }
       const uniqueGroup = (schema.uniqueGroups ?? []).find((g) => g.some((c) => c.toUpperCase() === column.toUpperCase()));
       if (uniqueGroup) {
-        throw constraintError("UNIQUE_DROP", `cannot DROP column referenced by UNIQUE constraint: ${column}`);
+        throw constraintError("UNIQUE_DROP", `cannot DROP column referenced by UNIQUE constraint: ${column}`, {
+          token: column,
+          clause: "ALTER TABLE DROP COLUMN",
+          field: column,
+        });
       }
 
       schema.columns.splice(idx, 1);
@@ -1454,7 +1478,10 @@ export class WalrusSqlClient {
         : (c.defaultValue ?? null);
       const coerced = this.coerceByType(c.type, (raw ?? null) as SqlPrimitive);
       if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
-        throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`);
+        throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`, {
+          clause: "NOT NULL",
+          field: `${table}.${c.name}`,
+        });
       }
       out[c.name] = coerced;
     }
@@ -1472,7 +1499,10 @@ export class WalrusSqlClient {
       this.bumpConstraintCost(table, { conflictChecks: 1 });
       if (hitRow !== undefined) {
         if (!previous || hitRow !== previous) {
-          throw constraintError("DUPLICATE_KEY", `Duplicate key value for ${table}(${group.join(",")})`);
+          throw constraintError("DUPLICATE_KEY", `Duplicate key value for ${table}(${group.join(",")})`, {
+            clause: "UNIQUE",
+            field: group.join(","),
+          });
         }
       }
     }
