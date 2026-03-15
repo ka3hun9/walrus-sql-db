@@ -199,6 +199,54 @@ export function listRuntimeTypeModels(): SqlRuntimeTypeModel[] {
   return SQL_RUNTIME_TYPE_CANONICAL_NAMES.map((name) => createRuntimeTypeModel(name));
 }
 
+export type SqlCastMode = "implicit" | "explicit";
+export type SqlCastPolicy = "allow" | "reject";
+
+const NUMERIC_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>([
+  "SMALLINT",
+  "INT",
+  "BIGINT",
+  "DECIMAL",
+  "FLOAT",
+  "DOUBLE",
+  "U64",
+]);
+
+const TEXT_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>(["TEXT", "STRING", "CHAR", "VARCHAR"]);
+const TEMPORAL_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>(["DATE", "TIME", "TIMESTAMP"]);
+
+export function resolveCastPolicy(
+  source: SqlRuntimeTypeName,
+  target: SqlRuntimeTypeName,
+  mode: SqlCastMode,
+): SqlCastPolicy {
+  if (source === "NULL" || source === target) return "allow";
+
+  if (TEXT_RUNTIME_TYPES.has(target)) return "allow";
+  if (target === "BLOB") return "allow";
+
+  if (NUMERIC_RUNTIME_TYPES.has(target)) {
+    if (NUMERIC_RUNTIME_TYPES.has(source)) return "allow";
+    if (TEXT_RUNTIME_TYPES.has(source)) return "allow";
+    if (source === "BOOLEAN") return mode === "explicit" ? "allow" : "reject";
+    return "reject";
+  }
+
+  if (target === "BOOLEAN") {
+    if (source === "BOOLEAN") return "allow";
+    if (NUMERIC_RUNTIME_TYPES.has(source)) return "allow";
+    if (TEXT_RUNTIME_TYPES.has(source)) return "allow";
+    return "reject";
+  }
+
+  if (TEMPORAL_RUNTIME_TYPES.has(target)) {
+    if (TEXT_RUNTIME_TYPES.has(source)) return "allow";
+    return "reject";
+  }
+
+  return "reject";
+}
+
 const BLOB_BASE64_PREFIX = "base64:";
 const BLOB_HEX_PREFIX = "hex:";
 

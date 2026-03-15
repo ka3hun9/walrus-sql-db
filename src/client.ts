@@ -1,12 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
-import { encodeBlob } from "./types.js";
+import { encodeBlob, inferRuntimeType, resolveCastPolicy } from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
   QueryResult,
   SqlPrimitive,
   SqlRow,
+  SqlRuntimeTypeName,
   StorageWriteEvent,
   StorageWriteOperation,
   WalrusSqlClientOptions,
@@ -1098,6 +1099,11 @@ export class WalrusSqlClient {
 
   private coerceByType(type: ColumnTypeSpec, value: SqlPrimitive): SqlPrimitive {
     if (value === null) return null;
+
+    const sourceType = inferRuntimeType(value);
+    if (resolveCastPolicy(sourceType, type.name as SqlRuntimeTypeName, "implicit") === "reject") {
+      throw sqlError("ERR_TYPE_CONSTRAINT", `implicit cast ${sourceType} -> ${type.name} not allowed`);
+    }
 
     const toNum = (v: SqlPrimitive): number => {
       const n = Number(v);
@@ -2649,18 +2655,52 @@ export class WalrusSqlClient {
       return this.eq(a, b) ? null : a;
     }
 
-    const castMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL)\)$/i);
-    if (castMatch) {
-      const v = this.evalExpr(row, castMatch[1]!);
-      const t = castMatch[2]!.toUpperCase();
-      if (v === null || v === undefined) return null;
-      if (t === "TEXT") return String(v);
-      if (t === "INT" || t === "INTEGER") {
-        const n = Number(v);
-        return Number.isFinite(n) ? Math.trunc(n) : null;
+    let castValueExpr: string | undefined;
+    let castTypeExpr: string | undefined;
+
+    const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL|FLOAT|DOUBLE|BOOLEAN)\)$/i);
+    if (castAsMatch) {
+      castValueExpr = castAsMatch[1]!;
+      castTypeExpr = castAsMatch[2]!;
+    } else {
+      const castFnMatch = expr.match(/^CAST\((.+)\)$/i);
+      if (castFnMatch) {
+        const parts = this.smartSplit(castFnMatch[1]!);
+        if (parts.length === 2) {
+          castValueExpr = parts[0]!;
+          castTypeExpr = this.trimQuoted(parts[1]!.trim());
+        }
       }
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
+    }
+
+    if (castValueExpr && castTypeExpr) {
+      const v = this.evalExpr(row, castValueExpr);
+      const tRaw = castTypeExpr.toUpperCase();
+      const t = tRaw === "INTEGER" ? "INT" : tRaw === "REAL" ? "DOUBLE" : tRaw;
+      if (v === null || v === undefined) return null;
+      const sourceType = inferRuntimeType(v);
+      if (resolveCastPolicy(sourceType, t as SqlRuntimeTypeName, "explicit") === "reject") {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `CAST ${sourceType} -> ${t} not allowed`);
+      }
+
+      if (t === "TEXT") return String(v);
+      if (t === "INT") {
+        const n = Number(v);
+        if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to INT: ${String(v)}`);
+        return Math.trunc(n);
+      }
+      if (t === "FLOAT" || t === "DOUBLE") {
+        const n = Number(v);
+        if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to ${t}: ${String(v)}`);
+        return n;
+      }
+      if (t === "BOOLEAN") {
+        const b = String(v).trim().toLowerCase();
+        if (b === "true" || b === "1") return true;
+        if (b === "false" || b === "0") return false;
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to BOOLEAN: ${String(v)}`);
+      }
+      throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${t}`);
     }
 
     if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return this.resolveRowValue(row, expr);

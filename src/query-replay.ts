@@ -4,7 +4,8 @@ import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
 import { decode as decodeMsgpack, encode as encodeMsgpack } from "@msgpack/msgpack";
 import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
-import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow } from "./types.js";
+import { inferRuntimeType, resolveCastPolicy } from "./types.js";
+import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow, SqlRuntimeTypeName } from "./types.js";
 
 type Payload =
   | {
@@ -305,16 +306,51 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
     return eq(a, b) ? null : a;
   }
 
-  const castMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL)\)$/i);
-  if (castMatch) {
-    const v = evalExpr(row, castMatch[1]!);
-    const t = castMatch[2]!.toUpperCase();
+  let castValueExpr: string | undefined;
+  let castTypeExpr: string | undefined;
+
+  const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+(TEXT|INT|INTEGER|REAL|FLOAT|DOUBLE|BOOLEAN)\)$/i);
+  if (castAsMatch) {
+    castValueExpr = castAsMatch[1]!;
+    castTypeExpr = castAsMatch[2]!;
+  } else {
+    const castFnMatch = expr.match(/^CAST\((.+)\)$/i);
+    if (castFnMatch) {
+      const parts = smartSplit(castFnMatch[1]!);
+      if (parts.length === 2) {
+        castValueExpr = parts[0]!;
+        castTypeExpr = trimQuoted(parts[1]!.trim());
+      }
+    }
+  }
+
+  if (castValueExpr && castTypeExpr) {
+    const v = evalExpr(row, castValueExpr);
+    const tRaw = castTypeExpr.toUpperCase();
+    const t = tRaw === "INTEGER" ? "INT" : tRaw === "REAL" ? "DOUBLE" : tRaw;
     if (v == null) return null;
+    const sourceType = inferRuntimeType(v);
+    if (resolveCastPolicy(sourceType, t as SqlRuntimeTypeName, "explicit") === "reject") {
+      throw new Error(`ERR_TYPE_CONSTRAINT: CAST ${sourceType} -> ${t} not allowed`);
+    }
     if (t === "TEXT") return String(v);
-    const n = Number(v);
-    if (!Number.isFinite(n)) return null;
-    if (t === "INT" || t === "INTEGER") return Math.trunc(n);
-    return n;
+    if (t === "INT") {
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to INT: ${String(v)}`);
+      return Math.trunc(n);
+    }
+    if (t === "FLOAT" || t === "DOUBLE") {
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to ${t}: ${String(v)}`);
+      return n;
+    }
+    if (t === "BOOLEAN") {
+      const b = String(v).trim().toLowerCase();
+      if (b === "true" || b === "1") return true;
+      if (b === "false" || b === "0") return false;
+      throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to BOOLEAN: ${String(v)}`);
+    }
+    throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${t}`);
   }
 
   if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return row[expr] as SqlPrimitive | undefined;

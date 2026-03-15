@@ -7,6 +7,7 @@ import {
   encodeBlob,
   inferRuntimeTypeModel,
   listRuntimeTypeModels,
+  resolveCastPolicy,
   toTypedValue,
 } from "../src/types.js";
 
@@ -58,6 +59,9 @@ const blobType = createRuntimeTypeModel(SqlRuntimeType.BLOB);
 assert.equal(blobType.metadata.storageEncoding, "base64-prefixed");
 assert.equal(encodeBlob("hello"), "base64:aGVsbG8=");
 assert.equal(Buffer.from(decodeBlob("base64:aGVsbG8=")).toString("utf8"), "hello");
+assert.equal(resolveCastPolicy(SqlRuntimeType.TEXT, SqlRuntimeType.INT, "implicit"), "allow");
+assert.equal(resolveCastPolicy(SqlRuntimeType.BOOLEAN, SqlRuntimeType.INT, "implicit"), "reject");
+assert.equal(resolveCastPolicy(SqlRuntimeType.BOOLEAN, SqlRuntimeType.INT, "explicit"), "allow");
 
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
