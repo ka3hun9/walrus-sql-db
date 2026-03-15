@@ -27,6 +27,7 @@ export type SelectStatementAst = {
   limit?: number;
   offset?: number;
   join?: JoinAst;
+  joins?: JoinAst[];
   rawSql: string;
 };
 
@@ -34,6 +35,7 @@ export type TableRefAst =
   | {
       kind: "table";
       name: string;
+      alias?: string;
     }
   | {
       kind: "subquery";

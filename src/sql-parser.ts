@@ -458,25 +458,37 @@ function parseOrderItems(raw?: string): OrderItemAst[] | undefined {
   });
 }
 
-function parseJoin(tail: string): { join?: JoinAst; rest: string } {
-  const jm = tail.match(
-    /^\s+(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
-  );
-  if (!jm) return { rest: tail };
-  return {
-    join: {
+function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
+  const joins: JoinAst[] = [];
+  let rest = tail;
+
+  while (true) {
+    const jm = rest.match(
+      /^\s*(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+    );
+    if (!jm) break;
+
+    joins.push({
       kind: "join",
       joinType: jm[1]!.toUpperCase() as "INNER" | "LEFT" | "RIGHT",
       table: jm[2]!,
       onLeft: jm[3]!,
       onRight: jm[4]!,
-    },
-    rest: jm[5] ?? "",
-  };
+    });
+
+    rest = jm[5] ?? "";
+  }
+
+  return { joins, rest };
+}
+
+function parseJoin(tail: string): { join?: JoinAst; rest: string } {
+  const { joins, rest } = parseJoinChain(tail);
+  return { join: joins[0], rest };
 }
 
 function parseFromRef(base: string): { from: TableRefAst; tail: string } | null {
-  const sub = base.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  const sub = base.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
   if (sub) {
     const outerFields = sub[1]!.trim();
     const subquerySql = sub[2]!.trim();
@@ -496,9 +508,36 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
 
   const table = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
   if (!table) return null;
+
+  let alias: string | undefined;
+  let tail = table[3] ?? "";
+  const aliasCandidate = tail.match(/^\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  if (aliasCandidate) {
+    const token = aliasCandidate[1]!.toUpperCase();
+    const clauseKeywords = new Set([
+      "WHERE",
+      "GROUP",
+      "HAVING",
+      "ORDER",
+      "LIMIT",
+      "OFFSET",
+      "FETCH",
+      "INNER",
+      "LEFT",
+      "RIGHT",
+      "FULL",
+      "JOIN",
+      "UNION",
+    ]);
+    if (!clauseKeywords.has(token)) {
+      alias = aliasCandidate[1]!;
+      tail = aliasCandidate[2] ?? "";
+    }
+  }
+
   return {
-    from: { kind: "table", name: table[2]!.trim() },
-    tail: table[3] ?? "",
+    from: { kind: "table", name: table[2]!.trim(), alias },
+    tail,
   };
 }
 
@@ -693,7 +732,7 @@ export function parseSqlToAst(
   }
   const { from, tail } = fromParsed;
 
-  const { join, rest } = parseJoin(tail);
+  const { joins, rest } = parseJoinChain(tail);
   const hasFetchToken = /\bFETCH\b/i.test(rest);
   if (hasFetchToken && !(dialect === "postgres" || dialect === "mysql" || dialect === "sqlserver")) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
@@ -791,7 +830,8 @@ export function parseSqlToAst(
     orderBy: parseOrderItems(orderBy),
     limit,
     offset,
-    join,
+    join: joins[0],
+    joins: joins.length ? joins : undefined,
     rawSql: sql,
   };
 
