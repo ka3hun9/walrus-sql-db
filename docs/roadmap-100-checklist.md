@@ -54,7 +54,7 @@
 - [x] C-EXEC-004 相关子查询执行（外层引用绑定正确）
 - [x] C-EXEC-005 GROUP BY + HAVING 与聚合组合场景全覆盖
 - [x] C-EXEC-006 ORDER BY + LIMIT/OFFSET 在复杂查询中的稳定行为
-- [ ] C-EXEC-007 NULL 三值逻辑在过滤/连接/聚合中的一致实现
+- [x] C-EXEC-007 NULL 三值逻辑在过滤/连接/聚合中的一致实现
 
 ## D. DML 全量能力（UPDATE/DELETE 复杂条件与子查询）
 

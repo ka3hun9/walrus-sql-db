@@ -857,7 +857,10 @@ function joinRows(
     let matched = false;
     for (let ri = 0; ri < rightRows.length; ri++) {
       const r = rightRows[ri]!;
-      if (String(l[leftField]) !== String(r[rightField])) continue;
+      const leftVal = l[leftField];
+      const rightVal = r[rightField];
+      if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
+      if (String(leftVal) !== String(rightVal)) continue;
       matched = true;
       matchedRightIndexes.add(ri);
       const merged: SqlRow = {};
