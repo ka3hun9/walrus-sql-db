@@ -39,7 +39,7 @@
 - [x] B-PARSE-007 谓词 IN / NOT IN（值列表）
 - [x] B-PARSE-008 谓词 IN / NOT IN（子查询）
 - [x] B-PARSE-009 EXISTS / NOT EXISTS（相关/非相关）
-- [ ] B-PARSE-010 子查询比较（=, <>, >, >=, <, <= 与标量子查询）
+- [x] B-PARSE-010 子查询比较（=, <>, >, >=, <, <= 与标量子查询）
 - [ ] B-PARSE-011 GROUP BY（单列/多列/表达式）
 - [ ] B-PARSE-012 HAVING（聚合与非聚合约束）
 - [ ] B-PARSE-013 聚合函数 COUNT/SUM/AVG/MIN/MAX 语法覆盖
