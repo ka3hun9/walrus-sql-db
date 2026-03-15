@@ -88,7 +88,7 @@
 - [x] G-STOR-002 增量写入（Incremental write）稳定可回放
 - [x] G-STOR-003 MessagePack/CBOR 存储格式切换一致性
 - [x] G-STOR-004 read-after-write 一致性回归（高并发模拟）
-- [ ] G-STOR-005 WAL/重试/退避策略在失败注入下通过
+- [x] G-STOR-005 WAL/重试/退避策略在失败注入下通过
 
 ## H. 测试体系（100% 验收门）
 
