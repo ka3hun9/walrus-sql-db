@@ -95,7 +95,7 @@
 - [x] H-TEST-001 全量类型单测（正例/反例/边界）
 - [x] H-TEST-002 解析器语法矩阵测试（子句组合笛卡尔覆盖）
 - [x] H-TEST-003 执行器语义测试（对照基准引擎）
-- [ ] H-TEST-004 DDL/DML 复杂场景回归集（含子查询与 JOIN）
+- [x] H-TEST-004 DDL/DML 复杂场景回归集（含子查询与 JOIN）
 - [ ] H-TEST-005 sqllogic 扩展集（阶段二新增语法）
 - [ ] H-TEST-006 性能基准（冷/热查询、写入吞吐）
 - [ ] H-TEST-007 CI 自动化：build + unit + integration + regression + benchmark gate
