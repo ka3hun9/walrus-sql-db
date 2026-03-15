@@ -135,6 +135,7 @@ type UpdatePlan = DmlPlan & {
   setField: string;
   setValue: string;
   join?: {
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
     table: string;
     leftAlias?: string;
     rightAlias?: string;
@@ -553,11 +554,19 @@ export class WalrusSqlClient {
             this.assertJoinOnFieldsExist(plan, leftField, rightField, "update");
             const leftAlias = plan.join.leftAlias ?? plan.table;
             const rightAlias = plan.join.rightAlias ?? plan.join.table;
+            const includeUnmatchedLeft = plan.join.type === "LEFT" || plan.join.type === "FULL";
+            const rightColumns = this.schemas.get(plan.join.table)?.columns.map((c) => c.name)
+              ?? (rightRows[0] ? Object.keys(rightRows[0]) : []);
 
             const out = new Map<SqlRow, SqlRow[]>();
             for (const l of bucket) {
+              let matched = false;
               for (const r of rightRows) {
-                if (String(l[leftField]) !== String(r[rightField])) continue;
+                const leftVal = l[leftField];
+                const rightVal = r[rightField];
+                if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
+                if (String(leftVal) !== String(rightVal)) continue;
+                matched = true;
                 const merged: SqlRow = {};
                 for (const [k, v] of Object.entries(l)) {
                   merged[k] = v;
@@ -571,6 +580,20 @@ export class WalrusSqlClient {
                 const arr = out.get(l);
                 if (arr) arr.push(merged);
                 else out.set(l, [merged]);
+              }
+
+              if (!matched && includeUnmatchedLeft) {
+                const merged: SqlRow = {};
+                for (const [k, v] of Object.entries(l)) {
+                  merged[k] = v;
+                  merged[`${leftAlias}.${k}`] = v;
+                  merged[`${plan.table}.${k}`] = v;
+                }
+                for (const k of rightColumns) {
+                  merged[`${rightAlias}.${k}`] = null;
+                  merged[`${plan.join!.table}.${k}`] = null;
+                }
+                out.set(l, [merged]);
               }
             }
             return out;
@@ -1428,31 +1451,29 @@ export class WalrusSqlClient {
   }
 
   private planUpdate(sql: string): UpdatePlan {
-    if (/^UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?\s+(LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+JOIN\b/i.test(sql)) {
-      throw sqlError("ERR_UNSUPPORTED_UPDATE", `non-inner join UPDATE not supported yet: ${sql}`);
-    }
-
     const joinM = sql.match(
-      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+(?:INNER\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
+      /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s+SET\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*(.+?)(?:\s+WHERE\s+(.+))?$/i,
     );
     if (joinM) {
       const leftTable = joinM[1]!.trim();
       const leftAlias = joinM[2]?.trim() || leftTable;
-      const rightTable = joinM[3]!.trim();
-      const rightAlias = joinM[4]?.trim() || rightTable;
+      const joinType = (joinM[3]?.trim().toUpperCase() || "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
+      const rightTable = joinM[4]!.trim();
+      const rightAlias = joinM[5]?.trim() || rightTable;
       this.assertJoinAliasSafety(leftTable, leftAlias, rightTable, rightAlias, "update", sql);
       return {
         table: joinM[1]!.trim(),
-        setField: joinM[7]!.trim(),
-        setValue: this.trimQuoted(joinM[8]!.trim()),
-        whereExpr: joinM[9]?.trim() ?? "1 = 1",
+        setField: joinM[8]!.trim(),
+        setValue: this.trimQuoted(joinM[9]!.trim()),
+        whereExpr: joinM[10]?.trim() ?? "1 = 1",
         joinAware: true,
         join: {
-          table: joinM[3]!.trim(),
+          type: joinType,
+          table: joinM[4]!.trim(),
           leftAlias: joinM[2]?.trim() || joinM[1]!.trim(),
-          rightAlias: joinM[4]?.trim() || joinM[3]!.trim(),
-          leftField: joinM[5]!.trim(),
-          rightField: joinM[6]!.trim(),
+          rightAlias: joinM[5]?.trim() || joinM[4]!.trim(),
+          leftField: joinM[6]!.trim(),
+          rightField: joinM[7]!.trim(),
         },
       };
     }
