@@ -97,7 +97,7 @@
 - [x] H-TEST-003 执行器语义测试（对照基准引擎）
 - [x] H-TEST-004 DDL/DML 复杂场景回归集（含子查询与 JOIN）
 - [x] H-TEST-005 sqllogic 扩展集（阶段二新增语法）
-- [ ] H-TEST-006 性能基准（冷/热查询、写入吞吐）
+- [x] H-TEST-006 性能基准（冷/热查询、写入吞吐）
 - [ ] H-TEST-007 CI 自动化：build + unit + integration + regression + benchmark gate
 - [ ] H-TEST-008 失败注入测试（网络/存储/超时/重试）
 
