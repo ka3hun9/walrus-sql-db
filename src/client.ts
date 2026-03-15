@@ -6,13 +6,26 @@ import type {
   QueryResult,
   SqlPrimitive,
   SqlRow,
+  StorageWriteEvent,
+  StorageWriteOperation,
   WalrusSqlClientOptions,
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
-import { createSqlError } from "./sql-errors.js";
+import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import type { ExprAst, SelectStatementAst } from "./sql-ast.js";
+import { normalizeSql } from "./sql-executor.js";
+import { ClientErrorCodeEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
+import { createLogger, type Logger } from "./logger.js";
+import {
+  emptyConstraintCostStats,
+  type ColumnSchema,
+  type ColumnTypeSpec,
+  type ConstraintIndexCostStats,
+  type SqlTypeName,
+  type TableSchema,
+} from "./sql-catalog.js";
 
 type CompareOp =
   | "="
@@ -45,6 +58,11 @@ type CompareOp =
   | "ANY"
   | "ALL";
 type LogicOp = "AND" | "OR";
+
+const BIGINT_MIN_BOUND = -9223372036854775808n;
+const BIGINT_MAX_BOUND = 9223372036854775807n;
+const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 
@@ -92,68 +110,17 @@ type ParsedSelect = {
     leftField: string;
     rightField: string;
   };
+  joins?: Array<{
+    type: "INNER" | "LEFT" | "RIGHT";
+    table: string;
+    leftField: string;
+    rightField: string;
+  }>;
   rowNumberAlias?: string;
   rowNumberSpec?: {
     partitionBy: string[];
     orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
   };
-};
-
-type SqlErrorCode =
-  | "ERR_TABLE_NOT_FOUND"
-  | "ERR_UNSUPPORTED_INSERT"
-  | "ERR_UNSUPPORTED_UPDATE"
-  | "ERR_UNSUPPORTED_DELETE"
-  | "ERR_UNSUPPORTED_SELECT"
-  | "ERR_UNSUPPORTED_SELECT_CLAUSES"
-  | "ERR_UNSUPPORTED_ORDER_BY"
-  | "ERR_UNSUPPORTED_WHERE"
-  | "ERR_UNSUPPORTED_AST_FROM"
-  | "ERR_UNSUPPORTED_RAW_EXPR"
-  | "ERR_UNSUPPORTED_SUBQUERY"
-  | "ERR_UNSUPPORTED_DDL"
-  | "ERR_UNSUPPORTED_TYPE"
-  | "ERR_TYPE_CONSTRAINT"
-  | "ERR_CONSTRAINT_VIOLATION";
-
-type SqlTypeName =
-  | "SMALLINT"
-  | "INT"
-  | "BIGINT"
-  | "DECIMAL"
-  | "FLOAT"
-  | "DOUBLE"
-  | "CHAR"
-  | "VARCHAR"
-  | "DATE"
-  | "TIME"
-  | "TIMESTAMP"
-  | "BOOLEAN"
-  | "BLOB"
-  | "TEXT"
-  | "STRING"
-  | "U64";
-
-type ColumnTypeSpec = {
-  name: SqlTypeName;
-  length?: number;
-  precision?: number;
-  scale?: number;
-};
-
-type ColumnSchema = {
-  name: string;
-  type: ColumnTypeSpec;
-  notNull: boolean;
-  primaryKey: boolean;
-  unique: boolean;
-};
-
-type TableSchema = {
-  name: string;
-  columns: ColumnSchema[];
-  uniqueGroups?: string[][];
-  primaryKeyGroup?: string[];
 };
 
 type DmlPlan = {
@@ -184,46 +151,86 @@ type DeletePlan = DmlPlan & {
   };
 };
 
-type ConstraintIndexCostStats = {
-  insertOps: number;
-  updateOps: number;
-  deleteOps: number;
-  rebuildOps: number;
-  conflictChecks: number;
-  rowsIndexed: number;
-};
-
-function emptyConstraintCostStats(): ConstraintIndexCostStats {
-  return {
-    insertOps: 0,
-    updateOps: 0,
-    deleteOps: 0,
-    rebuildOps: 0,
-    conflictChecks: 0,
-    rowsIndexed: 0,
-  };
-}
-
-function sqlError(code: SqlErrorCode, detail: string): Error {
-  return new Error(`${code}: ${detail}`);
-}
-
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
+  private readonly uniqueGroupsCache = new Map<string, string[][]>();
   private readonly constraintCost = new Map<string, ConstraintIndexCostStats>();
+  private readonly dirtyTables = new Set<string>();
+  private readonly queryCache = new Map<string, { rows: SqlRow[]; cachedAt: number; writeVersion: number }>();
+  private readonly storageWriteLog: StorageWriteEvent[] = [];
+  private readonly logger: Logger;
+  private writeVersion = 0;
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
+    this.logger = createLogger({
+      level: opts.logging?.level ?? "error",
+      sink: opts.logging?.sink,
+      scope: "WalrusSqlClient",
+    });
+  }
+
+  private isKnownError(err: unknown): err is Error {
+    if (!(err instanceof Error)) return false;
+    if (err instanceof SqlEngineError) return true;
+    return /^(?:ERR_[A-Z_]+|SQL_[A-Z_]+)/.test(err.message);
+  }
+
+  private stringifyError(err: unknown): string {
+    if (err instanceof Error) return err.message;
+    if (typeof err === "string") return err;
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
+
+  private wrapAsyncError(err: unknown, fallbackCode: ClientErrorCode, context: string): Error {
+    if (this.isKnownError(err)) return err;
+    return sqlError(fallbackCode, `${context}: ${this.stringifyError(err)}`);
   }
 
   async execute(sql: string): Promise<ExecuteResult> {
-    if ((this.opts.mode ?? "simulator") === "onchain") {
-      return this.executeOnchain(sql);
+    const normalized = normalizeSql(sql);
+    this.logger.debug("execute start", { sql: normalized, mode: this.opts.mode ?? "simulator" });
+    try {
+      if ((this.opts.mode ?? "simulator") === "onchain") {
+        const result = await this.executeOnchain(sql);
+        this.logger.debug("execute success", {
+          sql: normalized,
+          statementType: result.statementType,
+          affectedRows: result.affectedRows ?? 0,
+        });
+        return result;
+      }
+      const result = await this.executeSimulator(sql);
+      this.logger.debug("execute success", {
+        sql: normalized,
+        statementType: result.statementType,
+        affectedRows: result.affectedRows ?? 0,
+      });
+      return result;
+    } catch (err) {
+      const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "execute() failed");
+      this.logger.error("execute failed", { sql: normalized, error: wrapped.message });
+      throw wrapped;
     }
-    return this.executeSimulator(sql);
+  }
+
+  async executeBatch(sqlList: string[]): Promise<ExecuteResult[]> {
+    if (!Array.isArray(sqlList) || sqlList.length === 0) return [];
+
+    // P0 batch-write interface: aggregate multiple writes through one API call.
+    // Current engine applies statements sequentially while preserving result order.
+    const out: ExecuteResult[] = [];
+    for (const sql of sqlList) {
+      out.push(await this.execute(sql));
+    }
+    return out;
   }
 
   getConstraintIndexCost(table?: string): ConstraintIndexCostStats | Record<string, ConstraintIndexCostStats> {
@@ -233,12 +240,63 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getDirtyTables(): string[] {
+    return [...this.dirtyTables.values()].sort();
+  }
+
+  flushDirtyTables(tables?: string[]): string[] {
+    const target = tables && tables.length > 0 ? tables : [...this.dirtyTables.values()];
+    const flushed: string[] = [];
+    for (const t of target) {
+      if (this.dirtyTables.delete(t)) flushed.push(t);
+    }
+    return flushed;
+  }
+
   resetConstraintIndexCost(table?: string): void {
     if (table) {
       this.constraintCost.set(table, emptyConstraintCostStats());
       return;
     }
     this.constraintCost.clear();
+  }
+
+  getStorageWriteLog(table?: string): StorageWriteEvent[] {
+    const events = table ? this.storageWriteLog.filter((evt) => evt.table === table) : this.storageWriteLog;
+    return events.map((evt) => ({ ...evt }));
+  }
+
+  flushStorageWriteLog(table?: string): StorageWriteEvent[] {
+    if (!table) {
+      const out = this.storageWriteLog.map((evt) => ({ ...evt }));
+      this.storageWriteLog.length = 0;
+      return out;
+    }
+
+    const kept: StorageWriteEvent[] = [];
+    const flushed: StorageWriteEvent[] = [];
+    for (const evt of this.storageWriteLog) {
+      if (evt.table === table) flushed.push({ ...evt });
+      else kept.push(evt);
+    }
+    this.storageWriteLog.length = 0;
+    this.storageWriteLog.push(...kept);
+    return flushed;
+  }
+
+  private recordStorageWrite(
+    table: string,
+    op: StorageWriteOperation,
+    affectedRows: number,
+    mode: "simulator" | "onchain",
+  ): void {
+    this.storageWriteLog.push({
+      table,
+      op,
+      affectedRows,
+      mode,
+      at: Date.now(),
+    });
   }
 
   private bumpConstraintCost(table: string, patch: Partial<ConstraintIndexCostStats>): void {
@@ -253,6 +311,117 @@ export class WalrusSqlClient {
     });
   }
 
+  private getReadCacheConfig(): { enabled: boolean; maxEntries: number; ttlMs: number } {
+    const cfg = this.opts.readCache;
+    const enabled = cfg?.enabled ?? true;
+    const maxEntries = Math.max(1, cfg?.maxEntries ?? 256);
+    const ttlMs = Math.max(1, cfg?.ttlMs ?? 5_000);
+    return { enabled, maxEntries, ttlMs };
+  }
+
+  private deepCloneRows(rows: SqlRow[]): SqlRow[] {
+    return rows.map((r) => ({ ...r }));
+  }
+
+  private getCachedQuery(sql: string): SqlRow[] | null {
+    const cfg = this.getReadCacheConfig();
+    if (!cfg.enabled) return null;
+
+    const hit = this.queryCache.get(sql);
+    if (!hit) return null;
+
+    const expired = Date.now() - hit.cachedAt > cfg.ttlMs;
+    const stale = hit.writeVersion !== this.writeVersion;
+    if (expired || stale) {
+      this.queryCache.delete(sql);
+      return null;
+    }
+
+    // LRU touch
+    this.queryCache.delete(sql);
+    this.queryCache.set(sql, hit);
+    this.logger.debug("read-cache hit", { sql });
+    return this.deepCloneRows(hit.rows);
+  }
+
+  private setCachedQuery(sql: string, rows: SqlRow[]): void {
+    const cfg = this.getReadCacheConfig();
+    if (!cfg.enabled) return;
+
+    if (this.queryCache.has(sql)) this.queryCache.delete(sql);
+    this.queryCache.set(sql, {
+      rows: this.deepCloneRows(rows),
+      cachedAt: Date.now(),
+      writeVersion: this.writeVersion,
+    });
+
+    while (this.queryCache.size > cfg.maxEntries) {
+      const oldest = this.queryCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.queryCache.delete(oldest);
+    }
+  }
+
+  private buildQueryResult(sql: string, rows: SqlRow[]): QueryResult {
+    this.setCachedQuery(sql, rows);
+    return { rows };
+  }
+
+  private invalidateReadCacheOnWrite(): void {
+    this.writeVersion += 1;
+    this.queryCache.clear();
+  }
+
+  private getRetryConfig(): { maxAttempts: number; baseDelayMs: number; maxDelayMs: number } {
+    const cfg = this.opts.walrusRetry;
+    return {
+      maxAttempts: Math.max(1, cfg?.maxAttempts ?? 3),
+      baseDelayMs: Math.max(1, cfg?.baseDelayMs ?? 120),
+      maxDelayMs: Math.max(1, cfg?.maxDelayMs ?? 1_500),
+    };
+  }
+
+  private isRetryableWalrusError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /timeout|temporar|temporarily|rate\s*limit|429|5\d\d|network|ECONN|ENOTFOUND|ETIMEDOUT/i.test(msg);
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async withWalrusRetry<T>(op: () => Promise<T>): Promise<T> {
+    const cfg = this.getRetryConfig();
+    let attempt = 0;
+    let lastErr: unknown;
+
+    while (attempt < cfg.maxAttempts) {
+      attempt += 1;
+      try {
+        return await op();
+      } catch (err) {
+        lastErr = err;
+        const retryable = this.isRetryableWalrusError(err);
+        if (!retryable || attempt >= cfg.maxAttempts) break;
+
+        const exp = cfg.baseDelayMs * 2 ** (attempt - 1);
+        const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(cfg.baseDelayMs / 3)));
+        const waitMs = Math.min(cfg.maxDelayMs, exp + jitter);
+        this.logger.warn("walrus retry", {
+          attempt,
+          maxAttempts: cfg.maxAttempts,
+          waitMs,
+          error: this.stringifyError(err),
+        });
+        await this.sleep(waitMs);
+      }
+    }
+
+    const wrapped = this.wrapAsyncError(lastErr, ClientErrorCodeEnum.ExecutionFailed, "walrus operation failed");
+    this.logger.error("walrus retry exhausted", { error: wrapped.message });
+    throw wrapped;
+  }
+
   private async executeOnchain(sql: string): Promise<ExecuteResult> {
     const moveCall = buildMoveCall({
       packageId: this.opts.packageId,
@@ -260,32 +429,48 @@ export class WalrusSqlClient {
       sql,
     });
 
-    if (!this.opts.onchainExecutor) {
-      return {
-        txDigest: this.fakeDigest(`planned:${sql}`),
-        statementType: moveCall.statementType,
-        moveCall: {
-          target: moveCall.target,
-          arguments: moveCall.arguments,
-          typeArguments: moveCall.typeArguments,
-          tableName: moveCall.tableName,
-        },
-      };
+    const result = !this.opts.onchainExecutor
+      ? {
+          txDigest: this.fakeDigest(`planned:${sql}`),
+          statementType: moveCall.statementType,
+          moveCall: {
+            target: moveCall.target,
+            arguments: moveCall.arguments,
+            typeArguments: moveCall.typeArguments,
+            tableName: moveCall.tableName,
+          },
+        }
+      : await this.withWalrusRetry(async () => {
+          const res = await this.opts.onchainExecutor!(moveCall);
+          return {
+            txDigest: res.digest,
+            raw: res.raw,
+            tableObjectId: res.createdTableId,
+            statementType: moveCall.statementType,
+            moveCall: {
+              target: moveCall.target,
+              arguments: moveCall.arguments,
+              typeArguments: moveCall.typeArguments,
+              tableName: moveCall.tableName,
+            },
+          };
+        });
+
+    if (moveCall.tableName) {
+      const op: StorageWriteOperation =
+        moveCall.statementType === "CREATE"
+          ? "CREATE_TABLE"
+          : moveCall.statementType === "INSERT"
+            ? "INSERT_ROW"
+            : moveCall.statementType === "UPDATE"
+              ? "UPDATE_ROW"
+              : "DELETE_ROW";
+      const affectedRows = moveCall.statementType === "INSERT" ? 1 : 0;
+      this.recordStorageWrite(moveCall.tableName, op, affectedRows, "onchain");
     }
 
-    const res = await this.opts.onchainExecutor(moveCall);
-    return {
-      txDigest: res.digest,
-      raw: res.raw,
-      tableObjectId: res.createdTableId,
-      statementType: moveCall.statementType,
-      moveCall: {
-        target: moveCall.target,
-        arguments: moveCall.arguments,
-        typeArguments: moveCall.typeArguments,
-        tableName: moveCall.tableName,
-      },
-    };
+    this.invalidateReadCacheOnWrite();
+    return result;
   }
 
   private async executeSimulator(sql: string): Promise<ExecuteResult> {
@@ -296,7 +481,11 @@ export class WalrusSqlClient {
       const schema = this.parseCreateTableSchema(normalized);
       if (!this.tables.has(schema.name)) this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      this.uniqueGroupsCache.set(schema.name, this.collectUniqueGroups(schema));
       this.ensureUniqueIndexMaps(schema.name);
+      this.dirtyTables.add(schema.name);
+      this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "CREATE",
@@ -310,7 +499,11 @@ export class WalrusSqlClient {
       this.tables.delete(table);
       this.schemas.delete(table);
       this.uniqueIndexes.delete(table);
+      this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
+      this.dirtyTables.delete(table);
+      this.recordStorageWrite(table, "DROP_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -319,7 +512,10 @@ export class WalrusSqlClient {
     }
 
     if (upper.startsWith("ALTER TABLE")) {
+      const table = this.extractTableName(normalized, /ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.applyAlterTable(normalized);
+      this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "UPDATE",
@@ -334,6 +530,9 @@ export class WalrusSqlClient {
       const coerced = this.applySchemaOnWrite(table, row, undefined);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
+      this.dirtyTables.add(table);
+      this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "INSERT",
@@ -395,8 +594,11 @@ export class WalrusSqlClient {
         Object.assign(row, next);
         this.addRowToUniqueIndexes(plan.table, row);
         this.bumpConstraintCost(plan.table, { updateOps: 1 });
+        this.dirtyTables.add(plan.table);
         touched++;
       }
+      if (touched > 0) this.recordStorageWrite(plan.table, "UPDATE_ROW", touched, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "UPDATE",
@@ -454,6 +656,9 @@ export class WalrusSqlClient {
         }
       }
       this.tables.set(plan.table, next);
+      this.dirtyTables.add(plan.table);
+      if (touched > 0) this.recordStorageWrite(plan.table, "DELETE_ROW", touched, "simulator");
+      this.invalidateReadCacheOnWrite();
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -469,7 +674,14 @@ export class WalrusSqlClient {
   }
 
   async query(sql: string): Promise<QueryResult> {
-    const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+    const normalized = normalizeSql(sql);
+    this.logger.debug("query start", { sql: normalized, mode: this.opts.mode ?? "simulator" });
+    try {
+      const normalizedSql = sql.trim().replace(/\s+/g, " ");
+      const cachedRows = this.getCachedQuery(normalizedSql);
+      if (cachedRows) return { rows: cachedRows };
+
+      const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
     if (ast.kind === "union") {
       const rightPlan = this.splitSelectTail(ast.rightSql);
@@ -497,7 +709,7 @@ export class WalrusSqlClient {
 
       const ordered = this.applyOrder(merged, rightPlan.orderByList);
       const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
-      return { rows: paged };
+      return this.buildQueryResult(normalizedSql, paged);
     }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
@@ -512,7 +724,8 @@ export class WalrusSqlClient {
 
       this.tables.set(tempTable, materialized);
       try {
-        return await this.query(rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+        const result = await this.query(rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+        return this.buildQueryResult(normalizedSql, result.rows);
       } finally {
         this.tables.delete(tempTable);
       }
@@ -522,46 +735,55 @@ export class WalrusSqlClient {
     const parsed = this.parseSelect(normalized, sql);
 
     if (parsed.explain) {
-      return {
-        rows: [
-          {
-            type: "EXPLAIN",
-            table: parsed.table,
-            where: parsed.where ?? null,
-            groupBy: parsed.groupBy?.join(",") ?? null,
-            aggregate: parsed.aggregate ?? null,
-            orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
-            limit: parsed.limit ?? null,
-            offset: parsed.offset ?? null,
-            mode: this.opts.mode ?? "simulator",
-            join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
-          },
-        ],
-      };
+      return this.buildQueryResult(normalizedSql, [
+        {
+          type: "EXPLAIN",
+          table: parsed.table,
+          where: parsed.where ?? null,
+          groupBy: parsed.groupBy?.join(",") ?? null,
+          aggregate: parsed.aggregate ?? null,
+          orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
+          limit: parsed.limit ?? null,
+          offset: parsed.offset ?? null,
+          mode: this.opts.mode ?? "simulator",
+          join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
+          joins: parsed.joins?.length
+            ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
+            : null,
+        },
+      ]);
     }
 
     if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor) {
-      return this.opts.onchainQueryExecutor({
-        sql,
-        table: parsed.table,
-        fields: parsed.fields,
-        where: parsed.where,
-        limit: parsed.limit,
-        offset: parsed.offset,
-        orderBy: parsed.orderBy,
-        orderDirection: parsed.orderDirection,
-        orderByList: parsed.orderByList,
-        aggregate: parsed.aggregate,
-        aggregateField: parsed.aggregateField,
-        groupBy: parsed.groupBy,
-        having: parsed.having,
-        explain: parsed.explain,
-        join: parsed.join,
-      });
+      const onchain = await this.withWalrusRetry(async () =>
+        this.opts.onchainQueryExecutor!({
+          sql,
+          table: parsed.table,
+          fields: parsed.fields,
+          where: parsed.where,
+          limit: parsed.limit,
+          offset: parsed.offset,
+          orderBy: parsed.orderBy,
+          orderDirection: parsed.orderDirection,
+          orderByList: parsed.orderByList,
+          aggregate: parsed.aggregate,
+          aggregateField: parsed.aggregateField,
+          groupBy: parsed.groupBy,
+          having: parsed.having,
+          explain: parsed.explain,
+          join: parsed.join,
+          joins: parsed.joins,
+        }),
+      );
+      return this.buildQueryResult(normalizedSql, onchain.rows);
     }
 
     const bucket = this.requireTable(parsed.table);
-    const baseRows = parsed.join ? this.applyJoin(parsed.table, bucket, parsed.join) : bucket;
+    const baseRows = parsed.joins?.length
+      ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), bucket)
+      : parsed.join
+      ? this.applyJoin(parsed.table, bucket, parsed.join)
+      : bucket;
     const filtered = parsed.whereAst
       ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
       : parsed.whereTree
@@ -579,15 +801,14 @@ export class WalrusSqlClient {
         : grouped;
       const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
       const pagedGrouped = this.applyPage(orderedGrouped, parsed.offset, parsed.limit);
-      return {
-        rows: pagedGrouped.map((row) => this.pickFields(row, parsed.fields)),
-      };
+      return this.buildQueryResult(
+        normalizedSql,
+        pagedGrouped.map((row) => this.pickFields(row, parsed.fields)),
+      );
     }
 
     if (parsed.aggregate) {
-      return {
-        rows: [this.computeAggregateRow(filtered, parsed.aggregate, parsed.aggregateField)],
-      };
+      return this.buildQueryResult(normalizedSql, [this.computeAggregateRow(filtered, parsed.aggregate, parsed.aggregateField)]);
     }
 
     const withWindow = parsed.rowNumberAlias
@@ -596,9 +817,17 @@ export class WalrusSqlClient {
     const ordered = this.applyOrder(withWindow, parsed.orderByList);
     const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
 
-    return {
-      rows: paged.map((row) => this.pickFields(row, parsed.fields)),
-    };
+      const result = this.buildQueryResult(
+        normalizedSql,
+        paged.map((row) => this.pickFields(row, parsed.fields)),
+      );
+      this.logger.debug("query success", { sql: normalized, rows: result.rows.length });
+      return result;
+    } catch (err) {
+      const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
+      this.logger.error("query failed", { sql: normalized, error: wrapped.message });
+      throw wrapped;
+    }
   }
 
   async queryOne(sql: string): Promise<SqlRow | null> {
@@ -607,20 +836,28 @@ export class WalrusSqlClient {
   }
 
   async queryWithProof(sql: string): Promise<QueryProofResult> {
-    const result = await this.query(sql);
-    return {
-      ...result,
-      proof: {
-        manifestHash: this.fakeDigest(`manifest:${sql}`),
-        indexRoot: this.fakeDigest(`index:${sql}`),
-        blockHeight: Math.floor(Date.now() / 1000),
-        txDigest: this.fakeDigest(sql),
-      },
-    };
+    try {
+      const result = await this.query(sql);
+      return {
+        ...result,
+        proof: {
+          manifestHash: this.fakeDigest(`manifest:${sql}`),
+          indexRoot: this.fakeDigest(`index:${sql}`),
+          blockHeight: Math.floor(Date.now() / 1000),
+          txDigest: this.fakeDigest(sql),
+        },
+      };
+    } catch (err) {
+      throw this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, "queryWithProof() failed");
+    }
   }
 
   async verify(result: QueryProofResult): Promise<boolean> {
-    return Boolean(result.proof.manifestHash && result.proof.indexRoot && result.proof.txDigest);
+    try {
+      return Boolean(result.proof.manifestHash && result.proof.indexRoot && result.proof.txDigest);
+    } catch (err) {
+      throw this.wrapAsyncError(err, ClientErrorCodeEnum.VerificationFailed, "verify() failed");
+    }
   }
 
   private fakeDigest(input: string): string {
@@ -638,7 +875,7 @@ export class WalrusSqlClient {
 
   private extractTableName(sql: string, pattern: RegExp): string {
     const m = sql.match(pattern);
-    if (!m) throw new Error(`Unable to parse table name from SQL: ${sql}`);
+    if (!m) throw sqlError("ERR_UNSUPPORTED_DDL", `unable to parse table name from SQL: ${sql}`);
     return m[1];
   }
 
@@ -818,11 +1055,13 @@ export class WalrusSqlClient {
 
       const rows = this.requireTable(table);
       if (notNull && rows.length > 0) {
-        throw sqlError("ERR_CONSTRAINT_VIOLATION", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
+        throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
       }
       for (const r of rows) r[column] = null;
       schema.columns.push(col);
+      this.uniqueGroupsCache.delete(table);
       this.rebuildUniqueIndexes(table);
+      this.dirtyTables.add(table);
       return;
     }
 
@@ -837,17 +1076,19 @@ export class WalrusSqlClient {
 
       const idx = schema.columns.findIndex((c) => c.name.toUpperCase() === column.toUpperCase());
       if (idx < 0) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
-      if (schema.columns[idx]!.primaryKey) {
-        throw sqlError("ERR_CONSTRAINT_VIOLATION", `cannot DROP primary key column: ${column}`);
+      if (this.isPrimaryKeyMember(schema, column)) {
+        throw constraintError("PK_DROP", `cannot DROP primary key column: ${column}`);
       }
 
       schema.columns.splice(idx, 1);
       schema.uniqueGroups = (schema.uniqueGroups ?? []).filter(
         (g) => !g.some((c) => c.toUpperCase() === column.toUpperCase()),
       );
+      this.uniqueGroupsCache.delete(table);
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
       this.rebuildUniqueIndexes(table);
+      this.dirtyTables.add(table);
       return;
     }
 
@@ -869,6 +1110,32 @@ export class WalrusSqlClient {
       return n;
     };
 
+    const toBigInt = (v: SqlPrimitive): bigint => {
+      if (typeof v === "number") {
+        if (!Number.isInteger(v)) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", `expected integer for ${type.name}, got ${String(v)}`);
+        }
+        if (!Number.isSafeInteger(v)) {
+          throw sqlError(
+            "ERR_TYPE_CONSTRAINT",
+            `unsafe integer literal for ${type.name}; use quoted digits for precise conversion`,
+          );
+        }
+        return BigInt(v);
+      }
+
+      const raw = String(v).trim();
+      if (!/^[+-]?\d+$/.test(raw)) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `expected integer for ${type.name}, got ${String(v)}`);
+      }
+
+      try {
+        return BigInt(raw);
+      } catch {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `expected integer for ${type.name}, got ${String(v)}`);
+      }
+    };
+
     if (type.name === "SMALLINT") {
       const n = toInt(value);
       if (n < -32768 || n > 32767) throw sqlError("ERR_TYPE_CONSTRAINT", `SMALLINT out of range: ${n}`);
@@ -880,9 +1147,12 @@ export class WalrusSqlClient {
       return n;
     }
     if (type.name === "BIGINT") {
-      const n = toInt(value);
-      if (!Number.isSafeInteger(n)) return String(n);
-      return n;
+      const n = toBigInt(value);
+      if (n < BIGINT_MIN_BOUND || n > BIGINT_MAX_BOUND) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `BIGINT out of range: ${n.toString()}`);
+      }
+      if (n < MIN_SAFE_INTEGER_BIGINT || n > MAX_SAFE_INTEGER_BIGINT) return n.toString();
+      return Number(n);
     }
     if (type.name === "U64") {
       const n = toInt(value);
@@ -965,7 +1235,7 @@ export class WalrusSqlClient {
       const raw = Object.prototype.hasOwnProperty.call(candidate, c.name) ? candidate[c.name] : null;
       const coerced = this.coerceByType(c.type, (raw ?? null) as SqlPrimitive);
       if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
-        throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}.${c.name} is NOT NULL`);
+        throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`);
       }
       out[c.name] = coerced;
     }
@@ -974,7 +1244,7 @@ export class WalrusSqlClient {
     this.ensureUniqueIndexMaps(table);
     const indexByKey = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, SqlRow>>();
 
-    for (const group of this.collectUniqueGroups(schema)) {
+    for (const group of this.getUniqueGroups(table, schema)) {
       const keyName = this.uniqueGroupName(group);
       const keyVal = this.uniqueGroupValue(out, group);
       if (keyVal === null) continue;
@@ -983,7 +1253,7 @@ export class WalrusSqlClient {
       this.bumpConstraintCost(table, { conflictChecks: 1 });
       if (hitRow !== undefined) {
         if (!previous || hitRow !== previous) {
-          throw sqlError("ERR_CONSTRAINT_VIOLATION", `${table}(${group.join(",")}) violates UNIQUE`);
+          throw constraintError("DUPLICATE_KEY", `Duplicate key value for ${table}(${group.join(",")})`);
         }
       }
     }
@@ -1008,6 +1278,22 @@ export class WalrusSqlClient {
     return groups;
   }
 
+  private getUniqueGroups(table: string, schema?: TableSchema): string[][] {
+    const cached = this.uniqueGroupsCache.get(table);
+    if (cached) return cached;
+    const resolvedSchema = schema ?? this.schemas.get(table);
+    if (!resolvedSchema) return [];
+    const groups = this.collectUniqueGroups(resolvedSchema);
+    this.uniqueGroupsCache.set(table, groups);
+    return groups;
+  }
+
+  private isPrimaryKeyMember(schema: TableSchema, column: string): boolean {
+    if (schema.columns.some((c) => c.name.toUpperCase() === column.toUpperCase() && c.primaryKey)) return true;
+    if (schema.primaryKeyGroup?.some((c) => c.toUpperCase() === column.toUpperCase())) return true;
+    return false;
+  }
+
   private uniqueGroupName(group: string[]): string {
     return group.map((x) => x.toUpperCase()).join("+");
   }
@@ -1028,7 +1314,7 @@ export class WalrusSqlClient {
     if (this.uniqueIndexes.has(table)) return;
 
     const idxMap = new Map<string, Map<string, SqlRow>>();
-    for (const g of this.collectUniqueGroups(schema)) {
+    for (const g of this.getUniqueGroups(table, schema)) {
       idxMap.set(this.uniqueGroupName(g), new Map<string, SqlRow>());
     }
     this.uniqueIndexes.set(table, idxMap);
@@ -1043,7 +1329,7 @@ export class WalrusSqlClient {
 
     const rows = this.requireTable(table);
     const idxMap = new Map<string, Map<string, SqlRow>>();
-    for (const g of this.collectUniqueGroups(schema)) {
+    for (const g of this.getUniqueGroups(table, schema)) {
       const colMap = new Map<string, SqlRow>();
       for (let i = 0; i < rows.length; i++) {
         const key = this.uniqueGroupValue(rows[i]!, g);
@@ -1064,7 +1350,7 @@ export class WalrusSqlClient {
     const idxMap = this.uniqueIndexes.get(table);
     if (!idxMap) return;
 
-    for (const g of this.collectUniqueGroups(schema)) {
+    for (const g of this.getUniqueGroups(table, schema)) {
       const keyName = this.uniqueGroupName(g);
       const keyVal = this.uniqueGroupValue(row, g);
       if (keyVal === null) continue;
@@ -1079,7 +1365,7 @@ export class WalrusSqlClient {
     const idxMap = this.uniqueIndexes.get(table);
     if (!idxMap) return;
 
-    for (const g of this.collectUniqueGroups(schema)) {
+    for (const g of this.getUniqueGroups(table, schema)) {
       const keyName = this.uniqueGroupName(g);
       const keyVal = this.uniqueGroupValue(row, g);
       if (keyVal === null) continue;
@@ -1099,7 +1385,7 @@ export class WalrusSqlClient {
     if (!m) throw sqlError("ERR_UNSUPPORTED_INSERT", sql);
     const cols = this.splitTopLevelComma(m[1]).map((c) => c.trim());
     const vals = this.smartSplit(m[2]).map((v) => this.castValue(v));
-    if (cols.length !== vals.length) throw new Error(`INSERT column/value mismatch`);
+    if (cols.length !== vals.length) throw sqlError("ERR_UNSUPPORTED_INSERT", "INSERT column/value mismatch");
     const row: SqlRow = {};
     cols.forEach((c, i) => (row[c] = vals[i] ?? null));
     return row;
@@ -1462,6 +1748,12 @@ export class WalrusSqlClient {
             rightField: ast.join.onRight,
           }
         : undefined,
+      joins: ast.joins?.map((j) => ({
+        type: j.joinType,
+        table: j.table,
+        leftField: j.onLeft,
+        rightField: j.onRight,
+      })),
       rowNumberAlias,
       rowNumberSpec,
     };
@@ -1557,18 +1849,25 @@ export class WalrusSqlClient {
     const table = m[2];
     let tail = m[3] ?? "";
     let join: ParsedSelect["join"];
+    let joins: ParsedSelect["joins"];
 
-    const joinMatch = tail.match(
-      /^\s+(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+    const joinMatches = Array.from(
+      tail.matchAll(
+        /\s+(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)/gi,
+      ),
     );
-    if (joinMatch) {
-      join = {
-        type: joinMatch[1].toUpperCase() as "INNER" | "LEFT" | "RIGHT",
-        table: joinMatch[2],
-        leftField: joinMatch[3],
-        rightField: joinMatch[4],
-      };
-      tail = joinMatch[5] ?? "";
+    if (joinMatches.length) {
+      joins = joinMatches.map((m) => ({
+        type: m[1]!.toUpperCase() as "INNER" | "LEFT" | "RIGHT",
+        table: m[2]!,
+        leftField: m[3]!,
+        rightField: m[4]!,
+      }));
+      join = joins[0];
+
+      const last = joinMatches[joinMatches.length - 1]!;
+      const consumed = last.index! + last[0].length;
+      tail = tail.slice(consumed);
     }
 
     const tm = tail.match(
@@ -1650,6 +1949,7 @@ export class WalrusSqlClient {
         groupBy,
         having,
         join,
+        joins,
         rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
         rowNumberSpec,
       };
@@ -1671,6 +1971,7 @@ export class WalrusSqlClient {
         groupBy,
         having,
         join,
+        joins,
         rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
         rowNumberSpec,
       };
@@ -1691,6 +1992,7 @@ export class WalrusSqlClient {
       groupBy,
       having,
       join,
+      joins,
       rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
       rowNumberSpec,
     };
@@ -2229,7 +2531,7 @@ export class WalrusSqlClient {
 
     const firstRow = rows[0]!;
     const keys = Object.keys(firstRow);
-    if (keys.length !== 1) throw new Error(`Subquery must return exactly 1 column: ${subquerySql}`);
+    if (keys.length !== 1) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
     const key = keys[0]!;
     return rows.map((r) => r[key] ?? null);
   }
@@ -2823,10 +3125,14 @@ export class WalrusSqlClient {
     }
 
     if (!aggregateField || aggregateField === "*") {
-      throw new Error(`${aggregate} requires a numeric field`);
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `${aggregate} requires a numeric field`);
     }
 
-    const nums = rows.map((r) => Number(r[aggregateField])).filter((n) => Number.isFinite(n));
+    const nums = rows
+      .map((r) => r[aggregateField])
+      .filter((v) => v !== null && v !== undefined)
+      .map((v) => Number(v))
+      .filter((n) => Number.isFinite(n));
 
     if (aggregate === "SUM") return { sum: nums.reduce((a, b) => a + b, 0) };
     if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0 };
@@ -2879,6 +3185,15 @@ export class WalrusSqlClient {
     if (v.toLowerCase() === "null") return null;
     if (v.toLowerCase() === "true") return true;
     if (v.toLowerCase() === "false") return false;
+    if (/^[+-]?\d+$/.test(v)) {
+      try {
+        const parsed = BigInt(v);
+        if (parsed < MIN_SAFE_INTEGER_BIGINT || parsed > MAX_SAFE_INTEGER_BIGINT) return v;
+        return Number(v);
+      } catch {
+        return v;
+      }
+    }
     if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
     return v;
   }
@@ -2916,4 +3231,3 @@ export class WalrusSqlClient {
     return v;
   }
 }
-

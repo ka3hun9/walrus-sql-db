@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
+import { decode as decodeMsgpack, encode as encodeMsgpack } from "@msgpack/msgpack";
+import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
 import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow } from "./types.js";
 
 type Payload =
@@ -40,6 +42,9 @@ type LogicOp = "AND" | "OR";
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 type ComparePredicate = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=";
 
+const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
 type WhereClause = {
   logic?: LogicOp;
   field: string;
@@ -60,6 +65,19 @@ type ReplayCache = {
   invalidPayloads: number;
 };
 
+export type ReplayCacheFormat = "json" | "msgpack" | "cbor";
+
+export type PersistedReplayCacheEntry = {
+  cursor: Cursor;
+  rows: SqlRow[];
+  seenDigests: string[];
+  initialized: boolean;
+  lastCommitHash: string;
+  invalidPayloads: number;
+};
+
+export type PersistedReplayCache = Record<string, PersistedReplayCacheEntry>;
+
 export interface ReplayQueryExecutorOptions {
   client: SuiClient;
   packageId: string;
@@ -68,6 +86,27 @@ export interface ReplayQueryExecutorOptions {
   autoDiscoverTables?: boolean;
   pageSize?: number;
   cacheFilePath?: string;
+  cacheFormat?: ReplayCacheFormat;
+}
+
+function inferReplayCacheFormat(path?: string): ReplayCacheFormat {
+  if (!path) return "json";
+  const p = path.toLowerCase();
+  if (p.endsWith(".msgpack") || p.endsWith(".mpack") || p.endsWith(".mpk")) return "msgpack";
+  if (p.endsWith(".cbor") || p.endsWith(".cb")) return "cbor";
+  return "json";
+}
+
+export function serializeReplayCache(data: PersistedReplayCache, format: ReplayCacheFormat): Uint8Array {
+  if (format === "msgpack") return encodeMsgpack(data);
+  if (format === "cbor") return encodeCbor(data);
+  return new TextEncoder().encode(JSON.stringify(data));
+}
+
+export function deserializeReplayCache(blob: Uint8Array, format: ReplayCacheFormat): PersistedReplayCache {
+  if (format === "msgpack") return decodeMsgpack(blob) as PersistedReplayCache;
+  if (format === "cbor") return decodeCbor(blob) as PersistedReplayCache;
+  return JSON.parse(new TextDecoder().decode(blob)) as PersistedReplayCache;
 }
 
 function trimQuoted(raw: string): string {
@@ -82,6 +121,15 @@ function castValue(raw: string): SqlPrimitive {
   if (v.toLowerCase() === "null") return null;
   if (v.toLowerCase() === "true") return true;
   if (v.toLowerCase() === "false") return false;
+  if (/^[+-]?\d+$/.test(v)) {
+    try {
+      const parsed = BigInt(v);
+      if (parsed < MIN_SAFE_INTEGER_BIGINT || parsed > MAX_SAFE_INTEGER_BIGINT) return v;
+      return Number(v);
+    } catch {
+      return v;
+    }
+  }
   if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
   return v;
 }
@@ -856,6 +904,7 @@ async function discoverTableId(options: ReplayQueryExecutorOptions, table: strin
 
 export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): OnchainQueryExecutor {
   const pageSize = options.pageSize ?? 50;
+  const cacheFormat = options.cacheFormat ?? inferReplayCacheFormat(options.cacheFilePath);
   const cacheByTableId = new Map<string, ReplayCache>();
   const discoveredRegistry = new Map<string, string>();
   let persistedLoaded = false;
@@ -867,18 +916,8 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
     if (!options.cacheFilePath) return;
 
     try {
-      const raw = await fs.readFile(options.cacheFilePath, "utf8");
-      const data = JSON.parse(raw) as Record<
-        string,
-        {
-          cursor: Cursor;
-          rows: SqlRow[];
-          seenDigests: string[];
-          initialized: boolean;
-          lastCommitHash: string;
-          invalidPayloads: number;
-        }
-      >;
+      const raw = await fs.readFile(options.cacheFilePath);
+      const data = deserializeReplayCache(raw, cacheFormat);
 
       for (const [tableId, cache] of Object.entries(data)) {
         cacheByTableId.set(tableId, {
@@ -898,17 +937,7 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
   async function persistCaches(): Promise<void> {
     if (!options.cacheFilePath) return;
 
-    const out: Record<
-      string,
-      {
-        cursor: Cursor;
-        rows: SqlRow[];
-        seenDigests: string[];
-        initialized: boolean;
-        lastCommitHash: string;
-        invalidPayloads: number;
-      }
-    > = {};
+    const out: PersistedReplayCache = {};
 
     for (const [tableId, cache] of cacheByTableId.entries()) {
       out[tableId] = {
@@ -922,7 +951,7 @@ export function createReplayQueryExecutor(options: ReplayQueryExecutorOptions): 
     }
 
     await fs.mkdir(dirname(options.cacheFilePath), { recursive: true });
-    await fs.writeFile(options.cacheFilePath, JSON.stringify(out, null, 2), "utf8");
+    await fs.writeFile(options.cacheFilePath, Buffer.from(serializeReplayCache(out, cacheFormat)));
   }
 
   function getCache(tableId: string): ReplayCache {
