@@ -36,6 +36,7 @@ export interface SqlRuntimeTypeMetadata {
   encoding?: "utf8" | "binary";
   finiteOnly?: boolean;
   arithmeticModel?: "ieee754-double";
+  format?: string;
 }
 
 export interface SqlRuntimeTypeModel {
@@ -109,7 +110,7 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   DATE: {
     family: "TEMPORAL",
     acceptsParameters: false,
-    metadata: {},
+    metadata: { format: "YYYY-MM-DD" },
   },
   TIME: {
     family: "TEMPORAL",

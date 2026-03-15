@@ -1211,8 +1211,10 @@ export class WalrusSqlClient {
     if (type.name === "DATE") {
       const s = String(value);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DATE: ${s}`);
-      const d = new Date(`${s}T00:00:00Z`);
-      if (Number.isNaN(d.getTime())) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DATE: ${s}`);
+      const d = new Date(`${s}T00:00:00.000Z`);
+      if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DATE: ${s}`);
+      }
       return s;
     }
     if (type.name === "TIME") {

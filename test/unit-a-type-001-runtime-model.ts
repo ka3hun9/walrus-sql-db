@@ -39,6 +39,9 @@ const varcharType = createRuntimeTypeModel(SqlRuntimeType.VARCHAR);
 assert.equal(varcharType.metadata.fixedLength, false);
 assert.equal(varcharType.metadata.lengthOverflowPolicy, "reject");
 
+const dateType = createRuntimeTypeModel(SqlRuntimeType.DATE);
+assert.equal(dateType.metadata.format, "YYYY-MM-DD");
+
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
 

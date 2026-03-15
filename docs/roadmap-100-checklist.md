@@ -19,7 +19,7 @@
 - [x] A-TYPE-007 DOUBLE：解析、精度行为与比较规则文档化
 - [x] A-TYPE-008 CHAR(n)：定长填充/截断策略与一致性测试
 - [x] A-TYPE-009 VARCHAR(n)：长度约束与边界测试
-- [ ] A-TYPE-010 DATE：格式与有效日期校验
+- [x] A-TYPE-010 DATE：格式与有效日期校验
 - [ ] A-TYPE-011 TIME：格式与有效时间校验
 - [ ] A-TYPE-012 TIMESTAMP：格式/时区策略/序列化一致性
 - [ ] A-TYPE-013 BOOLEAN：字面量与隐式转换边界
