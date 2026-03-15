@@ -17,11 +17,18 @@ export type ColumnSchema = {
   unique: boolean;
 };
 
+export type ForeignKeySpec = {
+  columns: string[];
+  refTable: string;
+  refColumns: string[];
+};
+
 export type TableSchema = {
   name: string;
   columns: ColumnSchema[];
   uniqueGroups?: string[][];
   primaryKeyGroup?: string[];
+  foreignKeys?: ForeignKeySpec[];
 };
 
 export type ConstraintIndexCostStats = {

@@ -25,6 +25,7 @@ import {
   type ColumnSchema,
   type ColumnTypeSpec,
   type ConstraintIndexCostStats,
+  type ForeignKeySpec,
   type SqlTypeName,
   type TableSchema,
 } from "./sql-catalog.js";
@@ -500,6 +501,13 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DROP TABLE")) {
       const table = this.extractTableName(normalized, /DROP TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      if (!this.tables.has(table) || !this.schemas.has(table)) {
+        throw sqlError("ERR_TABLE_NOT_FOUND", table);
+      }
+      const dropDependents = this.collectDropDependents(table);
+      if (dropDependents.length > 0) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP TABLE ${table}: referenced by ${dropDependents.join(", ")}`);
+      }
       this.tables.delete(table);
       this.schemas.delete(table);
       this.uniqueIndexes.delete(table);
@@ -1007,6 +1015,7 @@ export class WalrusSqlClient {
 
     const columns: ColumnSchema[] = [];
     const tableUniqueGroups: string[][] = [];
+    const foreignKeys: ForeignKeySpec[] = [];
     let primaryKeyGroup: string[] | undefined;
 
     for (const d of defs) {
@@ -1026,15 +1035,40 @@ export class WalrusSqlClient {
         continue;
       }
 
+      const fkMatch = d.match(/^FOREIGN\s+KEY\s*\((.+)\)\s+REFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)$/i);
+      if (fkMatch) {
+        const cols = this.splitTopLevelComma(fkMatch[1]!).map((x) => x.trim());
+        const refCols = this.splitTopLevelComma(fkMatch[3]!).map((x) => x.trim());
+        if (!cols.length || !refCols.length || cols.length !== refCols.length) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${d}`);
+        }
+        foreignKeys.push({
+          columns: cols,
+          refTable: fkMatch[2]!.trim(),
+          refColumns: refCols,
+        });
+        continue;
+      }
+
       const dm = d.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i);
       if (!dm) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid column definition: ${d}`);
       const colName = dm[1]!.trim();
       const type = this.parseSqlTypeSpec(dm[2]!);
-      const cons = dm[3]!.toUpperCase();
+      const consRaw = dm[3]!.trim();
+      const cons = consRaw.toUpperCase();
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
       columns.push({ name: colName, type, notNull, primaryKey, unique });
+
+      const colRefMatch = consRaw.match(/\bREFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)/i);
+      if (colRefMatch) {
+        foreignKeys.push({
+          columns: [colName],
+          refTable: colRefMatch[1]!.trim(),
+          refColumns: [colRefMatch[2]!.trim()],
+        });
+      }
     }
 
     const seen = new Set<string>();
@@ -1063,7 +1097,15 @@ export class WalrusSqlClient {
       }
     }
 
-    return { name: table, columns, uniqueGroups: tableUniqueGroups, primaryKeyGroup };
+    for (const fk of foreignKeys) {
+      for (const k of fk.columns) {
+        if (!colByUpper.has(k.toUpperCase())) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `FOREIGN KEY column not found: ${k}`);
+        }
+      }
+    }
+
+    return { name: table, columns, uniqueGroups: tableUniqueGroups, primaryKeyGroup, foreignKeys };
   }
 
   private applyAlterTable(sql: string): void {
@@ -1118,6 +1160,9 @@ export class WalrusSqlClient {
       schema.uniqueGroups = (schema.uniqueGroups ?? []).filter(
         (g) => !g.some((c) => c.toUpperCase() === column.toUpperCase()),
       );
+      schema.foreignKeys = (schema.foreignKeys ?? []).filter(
+        (fk) => !fk.columns.some((c) => c.toUpperCase() === column.toUpperCase()),
+      );
       this.uniqueGroupsCache.delete(table);
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
@@ -1127,6 +1172,19 @@ export class WalrusSqlClient {
     }
 
     throw sqlError("ERR_UNSUPPORTED_DDL", sql);
+  }
+
+  private collectDropDependents(table: string): string[] {
+    const target = table.toUpperCase();
+    const out = new Set<string>();
+    for (const [schemaName, schema] of this.schemas.entries()) {
+      if (schemaName.toUpperCase() === target) continue;
+      for (const fk of schema.foreignKeys ?? []) {
+        if (fk.refTable.toUpperCase() !== target) continue;
+        out.add(`${schemaName}(${fk.columns.join(",")})`);
+      }
+    }
+    return [...out.values()];
   }
 
   private coerceByType(type: ColumnTypeSpec, value: SqlPrimitive): SqlPrimitive {
