@@ -115,7 +115,7 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   TIME: {
     family: "TEMPORAL",
     acceptsParameters: false,
-    metadata: {},
+    metadata: { format: "HH:MM:SS" },
   },
   TIMESTAMP: {
     family: "TEMPORAL",

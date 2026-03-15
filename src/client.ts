@@ -1220,6 +1220,8 @@ export class WalrusSqlClient {
     if (type.name === "TIME") {
       const s = String(value);
       if (!/^\d{2}:\d{2}:\d{2}$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME: ${s}`);
+      const [hh, mm, ss] = s.split(":").map((x) => Number(x));
+      if (hh > 23 || mm > 59 || ss > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME: ${s}`);
       return s;
     }
     if (type.name === "TIMESTAMP") {
