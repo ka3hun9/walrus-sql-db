@@ -287,9 +287,6 @@ function parsePrimary(ts: TokenStream): ExprAst {
 }
 
 function parseUnary(ts: TokenStream): ExprAst {
-  if (ts.match("NOT")) {
-    return { kind: "unary", op: "NOT", expr: parseUnary(ts) };
-  }
   if (ts.match("-")) {
     return { kind: "unary", op: "-", expr: parseUnary(ts) };
   }
@@ -393,10 +390,17 @@ function parseCompare(ts: TokenStream): ExprAst {
   return left;
 }
 
+function parseNot(ts: TokenStream): ExprAst {
+  if (ts.match("NOT")) {
+    return { kind: "unary", op: "NOT", expr: parseNot(ts) };
+  }
+  return parseCompare(ts);
+}
+
 function parseAnd(ts: TokenStream): ExprAst {
-  let left = parseCompare(ts);
+  let left = parseNot(ts);
   while (ts.match("AND")) {
-    const right = parseCompare(ts);
+    const right = parseNot(ts);
     left = { kind: "binary", op: "AND", left, right };
   }
   return left;
