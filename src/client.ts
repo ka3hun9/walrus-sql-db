@@ -511,7 +511,7 @@ export class WalrusSqlClient {
       }
       const dropDependents = this.collectDropDependents(table);
       if (dropDependents.length > 0) {
-        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP TABLE ${table}: referenced by ${dropDependents.join(", ")}`);
+        throw constraintError("DDL_DEPENDENCY", `cannot DROP TABLE ${table}: referenced by ${dropDependents.join(", ")}`);
       }
       this.tables.delete(table);
       this.schemas.delete(table);
@@ -1226,11 +1226,11 @@ export class WalrusSqlClient {
         throw constraintError("PK_DROP", `cannot DROP primary key column: ${column}`);
       }
       if (schema.columns[idx]!.unique) {
-        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP UNIQUE column: ${column}`);
+        throw constraintError("UNIQUE_DROP", `cannot DROP UNIQUE column: ${column}`);
       }
       const uniqueGroup = (schema.uniqueGroups ?? []).find((g) => g.some((c) => c.toUpperCase() === column.toUpperCase()));
       if (uniqueGroup) {
-        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP column referenced by UNIQUE constraint: ${column}`);
+        throw constraintError("UNIQUE_DROP", `cannot DROP column referenced by UNIQUE constraint: ${column}`);
       }
 
       schema.columns.splice(idx, 1);

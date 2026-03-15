@@ -78,7 +78,7 @@
 - [x] F-CONST-001 PRIMARY KEY 自动索引创建与维护（增删改一致）
 - [x] F-CONST-002 UNIQUE 约束冲突检测（单列/组合）
 - [x] F-CONST-003 NOT NULL 约束在 DDL/DML 全路径生效
-- [ ] F-CONST-004 约束错误码体系统一（可机器解析）
+- [x] F-CONST-004 约束错误码体系统一（可机器解析）
 - [ ] F-CONST-005 解析错误/语义错误/执行错误分层且稳定
 - [ ] F-CONST-006 错误信息包含定位上下文（token/子句/字段）
 

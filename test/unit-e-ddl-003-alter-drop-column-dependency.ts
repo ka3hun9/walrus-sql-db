@@ -14,12 +14,12 @@ await assert.rejects(
 
 await assert.rejects(
   db.execute("ALTER TABLE users_dropc DROP COLUMN email"),
-  /ERR_UNSUPPORTED_DDL: cannot DROP UNIQUE column: email/,
+  /ERR_CONSTRAINT_VIOLATION:UNIQUE_DROP: cannot DROP UNIQUE column: email/,
 );
 
 await assert.rejects(
   db.execute("ALTER TABLE users_dropc DROP COLUMN grp_a"),
-  /ERR_UNSUPPORTED_DDL: cannot DROP column referenced by UNIQUE constraint: grp_a/,
+  /ERR_CONSTRAINT_VIOLATION:UNIQUE_DROP: cannot DROP column referenced by UNIQUE constraint: grp_a/,
 );
 
 await db.execute("ALTER TABLE users_dropc DROP COLUMN nick");

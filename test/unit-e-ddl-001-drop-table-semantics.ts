@@ -13,7 +13,7 @@ await db.execute("CREATE TABLE child_ddl1 (id INT PRIMARY KEY, parent_id INT REF
 
 await assert.rejects(
   db.execute("DROP TABLE parent_ddl1"),
-  /ERR_UNSUPPORTED_DDL: cannot DROP TABLE parent_ddl1: referenced by child_ddl1\(parent_id\)/,
+  /ERR_CONSTRAINT_VIOLATION:DDL_DEPENDENCY: cannot DROP TABLE parent_ddl1: referenced by child_ddl1\(parent_id\)/,
 );
 
 await db.execute("DROP TABLE child_ddl1");
