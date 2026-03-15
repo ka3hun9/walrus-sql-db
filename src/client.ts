@@ -2589,6 +2589,22 @@ export class WalrusSqlClient {
     return rows.map((r) => r[key] ?? null);
   }
 
+  private parseScalarSubqueryValue(subquerySql: string, outerRow?: SqlRow): SqlPrimitive {
+    const rows = this.parseSubquerySelect(subquerySql, outerRow);
+    if (!rows.length) return null;
+    if (rows.length > 1) {
+      throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Scalar subquery must return exactly 1 row: ${subquerySql}`);
+    }
+
+    const firstRow = rows[0]!;
+    const keys = Object.keys(firstRow);
+    if (keys.length !== 1) {
+      throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Scalar subquery must return exactly 1 column: ${subquerySql}`);
+    }
+    const key = keys[0]!;
+    return (firstRow[key] ?? null) as SqlPrimitive;
+  }
+
   private parseExistsSubquery(expr: string): { not: boolean; subquerySql: string } | null {
     const m = expr.match(/^(NOT\s+)?EXISTS\s*\((SELECT\s+.+)\)$/i);
     if (!m) return null;
@@ -3022,10 +3038,10 @@ export class WalrusSqlClient {
     }
 
     const right = clause.subquerySql
-      ? this.parseSubqueryValues(clause.subquerySql, undefined, row)[0] ?? null
+      ? this.parseScalarSubqueryValue(clause.subquerySql, row)
       : clause.valueExprs?.[0]
-        ? this.evalExpr(row, clause.valueExprs[0])
-        : clause.value;
+      ? this.evalExpr(row, clause.valueExprs[0])
+      : clause.value;
     switch (clause.op) {
       case "=":
       case "!=":
