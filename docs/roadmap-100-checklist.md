@@ -37,7 +37,7 @@
 - [x] B-PARSE-005 谓词 BETWEEN / NOT BETWEEN
 - [x] B-PARSE-006 谓词 LIKE / NOT LIKE（含 ESCAPE）
 - [x] B-PARSE-007 谓词 IN / NOT IN（值列表）
-- [ ] B-PARSE-008 谓词 IN / NOT IN（子查询）
+- [x] B-PARSE-008 谓词 IN / NOT IN（子查询）
 - [ ] B-PARSE-009 EXISTS / NOT EXISTS（相关/非相关）
 - [ ] B-PARSE-010 子查询比较（=, <>, >, >=, <, <= 与标量子查询）
 - [ ] B-PARSE-011 GROUP BY（单列/多列/表达式）
