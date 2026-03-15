@@ -1225,11 +1225,34 @@ export class WalrusSqlClient {
       return s;
     }
     if (type.name === "TIMESTAMP") {
-      const s = String(value);
-      if (!/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(s)) {
+      const s = String(value).trim();
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
+      if (!m) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
+
+      const datePart = m[1]!;
+      const timePart = m[2]!;
+      const zonePart = (m[3] ?? "Z").toUpperCase();
+
+      const dateCheck = new Date(`${datePart}T00:00:00.000Z`);
+      if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0, 10) !== datePart) {
         throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
       }
-      return s.replace(" ", "T");
+
+      const [hh, mm, ss] = timePart.split(":").map((x) => Number(x));
+      if (hh > 23 || mm > 59 || ss > 59) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
+      }
+
+      if (zonePart !== "Z") {
+        const [zh, zm] = zonePart.slice(1).split(":").map((x) => Number(x));
+        if (zh > 23 || zm > 59) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
+        }
+      }
+
+      const dt = new Date(`${datePart}T${timePart}${zonePart}`);
+      if (Number.isNaN(dt.getTime())) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
+      return `${dt.toISOString().slice(0, 19)}Z`;
     }
     if (type.name === "BLOB") {
       return String(value);

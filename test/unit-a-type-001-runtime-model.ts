@@ -45,6 +45,10 @@ assert.equal(dateType.metadata.format, "YYYY-MM-DD");
 const timeType = createRuntimeTypeModel(SqlRuntimeType.TIME);
 assert.equal(timeType.metadata.format, "HH:MM:SS");
 
+const timestampType = createRuntimeTypeModel(SqlRuntimeType.TIMESTAMP);
+assert.equal(timestampType.metadata.serializationFormat, "YYYY-MM-DDTHH:MM:SSZ");
+assert.equal(timestampType.metadata.timezonePolicy, "assume-utc-if-absent normalize-to-utc");
+
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
 

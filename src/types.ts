@@ -37,6 +37,8 @@ export interface SqlRuntimeTypeMetadata {
   finiteOnly?: boolean;
   arithmeticModel?: "ieee754-double";
   format?: string;
+  timezonePolicy?: string;
+  serializationFormat?: string;
 }
 
 export interface SqlRuntimeTypeModel {
@@ -120,7 +122,12 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   TIMESTAMP: {
     family: "TEMPORAL",
     acceptsParameters: false,
-    metadata: { hasTimeZone: false },
+    metadata: {
+      hasTimeZone: true,
+      format: "YYYY-MM-DD[ T]HH:MM:SS[Z|±HH:MM]",
+      timezonePolicy: "assume-utc-if-absent normalize-to-utc",
+      serializationFormat: "YYYY-MM-DDTHH:MM:SSZ",
+    },
   },
   BOOLEAN: {
     family: "BOOLEAN",
