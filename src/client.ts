@@ -1203,7 +1203,7 @@ export class WalrusSqlClient {
     }
     if (type.name === "BOOLEAN") {
       if (typeof value === "boolean") return value;
-      const v = String(value).toLowerCase();
+      const v = String(value).trim().toLowerCase();
       if (v === "true" || v === "1") return true;
       if (v === "false" || v === "0") return false;
       throw sqlError("ERR_TYPE_CONSTRAINT", `invalid BOOLEAN: ${String(value)}`);

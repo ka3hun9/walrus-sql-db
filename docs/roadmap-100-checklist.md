@@ -22,7 +22,7 @@
 - [x] A-TYPE-010 DATE：格式与有效日期校验
 - [x] A-TYPE-011 TIME：格式与有效时间校验
 - [x] A-TYPE-012 TIMESTAMP：格式/时区策略/序列化一致性
-- [ ] A-TYPE-013 BOOLEAN：字面量与隐式转换边界
+- [x] A-TYPE-013 BOOLEAN：字面量与隐式转换边界
 - [ ] A-TYPE-014 BLOB：二进制编码/解码与存储一致性
 - [ ] A-TYPE-015 NULL 语义统一（比较/谓词/聚合/排序中的行为）
 - [ ] A-TYPE-016 CAST/隐式转换矩阵（类型对类型）与冲突策略

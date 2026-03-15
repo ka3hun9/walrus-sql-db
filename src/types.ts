@@ -39,6 +39,7 @@ export interface SqlRuntimeTypeMetadata {
   format?: string;
   timezonePolicy?: string;
   serializationFormat?: string;
+  acceptedLiterals?: string[];
 }
 
 export interface SqlRuntimeTypeModel {
@@ -132,7 +133,7 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   BOOLEAN: {
     family: "BOOLEAN",
     acceptsParameters: false,
-    metadata: {},
+    metadata: { acceptedLiterals: ["true", "false", "1", "0"] },
   },
   BLOB: {
     family: "BINARY",

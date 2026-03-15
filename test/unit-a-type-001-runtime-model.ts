@@ -49,6 +49,9 @@ const timestampType = createRuntimeTypeModel(SqlRuntimeType.TIMESTAMP);
 assert.equal(timestampType.metadata.serializationFormat, "YYYY-MM-DDTHH:MM:SSZ");
 assert.equal(timestampType.metadata.timezonePolicy, "assume-utc-if-absent normalize-to-utc");
 
+const boolType = createRuntimeTypeModel(SqlRuntimeType.BOOLEAN);
+assert.deepEqual(boolType.metadata.acceptedLiterals, ["true", "false", "1", "0"]);
+
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
 
