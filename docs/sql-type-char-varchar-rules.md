@@ -4,3 +4,8 @@
 - Fixed-length storage: `CHAR(n)` values are right-padded with spaces to exactly `n` characters.
 - Overflow policy: input longer than `n` is rejected (`ERR_TYPE_CONSTRAINT`), not truncated.
 - Consistency rule: insert and update both use the same pad/reject behavior.
+
+## A-TYPE-009: VARCHAR(n)
+- Variable-length storage: `VARCHAR(n)` keeps original content and does not pad to `n`.
+- Overflow policy: input longer than `n` is rejected (`ERR_TYPE_CONSTRAINT`), not truncated.
+- Boundary rule: empty string and exactly-`n` strings are accepted.
