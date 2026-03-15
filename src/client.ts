@@ -1198,7 +1198,7 @@ export class WalrusSqlClient {
       if (notNull && rows.length > 0 && !defaultParsed.hasDefault) {
         throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL on non-empty table`);
       }
-      if (notNull && (defaultValue === null || defaultValue === undefined)) {
+      if (notNull && rows.length > 0 && (defaultValue === null || defaultValue === undefined)) {
         throw constraintError("NOT_NULL_ADD_COLUMN", `cannot ADD COLUMN ${column} NOT NULL with NULL DEFAULT`);
       }
 
