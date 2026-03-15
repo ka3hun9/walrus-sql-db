@@ -19,6 +19,7 @@ assert.equal(decimal.family, "NUMERIC");
 assert.equal(decimal.acceptsParameters, true);
 assert.equal(decimal.metadata.precision, 18);
 assert.equal(decimal.metadata.scale, 6);
+assert.equal(decimal.metadata.scaleOverflowPolicy, "reject");
 
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);

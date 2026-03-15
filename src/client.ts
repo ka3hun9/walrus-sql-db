@@ -1162,16 +1162,30 @@ export class WalrusSqlClient {
     }
     if (type.name === "DECIMAL") {
       const s = String(value).trim();
-      if (!/^-?\d+(?:\.\d+)?$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DECIMAL literal: ${s}`);
-      const [intPartRaw, fracPart = ""] = s.replace(/^-/, "").split(".");
-      const intPart = intPartRaw.replace(/^0+(?=\d)/, "");
-      const digits = (intPart + fracPart).length;
+      if (!/^[+-]?\d+(?:\.\d+)?$/.test(s)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid DECIMAL literal: ${s}`);
+      const sign = s.startsWith("-") ? "-" : "";
+      const [intPartRaw, fracPartRaw = ""] = s.replace(/^[+-]/, "").split(".");
+      const intPart = intPartRaw.replace(/^0+(?=\d)/, "") || "0";
+      const fracPart = fracPartRaw;
       const precision = type.precision ?? 0;
       const scale = type.scale ?? 0;
-      if (digits > precision || fracPart.length > scale) {
+      const maxIntegerDigits = precision - scale;
+
+      if (fracPart.length > scale) {
+        throw sqlError(
+          "ERR_TYPE_CONSTRAINT",
+          `DECIMAL(${precision},${scale}) scale overflow (rounding disabled): ${s}`,
+        );
+      }
+      if (intPart.length > maxIntegerDigits) {
         throw sqlError("ERR_TYPE_CONSTRAINT", `DECIMAL(${precision},${scale}) overflow: ${s}`);
       }
-      return Number(s);
+
+      if (scale === 0) return `${sign}${intPart}`;
+      const paddedFrac = fracPart.padEnd(scale, "0");
+      const isZero = intPart === "0" && /^0*$/.test(paddedFrac);
+      const normalizedSign = sign === "-" && !isZero ? "-" : "";
+      return `${normalizedSign}${intPart}.${paddedFrac}`;
     }
     if (type.name === "FLOAT" || type.name === "DOUBLE") {
       return toNum(value);

@@ -26,6 +26,7 @@ export interface SqlRuntimeTypeMetadata {
   max?: number | string;
   precision?: number;
   scale?: number;
+  scaleOverflowPolicy?: "reject" | "round";
   length?: number;
   fixedLength?: boolean;
   unsigned?: boolean;
@@ -73,7 +74,7 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   DECIMAL: {
     family: "NUMERIC",
     acceptsParameters: true,
-    metadata: { precision: 38, scale: 0 },
+    metadata: { precision: 38, scale: 0, scaleOverflowPolicy: "reject" },
   },
   FLOAT: {
     family: "NUMERIC",
