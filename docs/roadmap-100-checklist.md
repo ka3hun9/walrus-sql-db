@@ -51,7 +51,7 @@
 - [x] C-EXEC-001 FULL OUTER JOIN 语义执行正确（含空值补齐）
 - [x] C-EXEC-002 谓词 BETWEEN / LIKE / IN / EXISTS 执行语义全量一致
 - [x] C-EXEC-003 标量子查询执行（单行单列约束与错误处理）
-- [ ] C-EXEC-004 相关子查询执行（外层引用绑定正确）
+- [x] C-EXEC-004 相关子查询执行（外层引用绑定正确）
 - [ ] C-EXEC-005 GROUP BY + HAVING 与聚合组合场景全覆盖
 - [ ] C-EXEC-006 ORDER BY + LIMIT/OFFSET 在复杂查询中的稳定行为
 - [ ] C-EXEC-007 NULL 三值逻辑在过滤/连接/聚合中的一致实现
