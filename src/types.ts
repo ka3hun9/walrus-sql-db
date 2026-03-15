@@ -29,6 +29,8 @@ export interface SqlRuntimeTypeMetadata {
   scaleOverflowPolicy?: "reject" | "round";
   length?: number;
   fixedLength?: boolean;
+  lengthOverflowPolicy?: "reject" | "truncate";
+  padCharacter?: string;
   unsigned?: boolean;
   hasTimeZone?: boolean;
   encoding?: "utf8" | "binary";
@@ -91,12 +93,18 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   CHAR: {
     family: "CHARACTER",
     acceptsParameters: true,
-    metadata: { length: 1, fixedLength: true, encoding: "utf8" },
+    metadata: {
+      length: 1,
+      fixedLength: true,
+      lengthOverflowPolicy: "reject",
+      padCharacter: " ",
+      encoding: "utf8",
+    },
   },
   VARCHAR: {
     family: "CHARACTER",
     acceptsParameters: true,
-    metadata: { length: 255, fixedLength: false, encoding: "utf8" },
+    metadata: { length: 255, fixedLength: false, lengthOverflowPolicy: "reject", encoding: "utf8" },
   },
   DATE: {
     family: "TEMPORAL",

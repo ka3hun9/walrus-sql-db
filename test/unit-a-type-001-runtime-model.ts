@@ -30,6 +30,11 @@ assert.equal(double.metadata.precision, 53);
 assert.equal(double.metadata.finiteOnly, true);
 assert.equal(double.metadata.arithmeticModel, "ieee754-double");
 
+const charType = createRuntimeTypeModel(SqlRuntimeType.CHAR);
+assert.equal(charType.metadata.fixedLength, true);
+assert.equal(charType.metadata.lengthOverflowPolicy, "reject");
+assert.equal(charType.metadata.padCharacter, " ");
+
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
 

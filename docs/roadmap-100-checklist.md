@@ -17,7 +17,7 @@
 - [x] A-TYPE-005 DECIMAL(p,s)：精度/小数位约束、四舍五入/拒绝策略明确
 - [x] A-TYPE-006 FLOAT：解析、精度行为与比较规则文档化
 - [x] A-TYPE-007 DOUBLE：解析、精度行为与比较规则文档化
-- [ ] A-TYPE-008 CHAR(n)：定长填充/截断策略与一致性测试
+- [x] A-TYPE-008 CHAR(n)：定长填充/截断策略与一致性测试
 - [ ] A-TYPE-009 VARCHAR(n)：长度约束与边界测试
 - [ ] A-TYPE-010 DATE：格式与有效日期校验
 - [ ] A-TYPE-011 TIME：格式与有效时间校验
