@@ -49,7 +49,7 @@
 ## C. 执行器能力（查询语义）
 
 - [x] C-EXEC-001 FULL OUTER JOIN 语义执行正确（含空值补齐）
-- [ ] C-EXEC-002 谓词 BETWEEN / LIKE / IN / EXISTS 执行语义全量一致
+- [x] C-EXEC-002 谓词 BETWEEN / LIKE / IN / EXISTS 执行语义全量一致
 - [ ] C-EXEC-003 标量子查询执行（单行单列约束与错误处理）
 - [ ] C-EXEC-004 相关子查询执行（外层引用绑定正确）
 - [ ] C-EXEC-005 GROUP BY + HAVING 与聚合组合场景全覆盖
