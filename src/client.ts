@@ -1220,11 +1220,15 @@ export class WalrusSqlClient {
       if (this.isPrimaryKeyMember(schema, column)) {
         throw constraintError("PK_DROP", `cannot DROP primary key column: ${column}`);
       }
+      if (schema.columns[idx]!.unique) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP UNIQUE column: ${column}`);
+      }
+      const uniqueGroup = (schema.uniqueGroups ?? []).find((g) => g.some((c) => c.toUpperCase() === column.toUpperCase()));
+      if (uniqueGroup) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `cannot DROP column referenced by UNIQUE constraint: ${column}`);
+      }
 
       schema.columns.splice(idx, 1);
-      schema.uniqueGroups = (schema.uniqueGroups ?? []).filter(
-        (g) => !g.some((c) => c.toUpperCase() === column.toUpperCase()),
-      );
       schema.foreignKeys = (schema.foreignKeys ?? []).filter(
         (fk) => !fk.columns.some((c) => c.toUpperCase() === column.toUpperCase()),
       );

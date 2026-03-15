@@ -70,7 +70,7 @@
 
 - [x] E-DDL-001 DROP TABLE 完整语义（不存在表/依赖场景错误）
 - [x] E-DDL-002 ALTER TABLE ADD COLUMN（默认值/NOT NULL 冲突处理）
-- [ ] E-DDL-003 ALTER TABLE DROP COLUMN（主键/唯一索引依赖校验）
+- [x] E-DDL-003 ALTER TABLE DROP COLUMN（主键/唯一索引依赖校验）
 - [ ] E-DDL-004 DDL 后 schema 缓存/索引/元数据一致性
 
 ## F. 约束与错误系统
