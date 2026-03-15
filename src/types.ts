@@ -32,6 +32,8 @@ export interface SqlRuntimeTypeMetadata {
   unsigned?: boolean;
   hasTimeZone?: boolean;
   encoding?: "utf8" | "binary";
+  finiteOnly?: boolean;
+  arithmeticModel?: "ieee754-double";
 }
 
 export interface SqlRuntimeTypeModel {
@@ -79,12 +81,12 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
   FLOAT: {
     family: "NUMERIC",
     acceptsParameters: false,
-    metadata: { precision: 24 },
+    metadata: { precision: 24, finiteOnly: true, arithmeticModel: "ieee754-double" },
   },
   DOUBLE: {
     family: "NUMERIC",
     acceptsParameters: false,
-    metadata: { precision: 53 },
+    metadata: { precision: 53, finiteOnly: true, arithmeticModel: "ieee754-double" },
   },
   CHAR: {
     family: "CHARACTER",
