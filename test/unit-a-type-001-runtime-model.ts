@@ -25,6 +25,11 @@ const float = createRuntimeTypeModel(SqlRuntimeType.FLOAT);
 assert.equal(float.metadata.finiteOnly, true);
 assert.equal(float.metadata.arithmeticModel, "ieee754-double");
 
+const double = createRuntimeTypeModel(SqlRuntimeType.DOUBLE);
+assert.equal(double.metadata.precision, 53);
+assert.equal(double.metadata.finiteOnly, true);
+assert.equal(double.metadata.arithmeticModel, "ieee754-double");
+
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.DECIMAL, { precision: 4, scale: 5 }), /scale cannot exceed precision/);
 assert.throws(() => createRuntimeTypeModel(SqlRuntimeType.CHAR, { length: 0 }), /positive integer/);
 
