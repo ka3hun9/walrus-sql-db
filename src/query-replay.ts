@@ -836,7 +836,7 @@ function groupRows(
 }
 
 function joinRows(
-  joinType: "INNER" | "LEFT" | "RIGHT",
+  joinType: "INNER" | "LEFT" | "RIGHT" | "FULL",
   leftTable: string,
   leftRows: SqlRow[],
   rightTable: string,
@@ -844,6 +844,10 @@ function joinRows(
   leftFieldExpr: string,
   rightFieldExpr: string,
 ): SqlRow[] {
+  if (joinType === "FULL") {
+    throw new Error("ERR_UNSUPPORTED_SELECT: FULL OUTER JOIN execution is not implemented yet");
+  }
+
   if (joinType === "RIGHT") {
     return joinRows("LEFT", rightTable, rightRows, leftTable, leftRows, rightFieldExpr, leftFieldExpr);
   }

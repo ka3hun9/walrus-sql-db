@@ -464,13 +464,14 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
 
   while (true) {
     const jm = rest.match(
-      /^\s*(INNER|LEFT|RIGHT)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+      /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
     );
     if (!jm) break;
 
+    const joinType = (jm[1]?.toUpperCase() ?? "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
     joins.push({
       kind: "join",
-      joinType: jm[1]!.toUpperCase() as "INNER" | "LEFT" | "RIGHT",
+      joinType,
       table: jm[2]!,
       onLeft: jm[3]!,
       onRight: jm[4]!,

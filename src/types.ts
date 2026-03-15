@@ -419,13 +419,13 @@ export interface OnchainQueryRequest {
   having?: string;
   explain?: boolean;
   join?: {
-    type: "INNER" | "LEFT" | "RIGHT";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
     table: string;
     leftField: string;
     rightField: string;
   };
   joins?: Array<{
-    type: "INNER" | "LEFT" | "RIGHT";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
     table: string;
     leftField: string;
     rightField: string;

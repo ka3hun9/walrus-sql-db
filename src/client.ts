@@ -107,13 +107,13 @@ type ParsedSelect = {
   groupBy?: string[];
   having?: string;
   join?: {
-    type: "INNER" | "LEFT" | "RIGHT";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
     table: string;
     leftField: string;
     rightField: string;
   };
   joins?: Array<{
-    type: "INNER" | "LEFT" | "RIGHT";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
     table: string;
     leftField: string;
     rightField: string;
@@ -2040,6 +2040,10 @@ export class WalrusSqlClient {
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
   ): SqlRow[] {
+    if (join.type === "FULL") {
+      throw sqlError("ERR_UNSUPPORTED_SELECT", "FULL OUTER JOIN execution is not implemented yet");
+    }
+
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
       const syntheticJoin: NonNullable<ParsedSelect["join"]> = {

@@ -46,7 +46,7 @@ export type TableRefAst =
 
 export type JoinAst = {
   kind: "join";
-  joinType: "INNER" | "LEFT" | "RIGHT";
+  joinType: "INNER" | "LEFT" | "RIGHT" | "FULL";
   table: string;
   onLeft: string;
   onRight: string;
