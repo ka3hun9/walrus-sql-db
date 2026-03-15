@@ -36,7 +36,7 @@
 - [x] B-PARSE-004 WHERE：AND/OR/NOT 优先级与括号嵌套
 - [x] B-PARSE-005 谓词 BETWEEN / NOT BETWEEN
 - [x] B-PARSE-006 谓词 LIKE / NOT LIKE（含 ESCAPE）
-- [ ] B-PARSE-007 谓词 IN / NOT IN（值列表）
+- [x] B-PARSE-007 谓词 IN / NOT IN（值列表）
 - [ ] B-PARSE-008 谓词 IN / NOT IN（子查询）
 - [ ] B-PARSE-009 EXISTS / NOT EXISTS（相关/非相关）
 - [ ] B-PARSE-010 子查询比较（=, <>, >, >=, <, <= 与标量子查询）
