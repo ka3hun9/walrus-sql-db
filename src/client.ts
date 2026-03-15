@@ -610,11 +610,13 @@ export class WalrusSqlClient {
         const matched = mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE");
         if (!matched) continue;
 
+        // Validate/coerce and enforce constraints before mutating row or indexes.
         const next = this.applySchemaOnWrite(
           plan.table,
           { ...row, [targetSetField]: this.castValue(plan.setValue) },
           row,
         );
+        // Commit in deterministic order: drop old unique keys, mutate row, add new unique keys.
         this.removeRowFromUniqueIndexes(plan.table, row);
         Object.keys(row).forEach((k) => delete row[k]);
         Object.assign(row, next);
@@ -697,6 +699,7 @@ export class WalrusSqlClient {
         const mergedHits = joinedRows.get(row);
         const matched = mergedHits ? mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE") : false;
         if (matched) {
+          // Keep unique indexes in sync before dropping the row from the table snapshot.
           this.removeRowFromUniqueIndexes(plan.table, row);
           touched++;
         } else {
