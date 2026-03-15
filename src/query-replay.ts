@@ -717,11 +717,26 @@ function applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; directi
   if (!orderByList?.length) return rows;
   return [...rows].sort((a, b) => {
     for (const { field, direction } of orderByList) {
-      const cmp = compare(a[field], b[field]);
-      if (cmp !== 0) return direction === "DESC" ? -cmp : cmp;
+      const cmp = compareForOrder(a[field], b[field], direction);
+      if (cmp !== 0) return cmp;
     }
     return 0;
   });
+}
+
+function compareForOrder(
+  a: SqlPrimitive | undefined,
+  b: SqlPrimitive | undefined,
+  direction: "ASC" | "DESC",
+): number {
+  const aNull = a === null || a === undefined;
+  const bNull = b === null || b === undefined;
+  if (aNull && bNull) return 0;
+  if (aNull) return 1;
+  if (bNull) return -1;
+
+  const base = compare(a, b);
+  return direction === "DESC" ? -base : base;
 }
 
 function applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
@@ -736,16 +751,23 @@ function computeAggregateRow(
   aggregateField?: string,
 ): SqlRow {
   if (aggregate === "COUNT") {
-    return { count: rows.length };
+    if (!aggregateField || aggregateField === "*") return { count: rows.length };
+    return {
+      count: rows.filter((r) => r[aggregateField] !== null && r[aggregateField] !== undefined).length,
+    };
   }
 
   if (!aggregateField || aggregateField === "*") {
     throw new Error(`${aggregate} requires a numeric field`);
   }
 
-  const nums = rows.map((r) => Number(r[aggregateField])).filter((n) => Number.isFinite(n));
-  if (aggregate === "SUM") return { sum: nums.reduce((a, b) => a + b, 0) };
-  if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0 };
+  const nums = rows
+    .map((r) => r[aggregateField])
+    .filter((v) => v !== null && v !== undefined)
+    .map((v) => Number(v))
+    .filter((n) => Number.isFinite(n));
+  if (aggregate === "SUM") return { sum: nums.length ? nums.reduce((a, b) => a + b, 0) : null };
+  if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null };
   if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
   return { max: nums.length ? Math.max(...nums) : null };
 }

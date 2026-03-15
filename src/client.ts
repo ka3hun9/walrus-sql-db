@@ -1662,6 +1662,7 @@ export class WalrusSqlClient {
   private isAllowedRawExpr(sql: string): boolean {
     const s = sql.trim();
     if (!s) return false;
+    if (s === "*") return true;
 
     // currently supported raw expression buckets in evaluator path
     if (/\bOVER\s*\(/i.test(s)) return true; // window expressions in select list
@@ -3168,7 +3169,10 @@ export class WalrusSqlClient {
     aggregateField?: string,
   ): SqlRow {
     if (aggregate === "COUNT") {
-      return { count: rows.length };
+      if (!aggregateField || aggregateField === "*") return { count: rows.length };
+      return {
+        count: rows.filter((r) => r[aggregateField] !== null && r[aggregateField] !== undefined).length,
+      };
     }
 
     if (!aggregateField || aggregateField === "*") {
@@ -3181,8 +3185,8 @@ export class WalrusSqlClient {
       .map((v) => Number(v))
       .filter((n) => Number.isFinite(n));
 
-    if (aggregate === "SUM") return { sum: nums.reduce((a, b) => a + b, 0) };
-    if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0 };
+    if (aggregate === "SUM") return { sum: nums.length ? nums.reduce((a, b) => a + b, 0) : null };
+    if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null };
     if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
     return { max: nums.length ? Math.max(...nums) : null };
   }
