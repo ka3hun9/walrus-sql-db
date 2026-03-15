@@ -238,6 +238,15 @@ export function deserializeReplayCache(blob: Uint8Array, format: ReplayCacheForm
   return decodePersistedReplayCache(JSON.parse(new TextDecoder().decode(blob)));
 }
 
+export function transcodeReplayCache(
+  blob: Uint8Array,
+  from: ReplayCacheFormat,
+  to: ReplayCacheFormat,
+): Uint8Array {
+  const decoded = deserializeReplayCache(blob, from);
+  return serializeReplayCache(decoded, to);
+}
+
 function trimQuoted(raw: string): string {
   if ((raw.startsWith("'") && raw.endsWith("'")) || (raw.startsWith('"') && raw.endsWith('"'))) {
     return raw.slice(1, -1);
