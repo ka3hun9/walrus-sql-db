@@ -468,7 +468,7 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
 
   while (true) {
     const jm = rest.match(
-      /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
+      /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
     );
     if (!jm) break;
 
@@ -477,11 +477,11 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
       kind: "join",
       joinType,
       table: jm[2]!,
-      onLeft: jm[3]!,
-      onRight: jm[4]!,
+      onLeft: jm[4]!,
+      onRight: jm[5]!,
     });
 
-    rest = jm[5] ?? "";
+    rest = jm[6] ?? "";
   }
 
   return { joins, rest };
@@ -770,6 +770,13 @@ export function parseSqlToAst(
   const limitFromLimit = tm[5] ? Number(tm[5]) : undefined;
   const offset = tm[6] ? Number(tm[6]) : undefined;
   const limitFromFetch = tm[8] ? Number(tm[8]) : undefined;
+
+  if (orderBy && /\bWHERE\b/i.test(orderBy)) {
+    throw createSqlError("SQL_SYNTAX_INVALID_CLAUSE_ORDER", {
+      message: "WHERE cannot appear after ORDER BY",
+      hint: "Expected order: WHERE -> GROUP BY -> HAVING -> ORDER BY -> LIMIT -> OFFSET",
+    });
+  }
 
   if (hasFetchToken && !tm[8]) {
     throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
