@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const SQL_RUNTIME_TYPE_CANONICAL_NAMES = [
   "NULL",
   "SMALLINT",
@@ -1048,9 +1050,11 @@ export const typedValueOperators: SqlTypedValueOperators = Object.freeze({
   not: typedValueNot,
 });
 
+export type SessionTransactionState = "idle" | "active" | "committing" | "aborted";
+
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "UNKNOWN";
+  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "UNKNOWN";
   affectedRows?: number;
   tableObjectId?: string;
   raw?: unknown;
@@ -1089,6 +1093,124 @@ export interface StorageWriteEvent {
   affectedRows: number;
   mode: "simulator" | "onchain";
   at: number;
+}
+
+export type TransactionLogWriteOperation = "INSERT" | "UPDATE" | "DELETE";
+
+export interface TransactionLogWriteEntry {
+  table: string;
+  op: TransactionLogWriteOperation;
+  key: Record<string, SqlPrimitive>;
+  preImage: SqlRow | null;
+  postImage: SqlRow | null;
+}
+
+export interface TransactionLogRecordPayload {
+  txnId: string;
+  writeSet: TransactionLogWriteEntry[];
+  at: number;
+}
+
+export interface TransactionLogRecord extends TransactionLogRecordPayload {
+  checksum: string;
+}
+
+function stableSerializeJson(value: unknown): string {
+  if (value === null) return "null";
+
+  const valueType = typeof value;
+  if (valueType === "string" || valueType === "number" || valueType === "boolean") {
+    return JSON.stringify(value);
+  }
+
+  if (valueType !== "object") return "null";
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => (item === undefined ? "null" : stableSerializeJson(item))).join(",")}]`;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((key) => obj[key] !== undefined)
+    .sort();
+  const pairs = keys.map((key) => `${JSON.stringify(key)}:${stableSerializeJson(obj[key])}`);
+  return `{${pairs.join(",")}}`;
+}
+
+function sanitizeRow(row: SqlRow | null): SqlRow | null {
+  if (row === null) return null;
+  const out: SqlRow = {};
+  for (const [key, value] of Object.entries(row)) out[key] = value;
+  return out;
+}
+
+function sanitizeWriteKey(key: Record<string, SqlPrimitive>): Record<string, SqlPrimitive> {
+  const out: Record<string, SqlPrimitive> = {};
+  for (const [name, value] of Object.entries(key)) out[name] = value;
+  return out;
+}
+
+function normalizeWriteSetEntry(entry: TransactionLogWriteEntry): TransactionLogWriteEntry {
+  if (!entry.table?.trim()) throw new TypeError("transaction log write entry table must be non-empty");
+  if (!entry.op) throw new TypeError("transaction log write entry op is required");
+  if (!entry.key || typeof entry.key !== "object") throw new TypeError("transaction log write entry key must be an object");
+
+  const preImage = sanitizeRow(entry.preImage);
+  const postImage = sanitizeRow(entry.postImage);
+
+  if (entry.op === "INSERT" && preImage !== null) {
+    throw new TypeError("transaction log INSERT entry must use preImage=null");
+  }
+  if (entry.op === "INSERT" && postImage === null) {
+    throw new TypeError("transaction log INSERT entry must include postImage");
+  }
+  if (entry.op === "DELETE" && postImage !== null) {
+    throw new TypeError("transaction log DELETE entry must use postImage=null");
+  }
+  if (entry.op === "DELETE" && preImage === null) {
+    throw new TypeError("transaction log DELETE entry must include preImage");
+  }
+  if (entry.op === "UPDATE" && (preImage === null || postImage === null)) {
+    throw new TypeError("transaction log UPDATE entry must include both preImage and postImage");
+  }
+
+  return {
+    table: entry.table,
+    op: entry.op,
+    key: sanitizeWriteKey(entry.key),
+    preImage,
+    postImage,
+  };
+}
+
+function normalizeTransactionLogPayload(payload: TransactionLogRecordPayload): TransactionLogRecordPayload {
+  const txnId = payload.txnId?.trim();
+  if (!txnId) throw new TypeError("transaction log txnId must be non-empty");
+  if (!Array.isArray(payload.writeSet)) throw new TypeError("transaction log writeSet must be an array");
+  if (!Number.isFinite(payload.at)) throw new TypeError("transaction log at must be a finite number");
+
+  return {
+    txnId,
+    writeSet: payload.writeSet.map((entry) => normalizeWriteSetEntry(entry)),
+    at: payload.at,
+  };
+}
+
+export function computeTransactionLogChecksum(payload: TransactionLogRecordPayload): string {
+  const normalized = normalizeTransactionLogPayload(payload);
+  return createHash("sha256").update(stableSerializeJson(normalized)).digest("hex");
+}
+
+export function createTransactionLogRecord(payload: TransactionLogRecordPayload): TransactionLogRecord {
+  const normalized = normalizeTransactionLogPayload(payload);
+  return {
+    ...normalized,
+    checksum: computeTransactionLogChecksum(normalized),
+  };
+}
+
+export function verifyTransactionLogRecordChecksum(record: TransactionLogRecord): boolean {
+  return record.checksum === computeTransactionLogChecksum(record);
 }
 
 export interface OnchainQueryRequest {
