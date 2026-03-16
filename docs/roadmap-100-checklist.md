@@ -153,7 +153,7 @@
 - [x] K-TVAL-018 replay/cache/index 的键和值统一 TypedValue 编解码
 
 ### K6. 工程化与可观测
-- [ ] K-TVAL-019 日志与调试输出支持 TypedValue 可读格式（含类型标签）
+- [x] K-TVAL-019 日志与调试输出支持 TypedValue 可读格式（含类型标签）
 - [ ] K-TVAL-020 性能回归守门：TypedValue 引入后关键查询/写入开销在阈值内
 - [ ] K-TVAL-021 Feature flag 迁移开关移除（最终仅保留 TypedValue 路径）
 

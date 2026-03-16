@@ -908,7 +908,14 @@ export class WalrusSqlClient {
         normalizedSql,
         paged.map((row) => this.pickFields(row, parsed.fields)),
       );
-      this.logger.debug("query success", { sql: normalized, rows: result.rows.length });
+      const successMeta: Record<string, unknown> = {
+        sql: normalized,
+        rows: result.rows.length,
+      };
+      if (this.logger.level === "debug" && result.rows[0]) {
+        successMeta.firstRowTyped = this.toTypedLogRow(result.rows[0], "debug.query.firstRow");
+      }
+      this.logger.debug("query success", successMeta);
       return result;
     } catch (err) {
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
@@ -1335,6 +1342,14 @@ export class WalrusSqlClient {
     return `typedValue={type=${value.type},value=${valueText},source=${value.metadata.source}${context}}`;
   }
 
+  private toTypedLogRow(row: SqlRow, sourceContext: string): Record<string, SqlTypedValue> {
+    const out: Record<string, SqlTypedValue> = {};
+    for (const [column, raw] of Object.entries(row)) {
+      out[column] = fromStorage((raw ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.${column}`);
+    }
+    return out;
+  }
+
   private runtimeTypeMetadataFromColumnType(type: ColumnTypeSpec): Partial<SqlRuntimeTypeMetadata> {
     if (type.name === "DECIMAL") {
       return {
@@ -1586,6 +1601,14 @@ export class WalrusSqlClient {
 
       const coerced = this.coerceByType(c.type, bound, `dml.coerce:${table}.${c.name}`);
       const coercedTyped = fromStorage((coerced ?? null) as SqlPrimitive, undefined, {}, `constraint.value:${table}.${c.name}`);
+      if (this.logger.level === "debug") {
+        this.logger.debug("write coercion", {
+          table,
+          column: c.name,
+          inputTyped: bound,
+          outputTyped: coercedTyped,
+        });
+      }
       if ((c.notNull || c.primaryKey) && (coercedTyped.value === null || coercedTyped.value === undefined)) {
         const snapshot = this.formatTypedValueSnapshot(coercedTyped);
         throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL (${snapshot})`, {
