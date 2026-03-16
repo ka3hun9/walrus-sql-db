@@ -39,6 +39,12 @@
 - READ COMMITTED intentionally allows non-repeatable reads.
 - Verified scenario:
   - Session A opens transaction and reads row value `v1`
-  - Session B commits an update to the same row
+- Session B commits an update to the same row
   - Session A re-reads inside same transaction and sees `v2 != v1`
 - Covered by `test/unit-c-exec-017-non-repeatable-read-rc.ts`.
+
+## P2-ISO-006: Conflict Error Standardization
+- Concurrent write conflicts are normalized to:
+  - `ERR_CONSTRAINT_VIOLATION:WRITE_CONFLICT`
+  - context includes `clause=COMMIT` and row-key token
+- Covered by `test/unit-c-exec-018-write-conflict-error-standardization.ts`.
