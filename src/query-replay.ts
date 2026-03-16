@@ -4,8 +4,15 @@ import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
 import { decode as decodeMsgpack, encode as encodeMsgpack } from "@msgpack/msgpack";
 import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
-import { convertTypedValue, fromJs, normalizeRuntimeTypeName } from "./types.js";
-import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow } from "./types.js";
+import {
+  convertTypedValue,
+  deserializeTypedValue,
+  fromJs,
+  fromStorage,
+  normalizeRuntimeTypeName,
+  serializeTypedValue,
+} from "./types.js";
+import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SerializedTypedValue, SqlPrimitive, SqlRow } from "./types.js";
 
 type Payload =
   | {
@@ -87,7 +94,7 @@ type EncodedSqlPrimitive =
   | { kind: "number"; value: string }
   | { kind: "string"; value: string };
 
-type EncodedSqlRow = Record<string, EncodedSqlPrimitive>;
+type EncodedSqlRow = Record<string, EncodedSqlPrimitive | SerializedTypedValue>;
 
 type PersistedReplayCacheEntryEncoded = Omit<PersistedReplayCacheEntry, "rows"> & {
   rows: EncodedSqlRow[];
@@ -96,6 +103,12 @@ type PersistedReplayCacheEntryEncoded = Omit<PersistedReplayCacheEntry, "rows"> 
 type PersistedReplayCacheEnvelope = {
   version: 1;
   encoding: "sql-primitive-v1";
+  entries: Record<string, PersistedReplayCacheEntryEncoded>;
+};
+
+type PersistedReplayCacheEnvelopeV2 = {
+  version: 2;
+  encoding: "typed-value-v1";
   entries: Record<string, PersistedReplayCacheEntryEncoded>;
 };
 
@@ -146,7 +159,7 @@ function decodeSqlPrimitive(value: unknown): SqlPrimitive {
 function encodeSqlRow(row: SqlRow): EncodedSqlRow {
   const out: EncodedSqlRow = {};
   for (const [k, v] of Object.entries(row)) {
-    out[k] = encodeSqlPrimitive(v ?? null);
+    out[k] = serializeTypedValue(fromStorage((v ?? null) as SqlPrimitive, undefined, {}, `replay.cache.encode:${k}`));
   }
   return out;
 }
@@ -154,12 +167,20 @@ function encodeSqlRow(row: SqlRow): EncodedSqlRow {
 function decodeSqlRow(row: Record<string, unknown>): SqlRow {
   const out: SqlRow = {};
   for (const [k, v] of Object.entries(row)) {
+    if (v && typeof v === "object" && "type" in (v as Record<string, unknown>)) {
+      try {
+        out[k] = deserializeTypedValue(v as SerializedTypedValue).value;
+        continue;
+      } catch {
+        // Fallback to primitive decoder for malformed cells.
+      }
+    }
     out[k] = decodeSqlPrimitive(v);
   }
   return out;
 }
 
-function encodePersistedReplayCache(data: PersistedReplayCache): PersistedReplayCacheEnvelope {
+function encodePersistedReplayCache(data: PersistedReplayCache): PersistedReplayCacheEnvelopeV2 {
   const entries: Record<string, PersistedReplayCacheEntryEncoded> = {};
   for (const [tableId, entry] of Object.entries(data)) {
     entries[tableId] = {
@@ -171,10 +192,33 @@ function encodePersistedReplayCache(data: PersistedReplayCache): PersistedReplay
       invalidPayloads: entry.invalidPayloads,
     };
   }
-  return { version: 1, encoding: "sql-primitive-v1", entries };
+  return { version: 2, encoding: "typed-value-v1", entries };
 }
 
 function decodePersistedReplayCache(payload: unknown): PersistedReplayCache {
+  if (
+    payload
+    && typeof payload === "object"
+    && (payload as Record<string, unknown>).version === 2
+    && (payload as Record<string, unknown>).encoding === "typed-value-v1"
+    && typeof (payload as Record<string, unknown>).entries === "object"
+    && (payload as Record<string, unknown>).entries !== null
+  ) {
+    const entries = (payload as PersistedReplayCacheEnvelopeV2).entries;
+    const out: PersistedReplayCache = {};
+    for (const [tableId, entry] of Object.entries(entries)) {
+      out[tableId] = {
+        cursor: entry.cursor,
+        rows: entry.rows.map((row) => decodeSqlRow(row as Record<string, unknown>)),
+        seenDigests: [...entry.seenDigests],
+        initialized: entry.initialized,
+        lastCommitHash: entry.lastCommitHash,
+        invalidPayloads: entry.invalidPayloads,
+      };
+    }
+    return out;
+  }
+
   if (
     payload
     && typeof payload === "object"
@@ -937,7 +981,7 @@ function groupRows(
 ): SqlRow[] {
   const buckets = new Map<string, SqlRow[]>();
   for (const row of rows) {
-    const key = groupBy.map((g) => String(row[g])).join("||");
+    const key = groupBy.map((g) => encodeReplayTypedKey(row[g] as SqlPrimitive | undefined, `replay.group:${g}`)).join("||");
     const bucket = buckets.get(key) ?? [];
     bucket.push(row);
     buckets.set(key, bucket);
@@ -977,8 +1021,7 @@ function joinRows(
       const r = rightRows[ri]!;
       const leftVal = l[leftField];
       const rightVal = r[rightField];
-      if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
-      if (String(leftVal) !== String(rightVal)) continue;
+      if (!replayKeyEqual(leftVal, rightVal)) continue;
       matched = true;
       matchedRightIndexes.add(ri);
       const merged: SqlRow = {};
@@ -1051,17 +1094,32 @@ function verifyPayloadChain(payload: Payload, expectedPreviousHash: string): boo
   return expectedCurrent === payload.currentCommitHash;
 }
 
+function encodeReplayTypedKey(value: SqlPrimitive | undefined, sourceContext: string): string {
+  const typed = fromStorage((value ?? null) as SqlPrimitive, undefined, {}, sourceContext);
+  return JSON.stringify({ type: typed.type, value: typed.value });
+}
+
+function replayKeyEqual(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined): boolean {
+  if (left === null || left === undefined || right === null || right === undefined) return false;
+  return (
+    encodeReplayTypedKey(left, "replay.key.left")
+    === encodeReplayTypedKey(right, "replay.key.right")
+  );
+}
+
 function applyPayload(rows: SqlRow[], payload: Payload): SqlRow[] {
   if (payload.op === "INSERT") return [...rows, { ...payload.row }];
 
   if (payload.op === "UPDATE") {
+    const whereValue = castValue(payload.where.value);
     return rows.map((row) => {
-      if (String(row[payload.where.field]) !== payload.where.value) return row;
+      if (!replayKeyEqual(row[payload.where.field] as SqlPrimitive | undefined, whereValue)) return row;
       return { ...row, ...payload.set };
     });
   }
 
-  return rows.filter((row) => String(row[payload.where.field]) !== payload.where.value);
+  const whereValue = castValue(payload.where.value);
+  return rows.filter((row) => !replayKeyEqual(row[payload.where.field] as SqlPrimitive | undefined, whereValue));
 }
 
 export function replayPayloadsIncremental(

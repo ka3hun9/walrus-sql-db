@@ -150,7 +150,7 @@
 ### K5. 存储与序列化
 - [x] K-TVAL-016 TypedValue 序列化协议（含版本）定义并落地
 - [x] K-TVAL-017 反序列化与旧格式兼容读取（向后兼容迁移）
-- [ ] K-TVAL-018 replay/cache/index 的键和值统一 TypedValue 编解码
+- [x] K-TVAL-018 replay/cache/index 的键和值统一 TypedValue 编解码
 
 ### K6. 工程化与可观测
 - [ ] K-TVAL-019 日志与调试输出支持 TypedValue 可读格式（含类型标签）
