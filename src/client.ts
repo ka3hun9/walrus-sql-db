@@ -1,6 +1,15 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
-import { convertTypedValue, encodeBlob, fromJs, fromLiteral, fromStorage, normalizeRuntimeTypeName } from "./types.js";
+import {
+  convertTypedValue,
+  encodeBlob,
+  fromJs,
+  fromLiteral,
+  fromStorage,
+  normalizeRuntimeTypeName,
+  SqlRuntimeType,
+  typedValueComparator,
+} from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
@@ -3145,24 +3154,52 @@ export class WalrusSqlClient {
   }
 
   private compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
-    if (left == null || right == null) return "UNKNOWN";
+    const toTruthValue = (value: boolean | null): TruthValue => {
+      if (value === null) return "UNKNOWN";
+      return value ? "TRUE" : "FALSE";
+    };
 
-    switch (op) {
-      case "=":
-        return this.eq(left, right) ? "TRUE" : "FALSE";
-      case "!=":
-      case "<>":
-        return this.eq(left, right) ? "FALSE" : "TRUE";
-      case ">":
-        return this.compare(left, right) > 0 ? "TRUE" : "FALSE";
-      case "<":
-        return this.compare(left, right) < 0 ? "TRUE" : "FALSE";
-      case ">=":
-        return this.compare(left, right) >= 0 ? "TRUE" : "FALSE";
-      case "<=":
-        return this.compare(left, right) <= 0 ? "TRUE" : "FALSE";
-      default:
-        return "FALSE";
+    try {
+      const leftTyped = fromStorage((left ?? null) as SqlPrimitive, undefined, {}, `predicate.compare.left:${op}`);
+      const rightTyped = fromJs((right ?? null) as SqlPrimitive, undefined, {}, `predicate.compare.right:${op}`);
+      switch (op) {
+        case "=":
+          return toTruthValue(typedValueComparator.eq(leftTyped, rightTyped));
+        case "!=":
+        case "<>": {
+          const eq = typedValueComparator.eq(leftTyped, rightTyped);
+          return toTruthValue(eq === null ? null : !eq);
+        }
+        case ">":
+          return toTruthValue(typedValueComparator.gt(leftTyped, rightTyped));
+        case "<":
+          return toTruthValue(typedValueComparator.lt(leftTyped, rightTyped));
+        case ">=":
+          return toTruthValue(typedValueComparator.gte(leftTyped, rightTyped));
+        case "<=":
+          return toTruthValue(typedValueComparator.lte(leftTyped, rightTyped));
+        default:
+          return "FALSE";
+      }
+    } catch {
+      if (left == null || right == null) return "UNKNOWN";
+      switch (op) {
+        case "=":
+          return this.eq(left, right) ? "TRUE" : "FALSE";
+        case "!=":
+        case "<>":
+          return this.eq(left, right) ? "FALSE" : "TRUE";
+        case ">":
+          return this.compare(left, right) > 0 ? "TRUE" : "FALSE";
+        case "<":
+          return this.compare(left, right) < 0 ? "TRUE" : "FALSE";
+        case ">=":
+          return this.compare(left, right) >= 0 ? "TRUE" : "FALSE";
+        case "<=":
+          return this.compare(left, right) <= 0 ? "TRUE" : "FALSE";
+        default:
+          return "FALSE";
+      }
     }
   }
 
@@ -3340,10 +3377,27 @@ export class WalrusSqlClient {
       case "LIKE":
       case "NOT_LIKE": {
         if (left == null || right == null) return "UNKNOWN";
-        const regex = this.likeToRegex(String(right ?? ""), clause.likeEscape);
-        const matched = new RegExp(regex, "i").test(String(left ?? ""));
-        const tv: TruthValue = matched ? "TRUE" : "FALSE";
-        return clause.op === "LIKE" ? tv : this.tvNot(tv);
+        try {
+          const leftTyped = convertTypedValue(
+            fromStorage((left ?? null) as SqlPrimitive, undefined, {}, "predicate.like.left"),
+            SqlRuntimeType.TEXT,
+            { mode: "explicit", sourceContext: "predicate.like.left" },
+          );
+          const rightTyped = convertTypedValue(
+            fromJs((right ?? null) as SqlPrimitive, undefined, {}, "predicate.like.right"),
+            SqlRuntimeType.TEXT,
+            { mode: "explicit", sourceContext: "predicate.like.right" },
+          );
+          const regex = this.likeToRegex(String(rightTyped.value ?? ""), clause.likeEscape);
+          const matched = new RegExp(regex, "i").test(String(leftTyped.value ?? ""));
+          const tv: TruthValue = matched ? "TRUE" : "FALSE";
+          return clause.op === "LIKE" ? tv : this.tvNot(tv);
+        } catch {
+          const regex = this.likeToRegex(String(right ?? ""), clause.likeEscape);
+          const matched = new RegExp(regex, "i").test(String(left ?? ""));
+          const tv: TruthValue = matched ? "TRUE" : "FALSE";
+          return clause.op === "LIKE" ? tv : this.tvNot(tv);
+        }
       }
       case "IS_NULL":
         return left === null || left === undefined ? "TRUE" : "FALSE";
