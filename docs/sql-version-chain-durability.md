@@ -35,3 +35,13 @@
 - It executes query against a snapshot sourced from each table's latest committed version object.
 - This path ignores caller's uncommitted staged writes and returns deterministic latest-commit results.
 - Covered by `test/unit-g-stor-014-query-latest-committed-version.ts`.
+
+## P2-DUR-005: Pending/Confirmed Consistent Read
+- Version objects include `confirmationStatus: pending | confirmed`.
+- Confirmation APIs/read strategies:
+  - `confirmVersionObject(table, version?)`
+  - `queryByConfirmation(sql, visibility)` where visibility is `pending` or `confirmed`
+- Read semantics:
+  - `pending`: latest submitted version (may be unconfirmed)
+  - `confirmed`: latest confirmed version only
+- Covered by `test/unit-g-stor-015-pending-confirmed-read-strategy.ts`.

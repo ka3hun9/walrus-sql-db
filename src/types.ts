@@ -1144,6 +1144,7 @@ export interface VersionedStorageObject {
   currentVersion: number;
   commitDigest: string;
   createdAt: number;
+  confirmationStatus: "pending" | "confirmed";
   immutable: true;
   rows: ReadonlyArray<Readonly<SqlRow>>;
 }

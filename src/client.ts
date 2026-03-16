@@ -729,6 +729,7 @@ export class WalrusSqlClient {
       currentVersion,
       commitDigest,
       createdAt,
+      confirmationStatus: this.opts.transactionCommitExecutor ? "pending" as const : "confirmed" as const,
       immutable: true as const,
       rows: immutableRows,
     }) as VersionedStorageObject;
@@ -749,15 +750,38 @@ export class WalrusSqlClient {
     return out;
   }
 
-  private buildLatestCommittedSnapshotTables(): Map<string, SqlRow[]> {
+  confirmVersionObject(table: string, version?: number): VersionedStorageObject | null {
+    const history = this.tableVersionObjects.get(table);
+    if (!history || history.length === 0) return null;
+    const targetVersion = version ?? history[history.length - 1]!.currentVersion;
+    const idx = history.findIndex((object) => object.currentVersion === targetVersion);
+    if (idx < 0) return null;
+
+    const current = history[idx]!;
+    if (current.confirmationStatus === "confirmed") return this.cloneVersionObject(current);
+
+    const confirmed = Object.freeze({
+      ...current,
+      confirmationStatus: "confirmed" as const,
+    }) as VersionedStorageObject;
+    history[idx] = confirmed;
+    return this.cloneVersionObject(confirmed);
+  }
+
+  private buildLatestCommittedSnapshotTables(visibility: "pending" | "confirmed"): Map<string, SqlRow[]> {
     const snapshot = new Map<string, SqlRow[]>();
     const allTables = new Set<string>([...this.tables.keys(), ...this.tableVersionObjects.keys()]);
     for (const table of allTables.values()) {
-      const latest = this.tableVersionObjects.get(table)?.at(-1);
-      if (latest) {
-        snapshot.set(table, latest.rows.map((row) => ({ ...row })));
+      const history = this.tableVersionObjects.get(table) ?? [];
+      const selectedVersion = visibility === "pending"
+        ? history.at(-1)
+        : [...history].reverse().find((object) => object.confirmationStatus === "confirmed");
+
+      if (selectedVersion) {
+        snapshot.set(table, selectedVersion.rows.map((row) => ({ ...row })));
         continue;
       }
+
       const committedRows = this.tables.get(table);
       if (!committedRows) continue;
       snapshot.set(table, this.deepCloneRows(committedRows));
@@ -765,7 +789,7 @@ export class WalrusSqlClient {
     return snapshot;
   }
 
-  async queryLatestCommitted(sql: string): Promise<QueryResult> {
+  private async queryAgainstSnapshotTables(sql: string, tables: Map<string, SqlRow[]>): Promise<QueryResult> {
     const snapshotClient = new WalrusSqlClient({
       ...this.opts,
       mode: "simulator",
@@ -787,7 +811,7 @@ export class WalrusSqlClient {
     };
 
     internals.tables.clear();
-    for (const [table, rows] of this.buildLatestCommittedSnapshotTables().entries()) {
+    for (const [table, rows] of tables.entries()) {
       internals.tables.set(table, rows);
     }
 
@@ -800,6 +824,15 @@ export class WalrusSqlClient {
     internals.tableVersionObjects.clear();
 
     return snapshotClient.query(sql);
+  }
+
+  async queryLatestCommitted(sql: string): Promise<QueryResult> {
+    return this.queryByConfirmation(sql, "pending");
+  }
+
+  async queryByConfirmation(sql: string, visibility: "pending" | "confirmed" = "confirmed"): Promise<QueryResult> {
+    const snapshot = this.buildLatestCommittedSnapshotTables(visibility);
+    return this.queryAgainstSnapshotTables(sql, snapshot);
   }
 
   private buildTransactionRowKey(table: string, keySource: SqlRow): Record<string, SqlPrimitive> {

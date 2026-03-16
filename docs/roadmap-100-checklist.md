@@ -38,7 +38,7 @@
 - [x] P2-DUR-002 版本链元数据（prevVersion/currentVersion/commitDigest）
 - [x] P2-DUR-003 崩溃恢复：基于 WAL + version chain 恢复到一致状态
 - [x] P2-DUR-004 读路径支持按“最新已提交版本”可重复解析
-- [ ] P2-DUR-005 链上确认延迟场景的一致读策略（pending/confirmed）
+- [x] P2-DUR-005 链上确认延迟场景的一致读策略（pending/confirmed）
 
 ## P2-E. 外键约束（FK）
 
