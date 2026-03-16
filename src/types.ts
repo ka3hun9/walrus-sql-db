@@ -1287,6 +1287,9 @@ export interface WalrusSqlClientOptions {
   wal?: {
     enabled?: boolean;
     filePath?: string;
+    maxEntries?: number;
+    archivePath?: string;
+    checkpointPath?: string;
   };
   transactionCommitExecutor?: (payload: TransactionCommitBatchPayload) => Promise<TransactionCommitBatchResult>;
   logging?: {

@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
 import {
@@ -401,12 +401,159 @@ export class WalrusSqlClient {
     return normalized.length > 0 ? normalized : ".cache/walrus-sql/transaction.wal.ndjson";
   }
 
+  private getWalArchivePath(): string | null {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return null;
+    const configured = this.opts.wal?.archivePath?.trim();
+    if (configured && configured.length > 0) return configured;
+    return `${walPath}.archive.ndjson`;
+  }
+
+  private getWalCheckpointPath(): string | null {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return null;
+    const configured = this.opts.wal?.checkpointPath?.trim();
+    if (configured && configured.length > 0) return configured;
+    return `${walPath}.checkpoint.json`;
+  }
+
+  private getWalRetentionMaxEntries(): number {
+    const raw = this.opts.wal?.maxEntries;
+    if (raw === undefined) return 2_000;
+    if (!Number.isFinite(raw)) return 2_000;
+    return Math.max(1, Math.floor(raw));
+  }
+
+  private parseTransactionWalEntry(line: string): TransactionWalEntry | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return null;
+    }
+
+    if (!parsed || typeof parsed !== "object") return null;
+    const payload = parsed as Partial<TransactionWalEntry>;
+    if (payload.phase !== "PREPARE" && payload.phase !== "COMMIT" && payload.phase !== "ROLLBACK") return null;
+    if (typeof payload.txnId !== "string" || payload.txnId.trim().length === 0) return null;
+    if (typeof payload.at !== "number" || !Number.isFinite(payload.at)) return null;
+    return payload as TransactionWalEntry;
+  }
+
+  private async loadWalLines(): Promise<string[]> {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return [];
+
+    let text = "";
+    try {
+      text = await readFile(walPath, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return [];
+      throw this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "failed to read WAL file");
+    }
+
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
+
+  private collectPendingWalRecords(lines: string[]): Map<string, TransactionLogRecord> {
+    const pending = new Map<string, TransactionLogRecord>();
+
+    for (const line of lines) {
+      const entry = this.parseTransactionWalEntry(line);
+      if (!entry) {
+        this.logger.warn("skip malformed WAL line during scan", { line });
+        continue;
+      }
+
+      if (entry.phase === "PREPARE") {
+        if (!entry.record || !verifyTransactionLogRecordChecksum(entry.record)) {
+          this.logger.warn("skip WAL PREPARE with invalid/missing checksum", { txnId: entry.txnId });
+          continue;
+        }
+        pending.set(entry.txnId, entry.record);
+        continue;
+      }
+
+      pending.delete(entry.txnId);
+    }
+
+    return pending;
+  }
+
+  private async enforceWalRetention(): Promise<void> {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return;
+
+    const maxEntries = this.getWalRetentionMaxEntries();
+    const lines = await this.loadWalLines();
+    if (lines.length <= maxEntries) return;
+
+    const pendingTxnIds = new Set<string>(this.collectPendingWalRecords(lines).keys());
+    const keepFlags = lines.map(() => true);
+    let keptCount = lines.length;
+    for (let idx = 0; idx < lines.length && keptCount > maxEntries; idx += 1) {
+      const entry = this.parseTransactionWalEntry(lines[idx]!);
+      if (entry && pendingTxnIds.has(entry.txnId)) continue;
+      keepFlags[idx] = false;
+      keptCount -= 1;
+    }
+
+    if (keptCount === lines.length) return;
+
+    const archivedLines: string[] = [];
+    const keptLines: string[] = [];
+    for (let idx = 0; idx < lines.length; idx += 1) {
+      if (keepFlags[idx]) keptLines.push(lines[idx]!);
+      else archivedLines.push(lines[idx]!);
+    }
+
+    const archivePath = this.getWalArchivePath();
+    if (archivePath && archivedLines.length > 0) {
+      await mkdir(dirname(archivePath), { recursive: true });
+      await appendFile(archivePath, `${archivedLines.join("\n")}\n`, "utf8");
+    }
+
+    const nextWalBody = keptLines.length > 0 ? `${keptLines.join("\n")}\n` : "";
+    await writeFile(walPath, nextWalBody, "utf8");
+  }
+
   private async appendTransactionWalEntry(entry: TransactionWalEntry): Promise<void> {
     const walPath = this.getWalFilePath();
     if (!walPath) return;
 
     await mkdir(dirname(walPath), { recursive: true });
     await appendFile(walPath, `${JSON.stringify(entry)}\n`, "utf8");
+    await this.enforceWalRetention();
+  }
+
+  async checkpointWal(): Promise<{ checkpointPath: string | null; pendingTxnIds: string[]; walLineCount: number }> {
+    const checkpointPath = this.getWalCheckpointPath();
+    if (!checkpointPath) return { checkpointPath: null, pendingTxnIds: [], walLineCount: 0 };
+
+    const walPath = this.getWalFilePath()!;
+    const lines = await this.loadWalLines();
+    const pending = this.collectPendingWalRecords(lines);
+    const payload = {
+      at: Date.now(),
+      walPath,
+      walLineCount: lines.length,
+      pendingTxnIds: [...pending.keys()],
+      pendingRecords: [...pending.values()],
+    };
+
+    await mkdir(dirname(checkpointPath), { recursive: true });
+    await writeFile(checkpointPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    await this.enforceWalRetention();
+
+    return {
+      checkpointPath,
+      pendingTxnIds: payload.pendingTxnIds,
+      walLineCount: payload.walLineCount,
+    };
   }
 
   private toWalWriteEntry(
@@ -487,47 +634,9 @@ export class WalrusSqlClient {
   }
 
   async recoverPendingTransactionLogsFromWal(): Promise<TransactionLogRecord[]> {
-    const walPath = this.getWalFilePath();
-    if (!walPath) return [];
-
-    let text = "";
-    try {
-      text = await readFile(walPath, "utf8");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === "ENOENT") return [];
-      throw this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "failed to read WAL file for recovery");
-    }
-
-    const pending = new Map<string, TransactionLogRecord>();
-    const lines = text.split(/\r?\n/);
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-
-      let entry: TransactionWalEntry;
-      try {
-        entry = JSON.parse(line) as TransactionWalEntry;
-      } catch {
-        this.logger.warn("skip malformed WAL line during recovery", { line });
-        continue;
-      }
-
-      if (entry.phase === "PREPARE") {
-        if (!entry.record || !verifyTransactionLogRecordChecksum(entry.record)) {
-          this.logger.warn("skip WAL PREPARE with invalid/missing checksum", { txnId: entry.txnId });
-          continue;
-        }
-        pending.set(entry.txnId, entry.record);
-        continue;
-      }
-
-      if (entry.phase === "COMMIT" || entry.phase === "ROLLBACK") {
-        pending.delete(entry.txnId);
-      }
-    }
-
-    return [...pending.values()];
+    if (!this.getWalFilePath()) return [];
+    const lines = await this.loadWalLines();
+    return [...this.collectPendingWalRecords(lines).values()];
   }
 
   async replayPendingTransactionLogsFromWal(): Promise<{ replayedTxnIds: string[]; failedTxnIds: string[] }> {

@@ -61,3 +61,15 @@
     - returns rolled-back txn ids
 - Both APIs are idempotent across repeated calls (second call sees no pending entries).
 - Covered by `test/unit-g-stor-009-wal-compensation-replay-rollback.ts`.
+
+## P2-LOG-005
+- WAL retention is configurable with `wal.maxEntries` (default: `2000`).
+- When WAL exceeds retention:
+  - old resolved entries are truncated from primary WAL
+  - truncated lines are archived into `wal.archivePath` (default: `${wal.filePath}.archive.ndjson`)
+  - unresolved pending transactions are preserved (not truncated)
+- Checkpoint API: `checkpointWal()`:
+  - writes checkpoint snapshot to `wal.checkpointPath` (default: `${wal.filePath}.checkpoint.json`)
+  - snapshot includes pending txn ids/records and current WAL line count
+  - triggers retention enforcement after checkpoint write
+- Covered by `test/unit-g-stor-010-wal-checkpoint-retention.ts`.
