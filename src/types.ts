@@ -352,7 +352,7 @@ export function inferRuntimeType(value: SqlPrimitive): SqlRuntimeTypeName {
   return inferRuntimeTypeModel(value).name;
 }
 
-export type SqlTypedValueSource = "js" | "literal" | "storage";
+export type SqlTypedValueSource = "js" | "literal" | "storage" | "computed";
 
 export interface SqlTypedValueMetadata {
   runtimeType: SqlRuntimeTypeModel;
@@ -655,6 +655,147 @@ export const typedValueComparator: SqlTypedValueComparator = Object.freeze({
   lte: typedValueLte,
   gt: typedValueGt,
   gte: typedValueGte,
+});
+
+export interface SqlTypedValueOperators {
+  add: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  sub: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  mul: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  div: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  and: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  or: (left: SqlTypedValue, right: SqlTypedValue) => SqlTypedValue;
+  not: (value: SqlTypedValue) => SqlTypedValue;
+}
+
+function numericPromotionRank(type: SqlRuntimeTypeName): number {
+  switch (type) {
+    case "SMALLINT":
+      return 1;
+    case "INT":
+      return 2;
+    case "BIGINT":
+    case "U64":
+      return 3;
+    case "DECIMAL":
+      return 4;
+    case "FLOAT":
+      return 5;
+    case "DOUBLE":
+      return 6;
+    default:
+      return -1;
+  }
+}
+
+function assertNumericTypedValue(value: SqlTypedValue, side: "left" | "right"): void {
+  if (!isNumericType(value.type)) {
+    throw new TypeError(`${side} operand must be numeric typed value, received ${value.type}`);
+  }
+}
+
+function promoteArithmeticType(
+  leftType: SqlRuntimeTypeName,
+  rightType: SqlRuntimeTypeName,
+  op: "add" | "sub" | "mul" | "div",
+): SqlRuntimeTypeName {
+  if (op === "div") return "DOUBLE";
+
+  const leftRank = numericPromotionRank(leftType);
+  const rightRank = numericPromotionRank(rightType);
+  if (leftRank < 0 || rightRank < 0) throw new TypeError(`numeric promotion requires numeric types: ${leftType}, ${rightType}`);
+
+  const rank = Math.max(leftRank, rightRank);
+  switch (rank) {
+    case 1:
+      return "SMALLINT";
+    case 2:
+      return "INT";
+    case 3:
+      return leftType === "BIGINT" || rightType === "BIGINT" ? "BIGINT" : "U64";
+    case 4:
+      return "DECIMAL";
+    case 5:
+      return "FLOAT";
+    default:
+      return "DOUBLE";
+  }
+}
+
+function arithmeticBinaryOp(
+  left: SqlTypedValue,
+  right: SqlTypedValue,
+  op: "add" | "sub" | "mul" | "div",
+  operation: (left: number, right: number) => number,
+): SqlTypedValue {
+  assertNumericTypedValue(left, "left");
+  assertNumericTypedValue(right, "right");
+
+  const promotedType = promoteArithmeticType(left.type, right.type, op);
+  if (left.value === null || right.value === null) {
+    return createTypedValue(null, "computed", promotedType, {}, op);
+  }
+
+  const leftNumber = normalizeNumericTypedValue(left);
+  const rightNumber = normalizeNumericTypedValue(right);
+  const raw = operation(leftNumber, rightNumber);
+  if (!Number.isFinite(raw)) throw new TypeError(`${op} produced non-finite numeric result`);
+
+  return createTypedValue(raw, "computed", promotedType, {}, op);
+}
+
+function toLogicalTruthValue(value: SqlTypedValue): SqlThreeValuedLogic {
+  if (value.value === null) return null;
+  if (value.type !== "BOOLEAN") throw new TypeError(`logical operand must be BOOLEAN typed value, received ${value.type}`);
+  if (typeof value.value !== "boolean") throw new TypeError("logical BOOLEAN typed value must be true/false");
+  return value.value;
+}
+
+export function typedValueAdd(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  return arithmeticBinaryOp(left, right, "add", (l, r) => l + r);
+}
+
+export function typedValueSub(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  return arithmeticBinaryOp(left, right, "sub", (l, r) => l - r);
+}
+
+export function typedValueMul(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  return arithmeticBinaryOp(left, right, "mul", (l, r) => l * r);
+}
+
+export function typedValueDiv(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  return arithmeticBinaryOp(left, right, "div", (l, r) => l / r);
+}
+
+export function typedValueAnd(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  const lv = toLogicalTruthValue(left);
+  const rv = toLogicalTruthValue(right);
+  if (lv === false || rv === false) return createTypedValue(false, "computed", "BOOLEAN", {}, "and");
+  if (lv === true && rv === true) return createTypedValue(true, "computed", "BOOLEAN", {}, "and");
+  return createTypedValue(null, "computed", "BOOLEAN", {}, "and");
+}
+
+export function typedValueOr(left: SqlTypedValue, right: SqlTypedValue): SqlTypedValue {
+  const lv = toLogicalTruthValue(left);
+  const rv = toLogicalTruthValue(right);
+  if (lv === true || rv === true) return createTypedValue(true, "computed", "BOOLEAN", {}, "or");
+  if (lv === false && rv === false) return createTypedValue(false, "computed", "BOOLEAN", {}, "or");
+  return createTypedValue(null, "computed", "BOOLEAN", {}, "or");
+}
+
+export function typedValueNot(value: SqlTypedValue): SqlTypedValue {
+  const truth = toLogicalTruthValue(value);
+  if (truth === null) return createTypedValue(null, "computed", "BOOLEAN", {}, "not");
+  return createTypedValue(!truth, "computed", "BOOLEAN", {}, "not");
+}
+
+export const typedValueOperators: SqlTypedValueOperators = Object.freeze({
+  add: typedValueAdd,
+  sub: typedValueSub,
+  mul: typedValueMul,
+  div: typedValueDiv,
+  and: typedValueAnd,
+  or: typedValueOr,
+  not: typedValueNot,
 });
 
 export interface ExecuteResult {

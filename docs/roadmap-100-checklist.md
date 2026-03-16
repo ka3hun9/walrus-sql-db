@@ -128,7 +128,7 @@
 - [x] K-TVAL-001 定义统一 `TypedValue` 核心结构（type + value + metadata）并冻结不可变语义
 - [x] K-TVAL-002 提供统一构造/校验工厂（fromLiteral/fromStorage/fromJs）
 - [x] K-TVAL-003 提供统一比较接口（eq/lt/lte/gt/gte）并接入 NULL 3VL
-- [ ] K-TVAL-004 提供统一算术/逻辑操作接口（add/sub/mul/div/and/or/not）及类型提升规则
+- [x] K-TVAL-004 提供统一算术/逻辑操作接口（add/sub/mul/div/and/or/not）及类型提升规则
 
 ### K2. 解析层接入
 - [ ] K-TVAL-005 SQL 字面量在 AST 构建阶段统一产出 TypedValue（不再裸 primitive）
