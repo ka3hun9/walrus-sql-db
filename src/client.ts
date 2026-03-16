@@ -17,6 +17,7 @@ import {
 } from "./types.js";
 import type {
   ExecuteResult,
+  DurabilityRecoverySummary,
   QueryProofResult,
   QueryResult,
   SessionTransactionState,
@@ -875,6 +876,53 @@ export class WalrusSqlClient {
       rolledBackTxnIds.push(record.txnId);
     }
     return rolledBackTxnIds;
+  }
+
+  async recoverConsistentStateFromWalAndVersionChain(
+    options?: { pendingStrategy?: "rollback" | "replay" },
+  ): Promise<DurabilityRecoverySummary> {
+    const strategy = options?.pendingStrategy ?? "rollback";
+    const restoredTables: string[] = [];
+
+    for (const [table, history] of this.tableVersionObjects.entries()) {
+      const latest = history[history.length - 1];
+      if (!latest) continue;
+
+      const restoredRows = latest.rows.map((row) => ({ ...row }));
+      this.tables.set(table, restoredRows);
+      this.uniqueIndexes.set(table, this.buildUniqueIndexSnapshot(table, restoredRows));
+
+      const versions = new Map<string, number>();
+      for (const row of restoredRows) {
+        const key = this.buildTransactionRowKey(table, row as SqlRow);
+        versions.set(this.encodeRowVersionKey(key), latest.currentVersion);
+      }
+      this.rowVersions.set(table, versions);
+      restoredTables.push(table);
+    }
+
+    this.clearTransactionWriteSet();
+    this.transactionState = "idle";
+    this.transactionStartedAt = null;
+    this.dirtyTables.clear();
+    this.queryCache.clear();
+    this.writeVersion += 1;
+
+    const pendingBeforeRecords = await this.recoverPendingTransactionLogsFromWal();
+    const pendingBefore = pendingBeforeRecords.map((record) => record.txnId);
+
+    if (strategy === "replay") await this.replayPendingTransactionLogsFromWal();
+    else await this.rollbackPendingTransactionLogsFromWal();
+
+    const pendingAfterRecords = await this.recoverPendingTransactionLogsFromWal();
+    const pendingAfter = pendingAfterRecords.map((record) => record.txnId);
+
+    return {
+      strategy,
+      restoredTables: restoredTables.sort(),
+      pendingBefore,
+      pendingAfter,
+    };
   }
 
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {

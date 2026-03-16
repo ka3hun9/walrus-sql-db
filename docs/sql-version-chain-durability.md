@@ -18,3 +18,14 @@
   - first version: `prevVersion = null`, `currentVersion = 1`
   - next version points to prior `currentVersion`
 - Covered by `test/unit-g-stor-012-version-chain-metadata.ts`.
+
+## P2-DUR-003: Crash Recovery (WAL + Version Chain)
+- Recovery API: `recoverConsistentStateFromWalAndVersionChain({ pendingStrategy })`.
+- Recovery flow:
+  - restore table data from latest committed version object
+  - rebuild unique indexes and row-version tracker
+  - resolve pending WAL entries by `rollback` (default) or `replay`
+- Returns recovery summary:
+  - restored tables
+  - pending WAL txn ids before/after recovery
+- Covered by `test/unit-g-stor-013-crash-recovery-wal-version-chain.ts`.

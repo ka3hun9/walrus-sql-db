@@ -1148,6 +1148,13 @@ export interface VersionedStorageObject {
   rows: ReadonlyArray<Readonly<SqlRow>>;
 }
 
+export interface DurabilityRecoverySummary {
+  strategy: "rollback" | "replay";
+  restoredTables: string[];
+  pendingBefore: string[];
+  pendingAfter: string[];
+}
+
 function stableSerializeJson(value: unknown): string {
   if (value === null) return "null";
 
