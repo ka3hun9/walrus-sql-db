@@ -89,6 +89,7 @@ const BIGINT_MIN_BOUND = -9223372036854775808n;
 const BIGINT_MAX_BOUND = 9223372036854775807n;
 const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_FK_CASCADE_DEPTH = 16;
 
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 
@@ -1505,6 +1506,7 @@ export class WalrusSqlClient {
       if (this.tables.has(schema.name) || this.schemas.has(schema.name)) {
         throw sqlError("ERR_UNSUPPORTED_DDL", `table already exists: ${schema.name}`);
       }
+      this.assertNoCascadeCycle(schema);
       this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
       this.uniqueIndexes.delete(schema.name);
@@ -2281,6 +2283,55 @@ export class WalrusSqlClient {
     return { refTable, refColumns, matchRule, onDelete, onUpdate };
   }
 
+  private assertNoCascadeCycle(newSchema: TableSchema): void {
+    const graph = new Map<string, Set<string>>();
+    const ensureNode = (table: string): Set<string> => {
+      let targets = graph.get(table);
+      if (!targets) {
+        targets = new Set<string>();
+        graph.set(table, targets);
+      }
+      return targets;
+    };
+    const attachSchema = (schema: TableSchema): void => {
+      ensureNode(schema.name);
+      for (const fk of schema.foreignKeys ?? []) {
+        if (fk.onDelete !== "CASCADE" && fk.onUpdate !== "CASCADE") continue;
+        ensureNode(fk.refTable).add(schema.name);
+      }
+    };
+
+    for (const schema of this.schemas.values()) attachSchema(schema);
+    attachSchema(newSchema);
+
+    const visited = new Set<string>();
+    const inPath = new Set<string>();
+    const visit = (table: string): boolean => {
+      if (inPath.has(table)) return true;
+      if (visited.has(table)) return false;
+      visited.add(table);
+      inPath.add(table);
+      for (const next of graph.get(table) ?? []) {
+        if (visit(next)) return true;
+      }
+      inPath.delete(table);
+      return false;
+    };
+
+    for (const table of graph.keys()) {
+      if (visit(table)) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `cascade cycle detected in FK graph while creating ${newSchema.name}`,
+          {
+            clause: "FOREIGN KEY",
+            field: newSchema.name,
+          },
+        );
+      }
+    }
+  }
+
   private parseCreateTableSchema(sql: string): TableSchema {
     const m = sql.match(/^CREATE TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*$/i);
     if (!m) throw sqlError("ERR_UNSUPPORTED_DDL", sql);
@@ -2956,9 +3007,19 @@ export class WalrusSqlClient {
 
   private collectDeleteTargetsWithCascade(seedTable: string, seedRows: SqlRow[]): Map<string, Set<SqlRow>> {
     const targets = new Map<string, Set<SqlRow>>();
-    const queue: Array<{ table: string; row: SqlRow }> = [];
+    const queue: Array<{ table: string; row: SqlRow; depth: number }> = [];
 
-    const addTarget = (table: string, row: SqlRow): void => {
+    const addTarget = (table: string, row: SqlRow, depth: number): void => {
+      if (depth > MAX_FK_CASCADE_DEPTH) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `cascade depth exceeded max=${MAX_FK_CASCADE_DEPTH} at ${table}`,
+          {
+            clause: "ON DELETE CASCADE",
+            field: table,
+          },
+        );
+      }
       let rows = targets.get(table);
       if (!rows) {
         rows = new Set<SqlRow>();
@@ -2966,10 +3027,10 @@ export class WalrusSqlClient {
       }
       if (rows.has(row)) return;
       rows.add(row);
-      queue.push({ table, row });
+      queue.push({ table, row, depth });
     };
 
-    for (const row of seedRows) addTarget(seedTable, row);
+    for (const row of seedRows) addTarget(seedTable, row, 0);
 
     while (queue.length > 0) {
       const head = queue.shift()!;
@@ -2980,7 +3041,7 @@ export class WalrusSqlClient {
         if (matchedChildren.length === 0) continue;
 
         if (ref.fk.onDelete === "CASCADE") {
-          for (const childRow of matchedChildren) addTarget(ref.table, childRow);
+          for (const childRow of matchedChildren) addTarget(ref.table, childRow, head.depth + 1);
           continue;
         }
 

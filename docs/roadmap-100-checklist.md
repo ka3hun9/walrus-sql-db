@@ -48,7 +48,7 @@
 - [x] P2-FK-004 ON DELETE CASCADE 实现
 - [x] P2-FK-005 ON DELETE RESTRICT/NO ACTION 实现
 - [x] P2-FK-006 ON UPDATE CASCADE/RESTRICT 策略实现
-- [ ] P2-FK-007 FK 环与级联深度保护（防止无限级联）
+- [x] P2-FK-007 FK 环与级联深度保护（防止无限级联）
 
 ## P2-F. 执行器与存储联动
 
