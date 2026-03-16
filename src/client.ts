@@ -277,6 +277,7 @@ export class WalrusSqlClient {
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
+  private transactionStartedAt: number | null = null;
   private writeVersion = 0;
 
   constructor(opts: WalrusSqlClientOptions) {
@@ -324,6 +325,30 @@ export class WalrusSqlClient {
 
   getIsolationLevel(): "read_committed" {
     return this.isolationLevel;
+  }
+
+  private getTransactionTimeoutMs(): number {
+    const raw = this.opts.transactionTimeoutMs;
+    if (raw === undefined) return 0;
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.floor(raw));
+  }
+
+  private assertTransactionNotTimedOut(sql: string): void {
+    if (this.transactionState !== "active") return;
+    const timeoutMs = this.getTransactionTimeoutMs();
+    if (timeoutMs <= 0) return;
+    if (this.transactionStartedAt === null) return;
+    if (Date.now() - this.transactionStartedAt <= timeoutMs) return;
+
+    this.transitionTransactionState("error", sql);
+    this.clearTransactionWriteSet();
+    this.transactionStartedAt = null;
+    throw sqlError(
+      ClientErrorCodeEnum.TransactionState,
+      `transaction timeout exceeded (${timeoutMs}ms): ${sql}`,
+      { clause: "TRANSACTION", token: "TIMEOUT" },
+    );
   }
 
   private tryParseTransactionAction(sql: string): SqlTransactionAction | null {
@@ -390,6 +415,7 @@ export class WalrusSqlClient {
     if (this.transactionState !== "active" && this.transactionState !== "committing") return;
     this.transitionTransactionState("error", sql);
     this.clearTransactionWriteSet();
+    this.transactionStartedAt = null;
   }
 
   private async waitTransactionCommitTurn(): Promise<void> {
@@ -897,6 +923,7 @@ export class WalrusSqlClient {
   private async executeTransactionControl(sql: string, action: SqlTransactionAction): Promise<ExecuteResult> {
     if (action === "BEGIN") {
       this.transitionTransactionState("begin", sql);
+      this.transactionStartedAt = Date.now();
       if (this.isSimulatorMode()) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
       return {
         txDigest: this.fakeDigest(sql),
@@ -908,6 +935,7 @@ export class WalrusSqlClient {
     if (action === "ROLLBACK") {
       this.transitionTransactionState("rollback", sql);
       this.clearTransactionWriteSet();
+      this.transactionStartedAt = null;
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "ROLLBACK",
@@ -915,6 +943,7 @@ export class WalrusSqlClient {
       };
     }
 
+    this.assertTransactionNotTimedOut(sql);
     this.transitionTransactionState("commit", sql);
     let walRecord: TransactionLogRecord | null = null;
     let batchPayload: TransactionCommitBatchPayload | null = null;
@@ -945,6 +974,7 @@ export class WalrusSqlClient {
       }
       this.transitionTransactionState("commit_done", sql);
       this.clearTransactionWriteSet();
+      this.transactionStartedAt = null;
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "COMMIT",
@@ -976,6 +1006,7 @@ export class WalrusSqlClient {
         return result;
       }
 
+      this.assertTransactionNotTimedOut(normalized);
       this.assertStatementAllowedDuringTransaction(normalized);
       try {
         this.assertDdlTransactionPolicy(normalized);
@@ -1572,6 +1603,7 @@ export class WalrusSqlClient {
       transactionState: this.transactionState,
     });
     try {
+      this.assertTransactionNotTimedOut(normalized);
       this.assertStatementAllowedDuringTransaction(normalized);
       const normalizedSql = sql.trim().replace(/\s+/g, " ");
       const cachedRows = this.getCachedQuery(normalizedSql);

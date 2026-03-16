@@ -18,3 +18,12 @@
   - mismatch => `ERR_CONSTRAINT_VIOLATION:WRITE_CONFLICT`
   - match => commit proceeds and row versions advance
 - Covered by `test/unit-c-exec-014-occ-write-conflict-detector.ts`.
+
+## P2-ISO-003: Timeout Mechanism
+- With OCC mode, lock wait/deadlock graph is replaced by transaction timeout guard.
+- Config: `WalrusSqlClientOptions.transactionTimeoutMs`.
+- Behavior:
+  - active transaction exceeding timeout is transitioned to `aborted`
+  - subsequent statement fails with `ERR_TRANSACTION_STATE` timeout error
+  - caller must `ROLLBACK` to return to `idle`
+- Covered by `test/unit-c-exec-015-transaction-timeout-guard.ts`.
