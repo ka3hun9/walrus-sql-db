@@ -918,6 +918,20 @@ export class WalrusSqlClient {
     await this.opts.transactionCommitExecutor(payload);
   }
 
+  private async processPreparedTransactionRecord(
+    record: TransactionLogRecord,
+    options?: { applyLocalWriteSet?: () => void },
+  ): Promise<void> {
+    const payload = this.buildTransactionCommitBatchPayload(record);
+    await this.executeTransactionCommitBatch(payload);
+    options?.applyLocalWriteSet?.();
+    await this.appendTransactionWalEntry({
+      phase: "COMMIT",
+      txnId: record.txnId,
+      at: Date.now(),
+    });
+  }
+
   async recoverPendingTransactionLogsFromWal(): Promise<TransactionLogRecord[]> {
     if (!this.getWalFilePath()) return [];
     const lines = await this.loadWalLines();
@@ -931,13 +945,7 @@ export class WalrusSqlClient {
 
     for (const record of pending) {
       try {
-        const payload = this.buildTransactionCommitBatchPayload(record);
-        await this.executeTransactionCommitBatch(payload);
-        await this.appendTransactionWalEntry({
-          phase: "COMMIT",
-          txnId: record.txnId,
-          at: Date.now(),
-        });
+        await this.processPreparedTransactionRecord(record);
         replayedTxnIds.push(record.txnId);
       } catch (err) {
         this.logger.warn("WAL replay failed", {
@@ -1279,7 +1287,6 @@ export class WalrusSqlClient {
     this.assertTransactionNotTimedOut(sql);
     this.transitionTransactionState("commit", sql);
     let walRecord: TransactionLogRecord | null = null;
-    let batchPayload: TransactionCommitBatchPayload | null = null;
     try {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
@@ -1289,7 +1296,6 @@ export class WalrusSqlClient {
           this.assertCommitConstraintRevalidation(this.transactionWriteSet);
         }
         walRecord = this.createCommitWalRecord();
-        if (walRecord) batchPayload = this.buildTransactionCommitBatchPayload(walRecord);
         if (walRecord) {
           await this.appendTransactionWalEntry({
             phase: "PREPARE",
@@ -1298,15 +1304,8 @@ export class WalrusSqlClient {
             record: walRecord,
           });
         }
-        if (batchPayload) await this.executeTransactionCommitBatch(batchPayload);
-        this.applyTransactionWriteSetOnCommit();
-        if (walRecord) {
-          await this.appendTransactionWalEntry({
-            phase: "COMMIT",
-            txnId: walRecord.txnId,
-            at: Date.now(),
-          });
-        }
+        if (walRecord) await this.processPreparedTransactionRecord(walRecord, { applyLocalWriteSet: () => this.applyTransactionWriteSetOnCommit() });
+        else this.applyTransactionWriteSetOnCommit();
       }
       this.transitionTransactionState("commit_done", sql);
       this.clearTransactionWriteSet();
