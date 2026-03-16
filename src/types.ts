@@ -1156,6 +1156,18 @@ export interface DurabilityRecoverySummary {
   pendingAfter: string[];
 }
 
+export interface TransactionObservabilityStats {
+  started: number;
+  committed: number;
+  aborted: number;
+  abortRatio: number;
+  avgTxnLatencyMs: number;
+  maxTxnLatencyMs: number;
+  totalTxnLatencyMs: number;
+  totalLockWaitMs: number;
+  lockWaitEvents: number;
+}
+
 function stableSerializeJson(value: unknown): string {
   if (value === null) return "null";
 

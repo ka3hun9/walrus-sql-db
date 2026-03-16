@@ -28,6 +28,7 @@ import type {
   SqlTypedValue,
   StorageWriteEvent,
   StorageWriteOperation,
+  TransactionObservabilityStats,
   TransactionCommitBatchPayload,
   TransactionLogRecord,
   TransactionLogWriteEntry,
@@ -244,6 +245,16 @@ type ReadCommittedView = {
   getTableRows: (name: string) => SqlRow[];
 };
 
+type TransactionObservabilityAccumulator = {
+  started: number;
+  committed: number;
+  aborted: number;
+  totalTxnLatencyMs: number;
+  maxTxnLatencyMs: number;
+  totalLockWaitMs: number;
+  lockWaitEvents: number;
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -283,6 +294,16 @@ export class WalrusSqlClient {
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
   private transactionStartedAt: number | null = null;
+  private currentTransactionLockWaitMs = 0;
+  private readonly transactionObservability: TransactionObservabilityAccumulator = {
+    started: 0,
+    committed: 0,
+    aborted: 0,
+    totalTxnLatencyMs: 0,
+    maxTxnLatencyMs: 0,
+    totalLockWaitMs: 0,
+    lockWaitEvents: 0,
+  };
   private writeVersion = 0;
 
   constructor(opts: WalrusSqlClientOptions) {
@@ -332,6 +353,22 @@ export class WalrusSqlClient {
     return this.isolationLevel;
   }
 
+  getTransactionObservabilityStats(): TransactionObservabilityStats {
+    const { started, committed, aborted, totalTxnLatencyMs, maxTxnLatencyMs, totalLockWaitMs, lockWaitEvents } = this.transactionObservability;
+    const finished = committed + aborted;
+    return {
+      started,
+      committed,
+      aborted,
+      abortRatio: finished > 0 ? aborted / finished : 0,
+      avgTxnLatencyMs: finished > 0 ? totalTxnLatencyMs / finished : 0,
+      maxTxnLatencyMs,
+      totalTxnLatencyMs,
+      totalLockWaitMs,
+      lockWaitEvents,
+    };
+  }
+
   private getTransactionTimeoutMs(): number {
     const raw = this.opts.transactionTimeoutMs;
     if (raw === undefined) return 0;
@@ -348,6 +385,7 @@ export class WalrusSqlClient {
 
     this.transitionTransactionState("error", sql);
     this.clearTransactionWriteSet();
+    this.recordTransactionOutcome("aborted");
     this.transactionStartedAt = null;
     throw sqlError(
       ClientErrorCodeEnum.TransactionState,
@@ -382,6 +420,18 @@ export class WalrusSqlClient {
     }
     this.transactionState = next;
     return next;
+  }
+
+  private recordTransactionOutcome(outcome: "committed" | "aborted"): void {
+    const startedAt = this.transactionStartedAt;
+    const latency = startedAt === null ? 0 : Math.max(0, Date.now() - startedAt);
+
+    if (outcome === "committed") this.transactionObservability.committed += 1;
+    else this.transactionObservability.aborted += 1;
+
+    this.transactionObservability.totalTxnLatencyMs += latency;
+    this.transactionObservability.maxTxnLatencyMs = Math.max(this.transactionObservability.maxTxnLatencyMs, latency);
+    this.currentTransactionLockWaitMs = 0;
   }
 
   private assertStatementAllowedDuringTransaction(sql: string): void {
@@ -420,13 +470,19 @@ export class WalrusSqlClient {
     if (this.transactionState !== "active" && this.transactionState !== "committing") return;
     this.transitionTransactionState("error", sql);
     this.clearTransactionWriteSet();
+    this.recordTransactionOutcome("aborted");
     this.transactionStartedAt = null;
   }
 
   private async waitTransactionCommitTurn(): Promise<void> {
     // Use a macrotask boundary so "committing" remains observable for concurrent calls
     // until COMMIT finishes and transitions to idle.
+    const startedAt = Date.now();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const waitedMs = Math.max(0, Date.now() - startedAt);
+    this.currentTransactionLockWaitMs += waitedMs;
+    this.transactionObservability.totalLockWaitMs += waitedMs;
+    if (waitedMs > 0) this.transactionObservability.lockWaitEvents += 1;
   }
 
   private isSimulatorMode(): boolean {
@@ -1265,6 +1321,8 @@ export class WalrusSqlClient {
     if (action === "BEGIN") {
       this.transitionTransactionState("begin", sql);
       this.transactionStartedAt = Date.now();
+      this.currentTransactionLockWaitMs = 0;
+      this.transactionObservability.started += 1;
       if (this.isSimulatorMode()) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
       return {
         txDigest: this.fakeDigest(sql),
@@ -1274,7 +1332,9 @@ export class WalrusSqlClient {
     }
 
     if (action === "ROLLBACK") {
+      const previousState = this.transactionState;
       this.transitionTransactionState("rollback", sql);
+      if (previousState === "active") this.recordTransactionOutcome("aborted");
       this.clearTransactionWriteSet();
       this.transactionStartedAt = null;
       return {
@@ -1308,6 +1368,7 @@ export class WalrusSqlClient {
         else this.applyTransactionWriteSetOnCommit();
       }
       this.transitionTransactionState("commit_done", sql);
+      this.recordTransactionOutcome("committed");
       this.clearTransactionWriteSet();
       this.transactionStartedAt = null;
       return {
