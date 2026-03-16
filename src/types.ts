@@ -544,6 +544,119 @@ export function fromTypedValue(v: SqlTypedValue): SqlPrimitive {
   return v.value;
 }
 
+export type SqlThreeValuedLogic = true | false | null;
+
+export interface SqlTypedValueComparator {
+  eq: (left: SqlTypedValue, right: SqlTypedValue) => SqlThreeValuedLogic;
+  lt: (left: SqlTypedValue, right: SqlTypedValue) => SqlThreeValuedLogic;
+  lte: (left: SqlTypedValue, right: SqlTypedValue) => SqlThreeValuedLogic;
+  gt: (left: SqlTypedValue, right: SqlTypedValue) => SqlThreeValuedLogic;
+  gte: (left: SqlTypedValue, right: SqlTypedValue) => SqlThreeValuedLogic;
+}
+
+function isNumericType(type: SqlRuntimeTypeName): boolean {
+  return (
+    type === "SMALLINT" ||
+    type === "INT" ||
+    type === "BIGINT" ||
+    type === "DECIMAL" ||
+    type === "FLOAT" ||
+    type === "DOUBLE" ||
+    type === "U64"
+  );
+}
+
+function isTextualType(type: SqlRuntimeTypeName): boolean {
+  return (
+    type === "CHAR" ||
+    type === "VARCHAR" ||
+    type === "TEXT" ||
+    type === "STRING" ||
+    type === "DATE" ||
+    type === "TIME" ||
+    type === "TIMESTAMP" ||
+    type === "BLOB"
+  );
+}
+
+function normalizeNumericTypedValue(value: SqlTypedValue): number {
+  if (value.value === null) throw new TypeError("cannot normalize NULL for numeric comparison");
+
+  if (typeof value.value === "number") return value.value;
+  if (typeof value.value === "string" && parseDecimalString(value.value)) return Number(value.value);
+
+  throw new TypeError(`numeric comparison requires numeric value, received ${typeof value.value}`);
+}
+
+function compareNonNullTypedValue(left: SqlTypedValue, right: SqlTypedValue): number {
+  const leftType = left.type;
+  const rightType = right.type;
+
+  if (isNumericType(leftType) && isNumericType(rightType)) {
+    const lv = normalizeNumericTypedValue(left);
+    const rv = normalizeNumericTypedValue(right);
+    if (lv === rv) return 0;
+    return lv < rv ? -1 : 1;
+  }
+
+  if (leftType === "BOOLEAN" && rightType === "BOOLEAN") {
+    if (left.value === right.value) return 0;
+    return left.value === false ? -1 : 1;
+  }
+
+  if (isTextualType(leftType) && isTextualType(rightType)) {
+    const lv = left.value as string;
+    const rv = right.value as string;
+    if (lv === rv) return 0;
+    return lv < rv ? -1 : 1;
+  }
+
+  throw new TypeError(`incompatible typed comparison: ${leftType} vs ${rightType}`);
+}
+
+function compareTypedValuesInternal(left: SqlTypedValue, right: SqlTypedValue): number | null {
+  if (left.value === null || right.value === null) return null;
+  return compareNonNullTypedValue(left, right);
+}
+
+export function typedValueEq(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
+  const cmp = compareTypedValuesInternal(left, right);
+  if (cmp === null) return null;
+  return cmp === 0;
+}
+
+export function typedValueLt(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
+  const cmp = compareTypedValuesInternal(left, right);
+  if (cmp === null) return null;
+  return cmp < 0;
+}
+
+export function typedValueLte(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
+  const cmp = compareTypedValuesInternal(left, right);
+  if (cmp === null) return null;
+  return cmp <= 0;
+}
+
+export function typedValueGt(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
+  const cmp = compareTypedValuesInternal(left, right);
+  if (cmp === null) return null;
+  return cmp > 0;
+}
+
+export function typedValueGte(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
+  const cmp = compareTypedValuesInternal(left, right);
+  if (cmp === null) return null;
+  return cmp >= 0;
+}
+
+export const typedValueComparator: SqlTypedValueComparator = Object.freeze({
+  eq: typedValueEq,
+  lt: typedValueLt,
+  lte: typedValueLte,
+  gt: typedValueGt,
+  gte: typedValueGte,
+});
+
 export interface ExecuteResult {
   txDigest: string;
   statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "UNKNOWN";
