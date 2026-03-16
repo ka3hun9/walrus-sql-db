@@ -1,12 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
-import { encodeBlob, fromJs, fromLiteral, fromStorage, inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
+import { convertTypedValue, encodeBlob, fromJs, fromLiteral, fromStorage, normalizeRuntimeTypeName } from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
   QueryResult,
   SqlPrimitive,
   SqlRow,
+  SqlRuntimeTypeMetadata,
   SqlRuntimeTypeName,
   SqlTypedValue,
   StorageWriteEvent,
@@ -1317,6 +1318,21 @@ export class WalrusSqlClient {
     return fromJs(value, undefined, {}, sourceContext);
   }
 
+  private runtimeTypeMetadataFromColumnType(type: ColumnTypeSpec): Partial<SqlRuntimeTypeMetadata> {
+    if (type.name === "DECIMAL") {
+      return {
+        precision: type.precision,
+        scale: type.scale,
+      };
+    }
+    if (type.name === "CHAR" || type.name === "VARCHAR") {
+      return {
+        length: type.length,
+      };
+    }
+    return {};
+  }
+
   private coerceByType(type: ColumnTypeSpec, boundInput: SqlPrimitive | SqlTypedValue, sourceContext = "dml.bind"): SqlPrimitive {
     const typedInput = this.isBoundTypedValue(boundInput)
       ? boundInput
@@ -1324,9 +1340,17 @@ export class WalrusSqlClient {
     const value = typedInput.value;
     if (value === null) return null;
 
-    const sourceType = typedInput.type ?? inferRuntimeType(value);
-    if (resolveCastPolicy(sourceType, type.name as SqlRuntimeTypeName, "implicit") === "reject") {
-      throw sqlError("ERR_TYPE_CONSTRAINT", `implicit cast ${sourceType} -> ${type.name} not allowed`);
+    const targetType = type.name as SqlRuntimeTypeName;
+    const targetMetadata = this.runtimeTypeMetadataFromColumnType(type);
+    try {
+      convertTypedValue(typedInput, targetType, {
+        mode: "implicit",
+        targetMetadata,
+        sourceContext,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw sqlError("ERR_TYPE_CONSTRAINT", msg);
     }
 
     const toNum = (v: SqlPrimitive): number => {
@@ -2963,31 +2987,24 @@ export class WalrusSqlClient {
       if (!normalizedTarget || normalizedTarget === "NULL") {
         throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${castTypeExpr}`);
       }
-      const t = normalizedTarget;
       if (v === null || v === undefined) return null;
-      const sourceType = inferRuntimeType(v);
-      if (resolveCastPolicy(sourceType, t, "explicit") === "reject") {
-        throw sqlError("ERR_TYPE_CONSTRAINT", `CAST ${sourceType} -> ${t} not allowed`);
+      try {
+        const casted = convertTypedValue(
+          fromJs(v, undefined, {}, `expr.cast.source:${castValueExpr}`),
+          normalizedTarget,
+          {
+            mode: "explicit",
+            sourceContext: `expr.cast.target:${normalizedTarget}`,
+          },
+        );
+        return casted.value;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/CAST .* not allowed/i.test(msg)) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", msg);
+        }
+        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to ${normalizedTarget}: ${String(v)}`);
       }
-
-      if (t === "TEXT") return String(v);
-      if (t === "INT") {
-        const n = Number(v);
-        if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to INT: ${String(v)}`);
-        return Math.trunc(n);
-      }
-      if (t === "FLOAT" || t === "DOUBLE") {
-        const n = Number(v);
-        if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to ${t}: ${String(v)}`);
-        return n;
-      }
-      if (t === "BOOLEAN") {
-        const b = String(v).trim().toLowerCase();
-        if (b === "true" || b === "1") return true;
-        if (b === "false" || b === "0") return false;
-        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to BOOLEAN: ${String(v)}`);
-      }
-      throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${castTypeExpr}`);
     }
 
     if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return this.resolveRowValue(row, expr);

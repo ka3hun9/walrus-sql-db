@@ -386,6 +386,8 @@ const BIGINT_MIN = BigInt("-9223372036854775808");
 const BIGINT_MAX = BigInt("9223372036854775807");
 const U64_MIN = BigInt(0);
 const U64_MAX = BigInt("18446744073709551615");
+const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 function validateIntegerRange(value: number, min: number, max: number, typeName: string): void {
   if (!Number.isInteger(value)) {
@@ -538,6 +540,183 @@ export function fromStorage(
   sourceContext?: string,
 ): SqlTypedValue {
   return createTypedValue(value, "storage", explicitType, metadata, sourceContext);
+}
+
+export interface SqlTypedValueConvertOptions {
+  mode?: SqlCastMode;
+  targetMetadata?: Partial<SqlRuntimeTypeMetadata>;
+  sourceContext?: string;
+}
+
+function toFiniteNumber(value: SqlPrimitive, targetType: SqlRuntimeTypeName): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new TypeError(`invalid ${targetType} literal: ${String(value)}`);
+  return n;
+}
+
+function toInteger(value: SqlPrimitive, targetType: SqlRuntimeTypeName): number {
+  const n = toFiniteNumber(value, targetType);
+  if (!Number.isInteger(n)) throw new TypeError(`expected integer for ${targetType}, got ${String(value)}`);
+  return n;
+}
+
+function toBigInt(value: SqlPrimitive, targetType: SqlRuntimeTypeName): bigint {
+  if (typeof value === "number") {
+    if (!Number.isInteger(value)) throw new TypeError(`expected integer for ${targetType}, got ${String(value)}`);
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(`unsafe integer literal for ${targetType}; use quoted digits for precise conversion`);
+    }
+    return BigInt(value);
+  }
+
+  const raw = String(value).trim();
+  if (!/^[+-]?\d+$/.test(raw)) throw new TypeError(`expected integer for ${targetType}, got ${String(value)}`);
+  return BigInt(raw);
+}
+
+function normalizeDecimal(value: SqlPrimitive, precision: number, scale: number): string {
+  const s = String(value).trim();
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(s)) throw new TypeError(`invalid DECIMAL literal: ${s}`);
+  const sign = s.startsWith("-") ? "-" : "";
+  const [intPartRaw, fracPartRaw = ""] = s.replace(/^[+-]/, "").split(".");
+  const intPart = intPartRaw.replace(/^0+(?=\d)/, "") || "0";
+  const fracPart = fracPartRaw;
+  const maxIntegerDigits = precision - scale;
+
+  if (fracPart.length > scale) {
+    throw new TypeError(`DECIMAL(${precision},${scale}) scale overflow (rounding disabled): ${s}`);
+  }
+  if (intPart.length > maxIntegerDigits) {
+    throw new TypeError(`DECIMAL(${precision},${scale}) overflow: ${s}`);
+  }
+
+  if (scale === 0) return `${sign}${intPart}`;
+  const paddedFrac = fracPart.padEnd(scale, "0");
+  const isZero = intPart === "0" && /^0*$/.test(paddedFrac);
+  const normalizedSign = sign === "-" && !isZero ? "-" : "";
+  return `${normalizedSign}${intPart}.${paddedFrac}`;
+}
+
+function coercePrimitiveToType(targetType: SqlRuntimeTypeName, value: SqlPrimitive, metadata: SqlRuntimeTypeMetadata): SqlPrimitive {
+  if (value === null) return null;
+
+  if (targetType === "TEXT" || targetType === "STRING") return String(value);
+
+  if (targetType === "CHAR" || targetType === "VARCHAR") {
+    const str = String(value);
+    const maxLen = metadata.length ?? str.length;
+    if (str.length > maxLen) {
+      throw new TypeError(`${targetType}(${maxLen}) length overflow: ${str.length}`);
+    }
+    return targetType === "CHAR" ? str.padEnd(maxLen, metadata.padCharacter ?? " ") : str;
+  }
+
+  if (targetType === "SMALLINT") {
+    const n = toInteger(value, targetType);
+    if (n < SMALLINT_MIN || n > SMALLINT_MAX) throw new TypeError(`SMALLINT out of range: ${n}`);
+    return n;
+  }
+  if (targetType === "INT") {
+    const n = toInteger(value, targetType);
+    if (n < INT_MIN || n > INT_MAX) throw new TypeError(`INT out of range: ${n}`);
+    return n;
+  }
+  if (targetType === "BIGINT") {
+    const n = toBigInt(value, targetType);
+    if (n < BIGINT_MIN || n > BIGINT_MAX) throw new TypeError(`BIGINT out of range: ${n.toString()}`);
+    if (n < MIN_SAFE_INTEGER_BIGINT || n > MAX_SAFE_INTEGER_BIGINT) return n.toString();
+    return Number(n);
+  }
+  if (targetType === "U64") {
+    const n = toBigInt(value, targetType);
+    if (n < U64_MIN || n > U64_MAX) throw new TypeError(`U64 out of range: ${n.toString()}`);
+    if (n > MAX_SAFE_INTEGER_BIGINT) return n.toString();
+    return Number(n);
+  }
+  if (targetType === "DECIMAL") {
+    return normalizeDecimal(value, metadata.precision ?? 38, metadata.scale ?? 0);
+  }
+  if (targetType === "FLOAT" || targetType === "DOUBLE") {
+    return toFiniteNumber(value, targetType);
+  }
+  if (targetType === "BOOLEAN") {
+    if (typeof value === "boolean") return value;
+    const v = String(value).trim().toLowerCase();
+    if (v === "true" || v === "1") return true;
+    if (v === "false" || v === "0") return false;
+    throw new TypeError(`invalid BOOLEAN: ${String(value)}`);
+  }
+  if (targetType === "DATE") {
+    const s = String(value);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new TypeError(`invalid DATE: ${s}`);
+    const d = new Date(`${s}T00:00:00.000Z`);
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) throw new TypeError(`invalid DATE: ${s}`);
+    return s;
+  }
+  if (targetType === "TIME") {
+    const s = String(value);
+    if (!/^\d{2}:\d{2}:\d{2}$/.test(s)) throw new TypeError(`invalid TIME: ${s}`);
+    const [hh, mm, ss] = s.split(":").map((x) => Number(x));
+    if (hh > 23 || mm > 59 || ss > 59) throw new TypeError(`invalid TIME: ${s}`);
+    return s;
+  }
+  if (targetType === "TIMESTAMP") {
+    const s = String(value).trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
+    if (!m) throw new TypeError(`invalid TIMESTAMP: ${s}`);
+
+    const datePart = m[1]!;
+    const timePart = m[2]!;
+    const zonePart = (m[3] ?? "Z").toUpperCase();
+
+    const dateCheck = new Date(`${datePart}T00:00:00.000Z`);
+    if (Number.isNaN(dateCheck.getTime()) || dateCheck.toISOString().slice(0, 10) !== datePart) {
+      throw new TypeError(`invalid TIMESTAMP: ${s}`);
+    }
+
+    const [hh, mm, ss] = timePart.split(":").map((x) => Number(x));
+    if (hh > 23 || mm > 59 || ss > 59) throw new TypeError(`invalid TIMESTAMP: ${s}`);
+
+    if (zonePart !== "Z") {
+      const [zh, zm] = zonePart.slice(1).split(":").map((x) => Number(x));
+      if (zh > 23 || zm > 59) throw new TypeError(`invalid TIMESTAMP: ${s}`);
+    }
+
+    const dt = new Date(`${datePart}T${timePart}${zonePart}`);
+    if (Number.isNaN(dt.getTime())) throw new TypeError(`invalid TIMESTAMP: ${s}`);
+    return `${dt.toISOString().slice(0, 19)}Z`;
+  }
+  if (targetType === "BLOB") {
+    return encodeBlob(typeof value === "string" ? value : String(value));
+  }
+  if (targetType === "NULL") {
+    if (value !== null) throw new TypeError("NULL typed value must be null");
+    return null;
+  }
+
+  throw new TypeError(`unsupported conversion target: ${targetType}`);
+}
+
+export function convertTypedValue(
+  input: SqlTypedValue,
+  targetType: SqlRuntimeTypeName,
+  options: SqlTypedValueConvertOptions = {},
+): SqlTypedValue {
+  const mode = options.mode ?? "explicit";
+  if (resolveCastPolicy(input.type, targetType, mode) === "reject") {
+    if (mode === "implicit") {
+      throw new TypeError(`implicit cast ${input.type} -> ${targetType} not allowed`);
+    }
+    throw new TypeError(`CAST ${input.type} -> ${targetType} not allowed`);
+  }
+
+  const targetRuntimeType = createRuntimeTypeModel(targetType, options.targetMetadata ?? {});
+  if (input.value === null) {
+    return createTypedValue(null, "computed", targetRuntimeType.name, targetRuntimeType.metadata, options.sourceContext);
+  }
+
+  const converted = coercePrimitiveToType(targetRuntimeType.name, input.value, targetRuntimeType.metadata);
+  return createTypedValue(converted, "computed", targetRuntimeType.name, targetRuntimeType.metadata, options.sourceContext);
 }
 
 export function fromTypedValue(v: SqlTypedValue): SqlPrimitive {

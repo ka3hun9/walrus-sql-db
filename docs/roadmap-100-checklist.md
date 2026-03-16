@@ -133,7 +133,7 @@
 ### K2. 解析层接入
 - [x] K-TVAL-005 SQL 字面量在 AST 构建阶段统一产出 TypedValue（不再裸 primitive）
 - [x] K-TVAL-006 参数绑定（含默认值）统一转 TypedValue 并记录来源上下文
-- [ ] K-TVAL-007 CAST 与隐式转换在解析/绑定阶段统一走 TypedValue 转换器
+- [x] K-TVAL-007 CAST 与隐式转换在解析/绑定阶段统一走 TypedValue 转换器
 
 ### K3. 执行层全链路替换
 - [ ] K-TVAL-008 表达式求值器改造：所有中间值/结果值均为 TypedValue

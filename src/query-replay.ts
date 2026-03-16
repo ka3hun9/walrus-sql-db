@@ -4,8 +4,8 @@ import { dirname } from "node:path";
 import { SuiClient } from "@mysten/sui/client";
 import { decode as decodeMsgpack, encode as encodeMsgpack } from "@msgpack/msgpack";
 import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
-import { inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
-import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow, SqlRuntimeTypeName } from "./types.js";
+import { convertTypedValue, fromJs, normalizeRuntimeTypeName } from "./types.js";
+import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SqlPrimitive, SqlRow } from "./types.js";
 
 type Payload =
   | {
@@ -467,30 +467,11 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
     if (!normalizedTarget || normalizedTarget === "NULL") {
       throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
     }
-    const t = normalizedTarget;
     if (v == null) return null;
-    const sourceType = inferRuntimeType(v);
-    if (resolveCastPolicy(sourceType, t as SqlRuntimeTypeName, "explicit") === "reject") {
-      throw new Error(`ERR_TYPE_CONSTRAINT: CAST ${sourceType} -> ${t} not allowed`);
-    }
-    if (t === "TEXT") return String(v);
-    if (t === "INT") {
-      const n = Number(v);
-      if (!Number.isFinite(n)) throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to INT: ${String(v)}`);
-      return Math.trunc(n);
-    }
-    if (t === "FLOAT" || t === "DOUBLE") {
-      const n = Number(v);
-      if (!Number.isFinite(n)) throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to ${t}: ${String(v)}`);
-      return n;
-    }
-    if (t === "BOOLEAN") {
-      const b = String(v).trim().toLowerCase();
-      if (b === "true" || b === "1") return true;
-      if (b === "false" || b === "0") return false;
-      throw new Error(`ERR_TYPE_CONSTRAINT: invalid CAST to BOOLEAN: ${String(v)}`);
-    }
-    throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
+    return convertTypedValue(fromJs(v, undefined, {}, `replay.cast.source:${castValueExpr}`), normalizedTarget, {
+      mode: "explicit",
+      sourceContext: `replay.cast.target:${normalizedTarget}`,
+    }).value;
   }
 
   if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return row[expr] as SqlPrimitive | undefined;

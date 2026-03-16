@@ -1,5 +1,5 @@
 import type { ExprAst } from "./sql-ast.js";
-import type { SqlPrimitive } from "./types.js";
+import { convertTypedValue, fromJs, normalizeRuntimeTypeName, type SqlPrimitive } from "./types.js";
 
 function toFiniteNumber(v: SqlPrimitive | undefined): number | null {
   if (v === null || v === undefined) return null;
@@ -208,18 +208,17 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
 
       if (fn === "CAST") {
         const a = args[0];
-        const t = String(args[1] ?? "").toUpperCase();
+        const normalizedTarget = normalizeRuntimeTypeName(String(args[1] ?? ""));
         if (a == null) return null;
-        if (t === "TEXT") return String(a);
-        if (t === "INT" || t === "INTEGER") {
-          const n = Number(a);
-          return Number.isFinite(n) ? Math.trunc(n) : null;
+        if (!normalizedTarget || normalizedTarget === "NULL") return null;
+        try {
+          return convertTypedValue(fromJs(a, undefined, {}, "expr.cast"), normalizedTarget, {
+            mode: "explicit",
+            sourceContext: "expr.cast",
+          }).value;
+        } catch {
+          return null;
         }
-        if (t === "REAL") {
-          const n = Number(a);
-          return Number.isFinite(n) ? n : null;
-        }
-        return null;
       }
 
       return null;
