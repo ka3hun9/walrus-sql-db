@@ -39,7 +39,7 @@ import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import type { ExprAst, SelectStatementAst, SqlTransactionAction } from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
-import { ClientErrorCodeEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
+import { ClientErrorCodeEnum, ConstraintViolationKindEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
 import { createLogger, type Logger } from "./logger.js";
 import {
   emptyConstraintCostStats,
@@ -196,6 +196,7 @@ type TransactionTableWriteSet = {
 type TransactionWriteSet = {
   tables: Map<string, TransactionTableWriteSet>;
   logEntries: TransactionLogWriteEntry[];
+  observedVersions: Map<string, Map<string, number>>;
 };
 
 type QueryCacheEntry = {
@@ -215,6 +216,7 @@ type TransactionCommitRuntimeSnapshot = {
   tableSnapshots: Map<string, TransactionTableCommitSnapshot>;
   dirtyTables: Set<string>;
   storageWriteLog: StorageWriteEvent[];
+  rowVersions: Map<string, Map<string, number>>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
 };
@@ -271,6 +273,7 @@ export class WalrusSqlClient {
   private readonly dirtyTables = new Set<string>();
   private readonly queryCache = new Map<string, QueryCacheEntry>();
   private readonly storageWriteLog: StorageWriteEvent[] = [];
+  private readonly rowVersions = new Map<string, Map<string, number>>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -403,6 +406,7 @@ export class WalrusSqlClient {
     return {
       tables: new Map<string, TransactionTableWriteSet>(),
       logEntries: [],
+      observedVersions: new Map<string, Map<string, number>>(),
     };
   }
 
@@ -410,6 +414,7 @@ export class WalrusSqlClient {
     if (!this.transactionWriteSet) return;
     this.transactionWriteSet.tables.clear();
     this.transactionWriteSet.logEntries.length = 0;
+    this.transactionWriteSet.observedVersions.clear();
     this.transactionWriteSet = null;
   }
 
@@ -575,13 +580,95 @@ export class WalrusSqlClient {
     };
   }
 
-  private toWalWriteEntry(
-    table: string,
-    op: TransactionLogWriteOperation,
-    keySource: SqlRow,
-    preImage: SqlRow | null,
-    postImage: SqlRow | null,
-  ): TransactionLogWriteEntry {
+  private encodeRowVersionKey(key: Record<string, SqlPrimitive>): string {
+    const ordered: Record<string, SqlPrimitive> = {};
+    for (const column of Object.keys(key).sort()) ordered[column] = key[column] ?? null;
+    return JSON.stringify(ordered);
+  }
+
+  private getOrCreateRowVersionsForTable(table: string): Map<string, number> {
+    const existing = this.rowVersions.get(table);
+    if (existing) return existing;
+    const created = new Map<string, number>();
+    this.rowVersions.set(table, created);
+    return created;
+  }
+
+  private getCommittedRowVersion(table: string, key: Record<string, SqlPrimitive>): number {
+    const encoded = this.encodeRowVersionKey(key);
+    const versions = this.rowVersions.get(table);
+    return versions?.get(encoded) ?? 0;
+  }
+
+  private getCommittedRowVersionByEncodedKey(table: string, encodedKey: string): number {
+    const versions = this.rowVersions.get(table);
+    return versions?.get(encodedKey) ?? 0;
+  }
+
+  private rememberObservedRowVersion(table: string, key: Record<string, SqlPrimitive>): void {
+    const staged = this.transactionWriteSet;
+    if (!staged) return;
+
+    let tableObserved = staged.observedVersions.get(table);
+    if (!tableObserved) {
+      tableObserved = new Map<string, number>();
+      staged.observedVersions.set(table, tableObserved);
+    }
+
+    const encoded = this.encodeRowVersionKey(key);
+    if (tableObserved.has(encoded)) return;
+    tableObserved.set(encoded, this.getCommittedRowVersionByEncodedKey(table, encoded));
+  }
+
+  private assertNoWriteConflicts(staged: TransactionWriteSet): void {
+    for (const [table, observed] of staged.observedVersions.entries()) {
+      for (const [encodedKey, expectedVersion] of observed.entries()) {
+        const currentVersion = this.getCommittedRowVersionByEncodedKey(table, encodedKey);
+        if (currentVersion === expectedVersion) continue;
+        throw constraintError(
+          ConstraintViolationKindEnum.WriteConflict,
+          `write conflict detected on ${table}; expectedVersion=${expectedVersion}, currentVersion=${currentVersion}`,
+          { clause: "COMMIT", token: `${table}:${encodedKey}` },
+        );
+      }
+    }
+  }
+
+  private applyCommittedRowVersions(staged: TransactionWriteSet): void {
+    const finalOps = new Map<string, Map<string, TransactionLogWriteOperation>>();
+    for (const entry of staged.logEntries) {
+      let tableOps = finalOps.get(entry.table);
+      if (!tableOps) {
+        tableOps = new Map<string, TransactionLogWriteOperation>();
+        finalOps.set(entry.table, tableOps);
+      }
+      tableOps.set(this.encodeRowVersionKey(entry.key), entry.op);
+    }
+
+    for (const [table, tableOps] of finalOps.entries()) {
+      const versions = this.getOrCreateRowVersionsForTable(table);
+      for (const [encodedKey, op] of tableOps.entries()) {
+        if (op === "DELETE") {
+          versions.delete(encodedKey);
+          continue;
+        }
+        versions.set(encodedKey, (versions.get(encodedKey) ?? 0) + 1);
+      }
+    }
+  }
+
+  private applyImmediateRowVersion(table: string, op: TransactionLogWriteOperation, row: SqlRow): void {
+    const key = this.buildTransactionRowKey(table, row);
+    const encoded = this.encodeRowVersionKey(key);
+    const versions = this.getOrCreateRowVersionsForTable(table);
+    if (op === "DELETE") {
+      versions.delete(encoded);
+      return;
+    }
+    versions.set(encoded, (versions.get(encoded) ?? 0) + 1);
+  }
+
+  private buildTransactionRowKey(table: string, keySource: SqlRow): Record<string, SqlPrimitive> {
     const key: Record<string, SqlPrimitive> = {};
     const schema = this.schemas.get(table);
     const keyColumns = schema?.primaryKeyGroup
@@ -594,11 +681,20 @@ export class WalrusSqlClient {
       const fallbackColumns = Object.keys(keySource).sort();
       for (const column of fallbackColumns) key[column] = keySource[column] ?? null;
     }
+    return key;
+  }
 
+  private toWalWriteEntry(
+    table: string,
+    op: TransactionLogWriteOperation,
+    keySource: SqlRow,
+    preImage: SqlRow | null,
+    postImage: SqlRow | null,
+  ): TransactionLogWriteEntry {
     return {
       table,
       op,
-      key,
+      key: this.buildTransactionRowKey(table, keySource),
       preImage: preImage ? { ...preImage } : null,
       postImage: postImage ? { ...postImage } : null,
     };
@@ -613,7 +709,9 @@ export class WalrusSqlClient {
   ): void {
     if (!this.isDmlWriteStagingActive()) return;
     if (!this.transactionWriteSet) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
-    this.transactionWriteSet.logEntries.push(this.toWalWriteEntry(table, op, keySource, preImage, postImage));
+    const entry = this.toWalWriteEntry(table, op, keySource, preImage, postImage);
+    this.rememberObservedRowVersion(table, entry.key);
+    this.transactionWriteSet.logEntries.push(entry);
   }
 
   private createCommitWalRecord(): TransactionLogRecord | null {
@@ -719,6 +817,9 @@ export class WalrusSqlClient {
       tableSnapshots,
       dirtyTables: new Set(this.dirtyTables),
       storageWriteLog: this.storageWriteLog.map((evt) => ({ ...evt })),
+      rowVersions: new Map(
+        [...this.rowVersions.entries()].map(([table, versions]) => [table, new Map(versions)] as const),
+      ),
       writeVersion: this.writeVersion,
       queryCache: new Map(this.queryCache),
     };
@@ -740,6 +841,11 @@ export class WalrusSqlClient {
 
     this.storageWriteLog.length = 0;
     this.storageWriteLog.push(...snapshot.storageWriteLog.map((evt) => ({ ...evt })));
+
+    this.rowVersions.clear();
+    for (const [table, versions] of snapshot.rowVersions.entries()) {
+      this.rowVersions.set(table, new Map(versions));
+    }
 
     this.writeVersion = snapshot.writeVersion;
     this.queryCache.clear();
@@ -776,6 +882,7 @@ export class WalrusSqlClient {
         if (stats.deleteRows > 0) this.recordStorageWrite(table, "DELETE_ROW", stats.deleteRows, "simulator");
       }
 
+      this.applyCommittedRowVersions(staged);
       if (committedRows > 0) this.invalidateReadCacheOnWrite();
     } catch (err) {
       this.restoreTransactionCommitRuntimeSnapshot(snapshot);
@@ -815,6 +922,7 @@ export class WalrusSqlClient {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
       if (this.isSimulatorMode()) {
+        if (this.transactionWriteSet) this.assertNoWriteConflicts(this.transactionWriteSet);
         walRecord = this.createCommitWalRecord();
         if (walRecord) batchPayload = this.buildTransactionCommitBatchPayload(walRecord);
         if (walRecord) {
@@ -1175,6 +1283,7 @@ export class WalrusSqlClient {
       this.uniqueGroupsCache.set(schema.name, this.collectUniqueGroups(schema));
       this.ensureUniqueIndexMaps(schema.name);
       this.constraintCost.set(schema.name, emptyConstraintCostStats());
+      this.rowVersions.delete(schema.name);
       this.dirtyTables.add(schema.name);
       this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -1204,6 +1313,7 @@ export class WalrusSqlClient {
       this.uniqueIndexes.delete(table);
       this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
+      this.rowVersions.delete(table);
       this.dirtyTables.delete(table);
       this.recordStorageWrite(table, "DROP_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -1238,6 +1348,7 @@ export class WalrusSqlClient {
         this.bumpTableWriteStats(table, { insertRows: 1 });
       } else {
         this.dirtyTables.add(table);
+        this.applyImmediateRowVersion(table, "INSERT", coerced);
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
         this.invalidateReadCacheOnWrite();
       }
@@ -1340,6 +1451,7 @@ export class WalrusSqlClient {
         this.addRowToUniqueIndexes(plan.table, row);
         this.recordTransactionLogWrite(plan.table, "UPDATE", beforeImage, beforeImage, { ...row });
         this.bumpConstraintCost(plan.table, { updateOps: 1 });
+        if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(plan.table, "UPDATE", row);
         touched++;
       }
       if (this.isDmlWriteStagingActive()) {
@@ -1424,6 +1536,7 @@ export class WalrusSqlClient {
           // Keep unique indexes in sync before dropping the row from the table snapshot.
           this.removeRowFromUniqueIndexes(plan.table, row);
           this.recordTransactionLogWrite(plan.table, "DELETE", beforeImage, beforeImage, null);
+          if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(plan.table, "DELETE", beforeImage);
           touched++;
         } else {
           next.push(row);

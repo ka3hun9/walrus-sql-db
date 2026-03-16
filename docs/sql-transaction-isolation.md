@@ -9,3 +9,12 @@
   - writer session sees uncommitted staged rows
   - reader session sees only committed rows until writer commits
 - Covered by `test/unit-c-exec-013-read-committed-view.ts`.
+
+## P2-ISO-002: OCC Write Conflict Detector
+- Chosen path for `P2-ISO-002`: optimistic concurrency control (version-conflict detector).
+- Engine now tracks committed row versions per table key.
+- Transaction write-set captures observed committed versions for written rows.
+- On `COMMIT`, engine checks observed vs current versions:
+  - mismatch => `ERR_CONSTRAINT_VIOLATION:WRITE_CONFLICT`
+  - match => commit proceeds and row versions advance
+- Covered by `test/unit-c-exec-014-occ-write-conflict-detector.ts`.

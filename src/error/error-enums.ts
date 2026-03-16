@@ -34,6 +34,7 @@ export enum ClientErrorCodeEnum {
   UnsupportedType = "ERR_UNSUPPORTED_TYPE",
   TypeConstraint = "ERR_TYPE_CONSTRAINT",
   ConstraintViolation = "ERR_CONSTRAINT_VIOLATION",
+  TransactionState = "ERR_TRANSACTION_STATE",
   ExecutionFailed = "ERR_EXECUTION_FAILED",
   QueryFailed = "ERR_QUERY_FAILED",
   VerificationFailed = "ERR_VERIFICATION_FAILED",
@@ -42,6 +43,7 @@ export enum ClientErrorCodeEnum {
 export enum ConstraintViolationKindEnum {
   NotNull = "NOT_NULL",
   DuplicateKey = "DUPLICATE_KEY",
+  WriteConflict = "WRITE_CONFLICT",
   PkDrop = "PK_DROP",
   UniqueDrop = "UNIQUE_DROP",
   DdlDependency = "DDL_DEPENDENCY",
