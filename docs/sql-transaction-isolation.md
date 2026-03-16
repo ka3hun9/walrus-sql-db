@@ -27,3 +27,10 @@
   - subsequent statement fails with `ERR_TRANSACTION_STATE` timeout error
   - caller must `ROLLBACK` to return to `idle`
 - Covered by `test/unit-c-exec-015-transaction-timeout-guard.ts`.
+
+## P2-ISO-004: Dirty Read Prohibition Validation
+- Added explicit cross-session regression for dirty-read prevention:
+  - reader cannot observe writer's uncommitted insert/update
+  - rollback keeps reader-visible state unchanged
+  - commit makes changes visible afterwards
+- Covered by `test/unit-c-exec-016-dirty-read-prohibition-regression.ts`.
