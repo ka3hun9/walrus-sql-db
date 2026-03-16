@@ -118,6 +118,69 @@
 - [x] J-MILE-006 全测试管线绿灯（本地+CI）
 - [x] J-MILE-007 文档、示例、回归快照全部同步
 
+## K. Collation + Charset 全量能力（新增，100%达标门）
+
+### K1. 类型与元数据模型
+- [ ] K-TYPE-001 Runtime type metadata 增加 collation/charset 字段并统一序列化
+- [ ] K-TYPE-002 默认字符集与默认排序规则（database/schema/table/column 继承链）
+- [ ] K-TYPE-003 CHAR/VARCHAR/TEXT 在 charset 与 length 交互规则下行为确定（字符长度 vs 字节长度策略）
+- [ ] K-TYPE-004 非字符类型显式禁止 COLLATE/CHARSET 并返回标准化错误码
+
+### K2. DDL 语法与 catalog 持久化
+- [ ] K-DDL-001 CREATE TABLE 列级 `CHARACTER SET` / `COLLATE` 语法支持
+- [ ] K-DDL-002 CREATE TABLE 表级默认 `CHARACTER SET` / `COLLATE` 语法支持
+- [ ] K-DDL-003 ALTER TABLE 修改列/表 charset 与 collation（含兼容性校验）
+- [ ] K-DDL-004 SHOW/DESCRIBE/系统元数据查询可见 charset/collation
+- [ ] K-DDL-005 DDL 回放与增量存储中 charset/collation 元数据一致性
+
+### K3. 解析器与 AST
+- [ ] K-PARSE-001 SELECT 表达式级 `... COLLATE <name>` 解析与 AST 表达
+- [ ] K-PARSE-002 ORDER BY 中 COLLATE 子句解析（列、别名、表达式）
+- [ ] K-PARSE-003 WHERE/ON/HAVING 中字符串比较 COLLATE 覆盖解析
+- [ ] K-PARSE-004 CAST/函数参数与 COLLATE 组合语法稳定
+- [ ] K-PARSE-005 错误子句顺序与非法 collation token 的语法错误上下文
+
+### K4. 比较/排序/分组语义执行
+- [ ] K-EXEC-001 字符串比较语义接入 collation（=, <>, <, <=, >, >=）
+- [ ] K-EXEC-002 ORDER BY 在不同 collation 下稳定且可重复
+- [ ] K-EXEC-003 GROUP BY 分组键在不同 collation 下一致
+- [ ] K-EXEC-004 DISTINCT/UNION 去重受 collation 控制并可预测
+- [ ] K-EXEC-005 JOIN 键为字符串时按 collation 比较（INNER/LEFT/RIGHT/FULL）
+- [ ] K-EXEC-006 LIKE/IN/EXISTS 与 collation 交互语义明确并实现
+
+### K5. 约束与索引一致性
+- [ ] K-CONST-001 UNIQUE/PRIMARY KEY 字符串键按 collation 进行冲突判定
+- [ ] K-CONST-002 索引键规范化（normalization key）与比较语义一致
+- [ ] K-CONST-003 复合键中混合 charset/collation 的冲突与拒绝策略
+- [ ] K-CONST-004 约束错误信息输出具体 charset/collation 上下文
+
+### K6. Charset 转换与写入策略
+- [ ] K-CHARSET-001 写入时字符集合法性校验（非法码点/不可编码字符）
+- [ ] K-CHARSET-002 跨 charset 转换策略（strict reject / explicit convert）
+- [ ] K-CHARSET-003 隐式转换边界：字符列与数值/时间类型互转中的 charset 保留规则
+- [ ] K-CHARSET-004 BLOB 与 TEXT 边界（binary vs charset text）规则与错误码
+
+### K7. 配置与运维
+- [ ] K-ENG-001 配置项：默认 charset/collation、可选白名单、严格模式开关
+- [ ] K-ENG-002 日志与可观测：记录 collation 分支选择与 charset 转换失败原因
+- [ ] K-ENG-003 兼容策略：老表无 charset/collation 元数据的迁移与默认回填
+
+### K8. 测试与验收门
+- [ ] K-TEST-001 单测：不同 collation 下比较、排序、分组、去重矩阵
+- [ ] K-TEST-002 单测：charset 编码合法性、转换失败、边界字符集案例
+- [ ] K-TEST-003 集成：DDL→DML→查询→回放全链路 charset/collation 一致性
+- [ ] K-TEST-004 回归：JOIN/子查询/聚合/ORDER BY 与 collation 交互回归
+- [ ] K-TEST-005 sqllogic 扩展：collation/charset fixture 套件
+- [ ] K-TEST-006 性能基线：启用 collation 后排序/比较回归不超阈值
+- [ ] K-TEST-007 文档与示例同步（含限制、默认行为、迁移指南）
+
+### K9. 最终验收里程碑（新增）
+- [ ] K-MILE-001 字符串语义（比较/排序/分组/去重/约束）在多 collation 下验收通过
+- [ ] K-MILE-002 charset 合法性与转换策略验收通过
+- [ ] K-MILE-003 老数据迁移与向后兼容验收通过
+- [ ] K-MILE-004 全测试管线绿灯（含新增 K-TEST 套件）
+- [ ] K-MILE-005 文档、示例、回归快照全部同步
+
 ---
 
 ## 验收标准（Definition of Done）
