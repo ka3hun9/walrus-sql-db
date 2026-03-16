@@ -1341,10 +1341,11 @@ export class WalrusSqlClient {
     return {};
   }
 
-  private coerceByType(type: ColumnTypeSpec, boundInput: SqlPrimitive | SqlTypedValue, sourceContext = "dml.bind"): SqlPrimitive {
-    const typedInput = this.isBoundTypedValue(boundInput)
-      ? boundInput
-      : this.bindTypedValue(boundInput, "js", sourceContext);
+  private coerceByType(type: ColumnTypeSpec, boundInput: SqlTypedValue, sourceContext = "dml.bind"): SqlPrimitive {
+    if (!this.isBoundTypedValue(boundInput)) {
+      throw sqlError("ERR_TYPE_CONSTRAINT", "write binding must be TypedValue");
+    }
+    const typedInput = boundInput;
     const value = typedInput.value;
     if (value === null) return null;
 

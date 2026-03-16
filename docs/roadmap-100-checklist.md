@@ -142,7 +142,7 @@
 - [x] K-TVAL-011 JOIN/GROUP/ORDER/DISTINCT 键值规范化全部改为 TypedValue key codec
 
 ### K4. DML/DDL/约束链路改造
-- [ ] K-TVAL-012 INSERT/UPDATE 写入前校验统一走 TypedValue（禁止旁路校验）
+- [x] K-TVAL-012 INSERT/UPDATE 写入前校验统一走 TypedValue（禁止旁路校验）
 - [ ] K-TVAL-013 NOT NULL/UNIQUE/PRIMARY KEY 冲突检测统一消费 TypedValue
 - [ ] K-TVAL-014 DEFAULT 值、ALTER ADD COLUMN 回填值统一走 TypedValue
 - [ ] K-TVAL-015 错误信息增强：违反类型/约束时报错携带 TypedValue 上下文快照
