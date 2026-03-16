@@ -30,6 +30,7 @@
     "sql:compare:matrix:nightly": "tsx examples/sql-compare-matrix.ts reports/sql-compare-nightly.json reports/mre nightly",
     "sql:perf:bench": "tsx examples/sql-performance-benchmark.ts reports/sql-performance-benchmark.json",
     "sql:tpcc:bench": "tsx examples/sql-tpcc-like-benchmark.ts reports/sql-tpcc-like-benchmark.json",
+    "sql:tpcc:bench:conflict": "tsx examples/sql-tpcc-like-benchmark.ts reports/sql-tpcc-like-conflict-baseline.json 800 2 200",
     "sql:ast:smoke": "tsx examples/sql-ast-smoke.ts",
     "sql:typedvalue:migration": "tsx examples/sql-typedvalue-migration.ts",
     "sql:semantic:grouped": "tsx examples/sql-semantic-grouped-runner.ts",
