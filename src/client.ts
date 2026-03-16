@@ -710,11 +710,13 @@ export class WalrusSqlClient {
 
   private recordImmutableVersionObject(table: string, rows: SqlRow[]): void {
     const history = this.tableVersionObjects.get(table) ?? [];
-    const version = (history[history.length - 1]?.version ?? 0) + 1;
+    const prevVersion = history[history.length - 1]?.currentVersion ?? null;
+    const currentVersion = (prevVersion ?? 0) + 1;
+    const version = currentVersion;
     const immutableRows = this.toImmutableRows(rows);
     const createdAt = Date.now();
     const commitDigest = createHash("sha256")
-      .update(JSON.stringify({ table, version, createdAt, rows: immutableRows }))
+      .update(JSON.stringify({ table, prevVersion, currentVersion, createdAt, rows: immutableRows }))
       .digest("hex");
     const objectId = `0x${commitDigest.slice(0, 40)}`;
 
@@ -722,6 +724,8 @@ export class WalrusSqlClient {
       table,
       objectId,
       version,
+      prevVersion,
+      currentVersion,
       commitDigest,
       createdAt,
       immutable: true as const,

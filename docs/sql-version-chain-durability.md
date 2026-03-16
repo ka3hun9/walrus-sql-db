@@ -8,3 +8,13 @@
   - `getTableVersionObjects(table?)`
 - New commits create new version objects; previous versions remain unchanged.
 - Covered by `test/unit-g-stor-011-immutable-version-object-on-commit.ts`.
+
+## P2-DUR-002: Version Chain Metadata
+- Version object metadata now includes:
+  - `prevVersion`
+  - `currentVersion`
+  - `commitDigest`
+- Chain semantics:
+  - first version: `prevVersion = null`, `currentVersion = 1`
+  - next version points to prior `currentVersion`
+- Covered by `test/unit-g-stor-012-version-chain-metadata.ts`.

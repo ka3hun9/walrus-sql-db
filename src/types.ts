@@ -1140,6 +1140,8 @@ export interface VersionedStorageObject {
   table: string;
   objectId: string;
   version: number;
+  prevVersion: number | null;
+  currentVersion: number;
   commitDigest: string;
   createdAt: number;
   immutable: true;
