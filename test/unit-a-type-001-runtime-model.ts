@@ -78,5 +78,7 @@ assert.equal(inferredText.metadata.length, 5);
 const explicit = toTypedValue("abc", SqlRuntimeType.VARCHAR, { length: 32 });
 assert.equal(explicit.type, SqlRuntimeType.VARCHAR);
 assert.equal(explicit.runtimeType.metadata.length, 32);
+assert.equal(explicit.metadata.runtimeType.metadata.length, 32);
+assert.equal(explicit.runtimeType, explicit.metadata.runtimeType);
 
 console.log("ok: A-TYPE-001 runtime type model");

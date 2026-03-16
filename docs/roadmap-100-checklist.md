@@ -122,10 +122,10 @@
 
 > 目标：将 A-TYPE-001 从“运行时类型模型完成”升级为“**全链路 TypedValue 强制化**”，满足“所有值操作都经过 TypedValue”的验收口径。
 >
-> 通过标准：K 组条目全部完成并测试通过后，阶段一可按你的标准判定 100%。
+> 通过标准：K 组条目全部完成并测试通过后。
 
 ### K1. 类型核心与不可变值模型
-- [ ] K-TVAL-001 定义统一 `TypedValue` 核心结构（type + value + metadata）并冻结不可变语义
+- [x] K-TVAL-001 定义统一 `TypedValue` 核心结构（type + value + metadata）并冻结不可变语义
 - [ ] K-TVAL-002 提供统一构造/校验工厂（fromLiteral/fromStorage/fromJs）
 - [ ] K-TVAL-003 提供统一比较接口（eq/lt/lte/gt/gte）并接入 NULL 3VL
 - [ ] K-TVAL-004 提供统一算术/逻辑操作接口（add/sub/mul/div/and/or/not）及类型提升规则

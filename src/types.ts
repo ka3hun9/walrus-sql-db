@@ -205,6 +205,17 @@ function validateRuntimeTypeMetadata(name: SqlRuntimeTypeName, metadata: SqlRunt
   }
 }
 
+function freezeRuntimeTypeMetadata(metadata: SqlRuntimeTypeMetadata): Readonly<SqlRuntimeTypeMetadata> {
+  const frozen: SqlRuntimeTypeMetadata = { ...metadata };
+  for (const key of Object.keys(frozen) as Array<keyof SqlRuntimeTypeMetadata>) {
+    const field = frozen[key];
+    if (Array.isArray(field)) {
+      (frozen as Record<string, unknown>)[key] = Object.freeze([...field]);
+    }
+  }
+  return Object.freeze(frozen);
+}
+
 export function createRuntimeTypeModel(
   name: SqlRuntimeTypeName,
   metadata: Partial<SqlRuntimeTypeMetadata> = {},
@@ -212,12 +223,12 @@ export function createRuntimeTypeModel(
   const base = BASE_RUNTIME_TYPE_MODELS[name];
   const mergedMetadata: SqlRuntimeTypeMetadata = { ...base.metadata, ...metadata };
   validateRuntimeTypeMetadata(name, mergedMetadata);
-  return {
+  return Object.freeze({
     name,
     family: base.family,
     acceptsParameters: base.acceptsParameters,
-    metadata: mergedMetadata,
-  };
+    metadata: freezeRuntimeTypeMetadata(mergedMetadata),
+  });
 }
 
 export function listRuntimeTypeModels(): SqlRuntimeTypeModel[] {
@@ -344,6 +355,10 @@ export function inferRuntimeType(value: SqlPrimitive): SqlRuntimeTypeName {
 export interface SqlTypedValue {
   type: SqlRuntimeTypeName;
   value: SqlPrimitive;
+  metadata: Readonly<{
+    runtimeType: SqlRuntimeTypeModel;
+  }>;
+  // Compatibility alias for existing callers; points to metadata.runtimeType.
   runtimeType: SqlRuntimeTypeModel;
 }
 
@@ -353,7 +368,16 @@ export function toTypedValue(
   metadata: Partial<SqlRuntimeTypeMetadata> = {},
 ): SqlTypedValue {
   const runtimeType = explicitType ? createRuntimeTypeModel(explicitType, metadata) : inferRuntimeTypeModel(value);
-  return { type: runtimeType.name, value, runtimeType };
+  const typedMetadata = Object.freeze({
+    runtimeType,
+  });
+
+  return Object.freeze({
+    type: runtimeType.name,
+    value,
+    metadata: typedMetadata,
+    runtimeType: typedMetadata.runtimeType,
+  });
 }
 
 export function fromTypedValue(v: SqlTypedValue): SqlPrimitive {
