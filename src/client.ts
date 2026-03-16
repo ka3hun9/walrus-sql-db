@@ -1647,7 +1647,7 @@ export class WalrusSqlClient {
 
       const whereTree = this.parseWhereTree(plan.whereExpr);
       const targetSetField = this.resolveUpdateSetField(plan);
-      let touched = 0;
+      const updateCounts = new Map<string, number>();
       for (const row of bucket) {
         const mergedHits = joinedRows.get(row);
         if (!mergedHits || mergedHits.length === 0) continue;
@@ -1674,22 +1674,26 @@ export class WalrusSqlClient {
           boundSetValue ? { [targetSetField]: boundSetValue } : {},
         );
         const beforeImage = { ...row };
-        // Commit in deterministic order: drop old unique keys, mutate row, add new unique keys.
-        this.removeRowFromUniqueIndexes(plan.table, row);
-        Object.keys(row).forEach((k) => delete row[k]);
-        Object.assign(row, next);
-        this.addRowToUniqueIndexes(plan.table, row);
-        this.recordTransactionLogWrite(plan.table, "UPDATE", beforeImage, beforeImage, { ...row });
-        this.bumpConstraintCost(plan.table, { updateOps: 1 });
-        if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(plan.table, "UPDATE", row);
-        touched++;
+        this.assertOnUpdateActionAllowed(plan.table, beforeImage, next);
+        this.commitRowUpdate(plan.table, row, next);
+        updateCounts.set(plan.table, (updateCounts.get(plan.table) ?? 0) + 1);
+
+        const cascaded = this.applyOnUpdateCascade(plan.table, beforeImage, row);
+        for (const [table, count] of cascaded.entries()) {
+          updateCounts.set(table, (updateCounts.get(table) ?? 0) + count);
+        }
       }
+      const touched = [...updateCounts.values()].reduce((sum, count) => sum + count, 0);
       if (this.isDmlWriteStagingActive()) {
-        if (touched > 0) this.bumpTableWriteStats(plan.table, { updateRows: touched });
+        for (const [table, count] of updateCounts.entries()) {
+          if (count > 0) this.bumpTableWriteStats(table, { updateRows: count });
+        }
       } else {
-        if (touched > 0) this.dirtyTables.add(plan.table);
-        if (touched > 0) this.recordStorageWrite(plan.table, "UPDATE_ROW", touched, "simulator");
-        this.invalidateReadCacheOnWrite();
+        for (const [table, count] of updateCounts.entries()) {
+          if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordStorageWrite(table, "UPDATE_ROW", count, "simulator");
+        }
+        if (touched > 0) this.invalidateReadCacheOnWrite();
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -3028,6 +3032,83 @@ export class WalrusSqlClient {
 
       this.setTableRows(table, keep);
       if (touched > 0) counts.set(table, touched);
+    }
+
+    return counts;
+  }
+
+  private commitRowUpdate(table: string, row: SqlRow, next: SqlRow): void {
+    const beforeImage = { ...row };
+    this.removeRowFromUniqueIndexes(table, row);
+    Object.keys(row).forEach((k) => delete row[k]);
+    Object.assign(row, next);
+    this.addRowToUniqueIndexes(table, row);
+    this.recordTransactionLogWrite(table, "UPDATE", beforeImage, beforeImage, { ...row });
+    this.bumpConstraintCost(table, { updateOps: 1 });
+    if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "UPDATE", row);
+  }
+
+  private didForeignKeyReferenceChange(fk: ForeignKeySpec, before: SqlRow, after: SqlRow): boolean {
+    return fk.refColumns.some((refColumn) =>
+      !this.areConstraintValuesEqual(
+        (before[refColumn] ?? null) as SqlPrimitive,
+        (after[refColumn] ?? null) as SqlPrimitive,
+        `constraint.fk.ref-change:${refColumn}`,
+      ));
+  }
+
+  private assertOnUpdateActionAllowed(parentTable: string, before: SqlRow, after: SqlRow): void {
+    for (const ref of this.getReferencingForeignKeys(parentTable)) {
+      if (!this.didForeignKeyReferenceChange(ref.fk, before, after)) continue;
+
+      const childRows = this.requireWritableTableForDml(ref.table);
+      const hasReference = childRows.some((childRow) => this.doesChildRowReferenceParent(before, childRow, ref.fk));
+      if (!hasReference) continue;
+
+      if (ref.fk.onUpdate === "RESTRICT" || ref.fk.onUpdate === "NO ACTION") {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `cannot update ${parentTable}: referenced by ${ref.table}(${ref.fk.columns.join(",")})`,
+          {
+            clause: `ON UPDATE ${ref.fk.onUpdate}`,
+            field: `${parentTable} -> ${ref.table}`,
+          },
+        );
+      }
+
+      if (ref.fk.onUpdate !== "CASCADE") {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `ON UPDATE ${ref.fk.onUpdate} is not supported in update path yet`,
+          {
+            clause: `ON UPDATE ${ref.fk.onUpdate}`,
+            field: `${parentTable} -> ${ref.table}`,
+          },
+        );
+      }
+    }
+  }
+
+  private applyOnUpdateCascade(parentTable: string, before: SqlRow, after: SqlRow): Map<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const ref of this.getReferencingForeignKeys(parentTable)) {
+      if (ref.fk.onUpdate !== "CASCADE") continue;
+      if (!this.didForeignKeyReferenceChange(ref.fk, before, after)) continue;
+
+      const childRows = this.requireWritableTableForDml(ref.table);
+      for (const childRow of childRows) {
+        if (!this.doesChildRowReferenceParent(before, childRow, ref.fk)) continue;
+        const candidate = { ...childRow };
+        for (let i = 0; i < ref.fk.columns.length; i++) {
+          const childColumn = ref.fk.columns[i]!;
+          const parentColumn = ref.fk.refColumns[i]!;
+          candidate[childColumn] = (after[parentColumn] ?? null) as SqlPrimitive;
+        }
+        const next = this.applySchemaOnWrite(ref.table, candidate, childRow);
+        this.commitRowUpdate(ref.table, childRow, next);
+        counts.set(ref.table, (counts.get(ref.table) ?? 0) + 1);
+      }
     }
 
     return counts;
