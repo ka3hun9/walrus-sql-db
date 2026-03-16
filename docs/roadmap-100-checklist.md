@@ -166,7 +166,7 @@
 
 ### K8. 最终里程碑（阶段一补齐）
 - [x] K-MILE-001 代码中所有值操作路径移除裸 primitive 快捷通道
-- [ ] K-MILE-002 阶段一自检项 A-TYPE-001 验收通过（全链路 TypedValue）
+- [x] K-MILE-002 阶段一自检项 A-TYPE-001 验收通过（全链路 TypedValue）
 - [ ] K-MILE-003 全测试管线绿灯（build + unit + integration + regression + benchmark）
 - [ ] K-MILE-004 文档、示例、迁移说明同步完成
 
