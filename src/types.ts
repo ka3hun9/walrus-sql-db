@@ -1115,6 +1115,15 @@ export interface TransactionLogRecord extends TransactionLogRecordPayload {
   checksum: string;
 }
 
+export type TransactionWalEntryPhase = "PREPARE" | "COMMIT" | "ROLLBACK";
+
+export interface TransactionWalEntry {
+  phase: TransactionWalEntryPhase;
+  txnId: string;
+  at: number;
+  record?: TransactionLogRecord;
+}
+
 function stableSerializeJson(value: unknown): string {
   if (value === null) return "null";
 
@@ -1262,6 +1271,10 @@ export interface WalrusSqlClientOptions {
     maxAttempts?: number;
     baseDelayMs?: number;
     maxDelayMs?: number;
+  };
+  wal?: {
+    enabled?: boolean;
+    filePath?: string;
   };
   logging?: {
     level?: import("./logger.js").LogLevel;

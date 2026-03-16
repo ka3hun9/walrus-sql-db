@@ -23,3 +23,18 @@
 - `computeTransactionLogChecksum()` uses deterministic JSON key ordering with SHA-256.
 - `verifyTransactionLogRecordChecksum()` verifies integrity and tamper detection.
 - Covered by `test/unit-g-stor-006-transaction-log-structure.ts`.
+
+## P2-LOG-002
+- WAL persistence is available through `WalrusSqlClientOptions.wal`:
+  - `enabled`: turn WAL persistence on/off
+  - `filePath`: NDJSON WAL file path (default `.cache/walrus-sql/transaction.wal.ndjson`)
+- Commit path (`mode=simulator`) now writes:
+  - `PREPARE` record before apply (`record` includes txn writeSet + checksum)
+  - `COMMIT` marker after apply
+  - `ROLLBACK` marker when commit flow fails after prepare
+- Recovery entry API: `recoverPendingTransactionLogsFromWal()`:
+  - reads WAL NDJSON
+  - validates prepared record checksum
+  - returns unresolved prepared transactions (`PREPARE` without `COMMIT`/`ROLLBACK`)
+  - skips malformed lines safely
+- Covered by `test/unit-g-stor-007-wal-persistence-recovery-entry.ts`.

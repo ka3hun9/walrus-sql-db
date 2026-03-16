@@ -1,6 +1,9 @@
 import { randomUUID, createHash } from "node:crypto";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
 import {
+  createTransactionLogRecord,
   convertTypedValue,
   encodeBlob,
   fromJs,
@@ -10,6 +13,7 @@ import {
   SqlRuntimeType,
   typedValueComparator,
   typedValueOperators,
+  verifyTransactionLogRecordChecksum,
 } from "./types.js";
 import type {
   ExecuteResult,
@@ -23,6 +27,9 @@ import type {
   SqlTypedValue,
   StorageWriteEvent,
   StorageWriteOperation,
+  TransactionLogRecord,
+  TransactionLogWriteEntry,
+  TransactionLogWriteOperation,
   WalrusSqlClientOptions,
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
@@ -187,6 +194,7 @@ type TransactionTableWriteSet = {
 
 type TransactionWriteSet = {
   tables: Map<string, TransactionTableWriteSet>;
+  logEntries: TransactionLogWriteEntry[];
 };
 
 type QueryCacheEntry = {
@@ -213,6 +221,15 @@ type TransactionCommitRuntimeSnapshot = {
 type TransactionTableCommitSideEffect = {
   table: string;
   stats: TransactionTableWriteStats;
+};
+
+type TransactionWalEntryPhase = "PREPARE" | "COMMIT" | "ROLLBACK";
+
+type TransactionWalEntry = {
+  phase: TransactionWalEntryPhase;
+  txnId: string;
+  at: number;
+  record?: TransactionLogRecord;
 };
 
 const SESSION_TRANSACTION_TRANSITIONS: Record<
@@ -363,13 +380,133 @@ export class WalrusSqlClient {
   }
 
   private createEmptyTransactionWriteSet(): TransactionWriteSet {
-    return { tables: new Map<string, TransactionTableWriteSet>() };
+    return {
+      tables: new Map<string, TransactionTableWriteSet>(),
+      logEntries: [],
+    };
   }
 
   private clearTransactionWriteSet(): void {
     if (!this.transactionWriteSet) return;
     this.transactionWriteSet.tables.clear();
+    this.transactionWriteSet.logEntries.length = 0;
     this.transactionWriteSet = null;
+  }
+
+  private getWalFilePath(): string | null {
+    const cfg = this.opts.wal;
+    if (!cfg?.enabled) return null;
+    const normalized = (cfg.filePath ?? ".cache/walrus-sql/transaction.wal.ndjson").trim();
+    return normalized.length > 0 ? normalized : ".cache/walrus-sql/transaction.wal.ndjson";
+  }
+
+  private async appendTransactionWalEntry(entry: TransactionWalEntry): Promise<void> {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return;
+
+    await mkdir(dirname(walPath), { recursive: true });
+    await appendFile(walPath, `${JSON.stringify(entry)}\n`, "utf8");
+  }
+
+  private toWalWriteEntry(
+    table: string,
+    op: TransactionLogWriteOperation,
+    keySource: SqlRow,
+    preImage: SqlRow | null,
+    postImage: SqlRow | null,
+  ): TransactionLogWriteEntry {
+    const key: Record<string, SqlPrimitive> = {};
+    const schema = this.schemas.get(table);
+    const keyColumns = schema?.primaryKeyGroup
+      ?? schema?.columns.filter((column) => column.primaryKey).map((column) => column.name)
+      ?? [];
+
+    if (keyColumns.length > 0) {
+      for (const column of keyColumns) key[column] = keySource[column] ?? null;
+    } else {
+      const fallbackColumns = Object.keys(keySource).sort();
+      for (const column of fallbackColumns) key[column] = keySource[column] ?? null;
+    }
+
+    return {
+      table,
+      op,
+      key,
+      preImage: preImage ? { ...preImage } : null,
+      postImage: postImage ? { ...postImage } : null,
+    };
+  }
+
+  private recordTransactionLogWrite(
+    table: string,
+    op: TransactionLogWriteOperation,
+    keySource: SqlRow,
+    preImage: SqlRow | null,
+    postImage: SqlRow | null,
+  ): void {
+    if (!this.isDmlWriteStagingActive()) return;
+    if (!this.transactionWriteSet) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
+    this.transactionWriteSet.logEntries.push(this.toWalWriteEntry(table, op, keySource, preImage, postImage));
+  }
+
+  private createCommitWalRecord(): TransactionLogRecord | null {
+    const staged = this.transactionWriteSet;
+    if (!staged || staged.logEntries.length === 0) return null;
+    return createTransactionLogRecord({
+      txnId: randomUUID(),
+      at: Date.now(),
+      writeSet: staged.logEntries.map((entry) => ({
+        table: entry.table,
+        op: entry.op,
+        key: { ...entry.key },
+        preImage: entry.preImage ? { ...entry.preImage } : null,
+        postImage: entry.postImage ? { ...entry.postImage } : null,
+      })),
+    });
+  }
+
+  async recoverPendingTransactionLogsFromWal(): Promise<TransactionLogRecord[]> {
+    const walPath = this.getWalFilePath();
+    if (!walPath) return [];
+
+    let text = "";
+    try {
+      text = await readFile(walPath, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return [];
+      throw this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "failed to read WAL file for recovery");
+    }
+
+    const pending = new Map<string, TransactionLogRecord>();
+    const lines = text.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      let entry: TransactionWalEntry;
+      try {
+        entry = JSON.parse(line) as TransactionWalEntry;
+      } catch {
+        this.logger.warn("skip malformed WAL line during recovery", { line });
+        continue;
+      }
+
+      if (entry.phase === "PREPARE") {
+        if (!entry.record || !verifyTransactionLogRecordChecksum(entry.record)) {
+          this.logger.warn("skip WAL PREPARE with invalid/missing checksum", { txnId: entry.txnId });
+          continue;
+        }
+        pending.set(entry.txnId, entry.record);
+        continue;
+      }
+
+      if (entry.phase === "COMMIT" || entry.phase === "ROLLBACK") {
+        pending.delete(entry.txnId);
+      }
+    }
+
+    return [...pending.values()];
   }
 
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
@@ -482,10 +619,29 @@ export class WalrusSqlClient {
     }
 
     this.transitionTransactionState("commit", sql);
+    let walRecord: TransactionLogRecord | null = null;
     try {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
-      if (this.isSimulatorMode()) this.applyTransactionWriteSetOnCommit();
+      if (this.isSimulatorMode()) {
+        walRecord = this.createCommitWalRecord();
+        if (walRecord) {
+          await this.appendTransactionWalEntry({
+            phase: "PREPARE",
+            txnId: walRecord.txnId,
+            at: Date.now(),
+            record: walRecord,
+          });
+        }
+        this.applyTransactionWriteSetOnCommit();
+        if (walRecord) {
+          await this.appendTransactionWalEntry({
+            phase: "COMMIT",
+            txnId: walRecord.txnId,
+            at: Date.now(),
+          });
+        }
+      }
       this.transitionTransactionState("commit_done", sql);
       this.clearTransactionWriteSet();
       return {
@@ -494,6 +650,17 @@ export class WalrusSqlClient {
         affectedRows: 0,
       };
     } catch (err) {
+      if (walRecord) {
+        try {
+          await this.appendTransactionWalEntry({
+            phase: "ROLLBACK",
+            txnId: walRecord.txnId,
+            at: Date.now(),
+          });
+        } catch (walErr) {
+          this.logger.warn("failed to append WAL rollback marker", { error: this.stringifyError(walErr) });
+        }
+      }
       this.transitionTransactionToAbortedOnError(sql);
       throw err;
     }
@@ -885,6 +1052,7 @@ export class WalrusSqlClient {
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
       if (this.isDmlWriteStagingActive()) {
+        this.recordTransactionLogWrite(table, "INSERT", coerced, null, coerced);
         this.bumpTableWriteStats(table, { insertRows: 1 });
       } else {
         this.dirtyTables.add(table);
@@ -982,11 +1150,13 @@ export class WalrusSqlClient {
           row,
           boundSetValue ? { [targetSetField]: boundSetValue } : {},
         );
+        const beforeImage = { ...row };
         // Commit in deterministic order: drop old unique keys, mutate row, add new unique keys.
         this.removeRowFromUniqueIndexes(plan.table, row);
         Object.keys(row).forEach((k) => delete row[k]);
         Object.assign(row, next);
         this.addRowToUniqueIndexes(plan.table, row);
+        this.recordTransactionLogWrite(plan.table, "UPDATE", beforeImage, beforeImage, { ...row });
         this.bumpConstraintCost(plan.table, { updateOps: 1 });
         touched++;
       }
@@ -1068,8 +1238,10 @@ export class WalrusSqlClient {
         const mergedHits = joinedRows.get(row);
         const matched = mergedHits ? mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE") : false;
         if (matched) {
+          const beforeImage = { ...row };
           // Keep unique indexes in sync before dropping the row from the table snapshot.
           this.removeRowFromUniqueIndexes(plan.table, row);
+          this.recordTransactionLogWrite(plan.table, "DELETE", beforeImage, beforeImage, null);
           touched++;
         } else {
           next.push(row);
