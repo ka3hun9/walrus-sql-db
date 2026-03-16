@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
-import { encodeBlob, inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
+import { encodeBlob, fromJs, fromLiteral, fromStorage, inferRuntimeType, normalizeRuntimeTypeName, resolveCastPolicy } from "./types.js";
 import type {
   ExecuteResult,
   QueryProofResult,
@@ -8,6 +8,7 @@ import type {
   SqlPrimitive,
   SqlRow,
   SqlRuntimeTypeName,
+  SqlTypedValue,
   StorageWriteEvent,
   StorageWriteOperation,
   WalrusSqlClientOptions,
@@ -131,6 +132,8 @@ type DmlPlan = {
   whereExpr: string;
   joinAware: boolean;
 };
+
+type BoundColumnValues = Record<string, SqlTypedValue>;
 
 type UpdatePlan = DmlPlan & {
   setField: string;
@@ -546,9 +549,9 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
-      const row = this.parseInsert(normalized);
+      const parsedInsert = this.parseInsert(normalized);
       const bucket = this.requireTable(table);
-      const coerced = this.applySchemaOnWrite(table, row, undefined);
+      const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
       this.dirtyTables.add(table);
@@ -628,10 +631,17 @@ export class WalrusSqlClient {
         if (!matched) continue;
 
         // Validate/coerce and enforce constraints before mutating row or indexes.
+        const boundSetValue = fromLiteral(
+          this.castValue(plan.setValue),
+          undefined,
+          {},
+          `dml.update.set:${plan.table}.${targetSetField}`,
+        );
         const next = this.applySchemaOnWrite(
           plan.table,
-          { ...row, [targetSetField]: this.castValue(plan.setValue) },
+          { ...row, [targetSetField]: boundSetValue.value },
           row,
+          { [targetSetField]: boundSetValue },
         );
         // Commit in deterministic order: drop old unique keys, mutate row, add new unique keys.
         this.removeRowFromUniqueIndexes(plan.table, row);
@@ -978,7 +988,7 @@ export class WalrusSqlClient {
     return out;
   }
 
-  private parseDefaultLiteral(rawConstraints: string): { hasDefault: boolean; value?: SqlPrimitive } {
+  private parseDefaultLiteral(rawConstraints: string, sourceContext: string): { hasDefault: boolean; typedValue?: SqlTypedValue } {
     const m = /\bDEFAULT\b/i.exec(rawConstraints);
     if (!m) return { hasDefault: false };
 
@@ -1027,7 +1037,10 @@ export class WalrusSqlClient {
       }
     }
 
-    return { hasDefault: true, value: this.castValue(literal) };
+    return {
+      hasDefault: true,
+      typedValue: fromLiteral(this.castValue(literal), undefined, {}, sourceContext),
+    };
   }
 
   private parseSqlTypeSpec(rawType: string): ColumnTypeSpec {
@@ -1120,8 +1133,10 @@ export class WalrusSqlClient {
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
-      const defaultParsed = this.parseDefaultLiteral(consRaw);
-      const defaultValue = defaultParsed.hasDefault ? this.coerceByType(type, defaultParsed.value ?? null) : undefined;
+      const defaultParsed = this.parseDefaultLiteral(consRaw, `ddl.default.create:${table}.${colName}`);
+      const defaultValue = defaultParsed.hasDefault
+        ? this.coerceByType(type, defaultParsed.typedValue ?? fromLiteral(null), `ddl.default.create:${table}.${colName}`)
+        : undefined;
       if (notNull && defaultParsed.hasDefault && (defaultValue === null || defaultValue === undefined)) {
         throw sqlError("ERR_UNSUPPORTED_DDL", `DEFAULT NULL conflicts with NOT NULL: ${colName}`);
       }
@@ -1194,8 +1209,10 @@ export class WalrusSqlClient {
       const primaryKey = /\bPRIMARY\s+KEY\b/.test(cons);
       const notNull = primaryKey || /\bNOT\s+NULL\b/.test(cons);
       const unique = primaryKey || /\bUNIQUE\b/.test(cons);
-      const defaultParsed = this.parseDefaultLiteral(consRaw);
-      const defaultValue = defaultParsed.hasDefault ? this.coerceByType(type, defaultParsed.value ?? null) : undefined;
+      const defaultParsed = this.parseDefaultLiteral(consRaw, `ddl.default.alter:${table}.${column}`);
+      const defaultValue = defaultParsed.hasDefault
+        ? this.coerceByType(type, defaultParsed.typedValue ?? fromLiteral(null), `ddl.default.alter:${table}.${column}`)
+        : undefined;
       const col: ColumnSchema = { name: column, type, notNull, primaryKey, unique, defaultValue };
 
       const rows = this.requireTable(table);
@@ -1285,10 +1302,29 @@ export class WalrusSqlClient {
     return [...out.values()];
   }
 
-  private coerceByType(type: ColumnTypeSpec, value: SqlPrimitive): SqlPrimitive {
+  private isBoundTypedValue(value: SqlPrimitive | SqlTypedValue): value is SqlTypedValue {
+    if (typeof value !== "object" || value === null) return false;
+    return "type" in value && "value" in value && "metadata" in value;
+  }
+
+  private bindTypedValue(
+    value: SqlPrimitive,
+    source: "js" | "literal" | "storage",
+    sourceContext: string,
+  ): SqlTypedValue {
+    if (source === "literal") return fromLiteral(value, undefined, {}, sourceContext);
+    if (source === "storage") return fromStorage(value, undefined, {}, sourceContext);
+    return fromJs(value, undefined, {}, sourceContext);
+  }
+
+  private coerceByType(type: ColumnTypeSpec, boundInput: SqlPrimitive | SqlTypedValue, sourceContext = "dml.bind"): SqlPrimitive {
+    const typedInput = this.isBoundTypedValue(boundInput)
+      ? boundInput
+      : this.bindTypedValue(boundInput, "js", sourceContext);
+    const value = typedInput.value;
     if (value === null) return null;
 
-    const sourceType = inferRuntimeType(value);
+    const sourceType = typedInput.type ?? inferRuntimeType(value);
     if (resolveCastPolicy(sourceType, type.name as SqlRuntimeTypeName, "implicit") === "reject") {
       throw sqlError("ERR_TYPE_CONSTRAINT", `implicit cast ${sourceType} -> ${type.name} not allowed`);
     }
@@ -1461,7 +1497,12 @@ export class WalrusSqlClient {
     throw sqlError("ERR_UNSUPPORTED_TYPE", type.name);
   }
 
-  private applySchemaOnWrite(table: string, candidate: SqlRow, previous?: SqlRow): SqlRow {
+  private applySchemaOnWrite(
+    table: string,
+    candidate: SqlRow,
+    previous?: SqlRow,
+    boundInputs: BoundColumnValues = {},
+  ): SqlRow {
     const schema = this.schemas.get(table);
     if (!schema) return candidate;
 
@@ -1473,10 +1514,20 @@ export class WalrusSqlClient {
 
     const out: SqlRow = {};
     for (const c of schema.columns) {
-      const raw = Object.prototype.hasOwnProperty.call(candidate, c.name)
-        ? candidate[c.name]
-        : (c.defaultValue ?? null);
-      const coerced = this.coerceByType(c.type, (raw ?? null) as SqlPrimitive);
+      const hasCandidate = Object.prototype.hasOwnProperty.call(candidate, c.name);
+      const raw = hasCandidate ? candidate[c.name] : (c.defaultValue ?? null);
+
+      const bound =
+        boundInputs[c.name]
+        ?? (hasCandidate
+          ? this.bindTypedValue(
+              (raw ?? null) as SqlPrimitive,
+              previous && Object.prototype.hasOwnProperty.call(previous, c.name) ? "storage" : "js",
+              `dml.bind:${table}.${c.name}`,
+            )
+          : this.bindTypedValue((raw ?? null) as SqlPrimitive, "literal", `dml.default:${table}.${c.name}`));
+
+      const coerced = this.coerceByType(c.type, bound, `dml.coerce:${table}.${c.name}`);
       if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
         throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`, {
           clause: "NOT NULL",
@@ -1629,15 +1680,21 @@ export class WalrusSqlClient {
     this.bumpConstraintCost(table, { updateOps: 1 });
   }
 
-  private parseInsert(sql: string): SqlRow {
-    const m = sql.match(/INSERT INTO\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\((.+)\)\s*VALUES\s*\((.+)\)/i);
+  private parseInsert(sql: string): { row: SqlRow; bindings: BoundColumnValues } {
+    const m = sql.match(/INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*VALUES\s*\((.+)\)/i);
     if (!m) throw sqlError("ERR_UNSUPPORTED_INSERT", sql);
-    const cols = this.splitTopLevelComma(m[1]).map((c) => c.trim());
-    const vals = this.smartSplit(m[2]).map((v) => this.castValue(v));
+    const table = m[1]!;
+    const cols = this.splitTopLevelComma(m[2]).map((c) => c.trim());
+    const vals = this.smartSplit(m[3]).map((v) => this.castValue(v));
     if (cols.length !== vals.length) throw sqlError("ERR_UNSUPPORTED_INSERT", "INSERT column/value mismatch");
     const row: SqlRow = {};
-    cols.forEach((c, i) => (row[c] = vals[i] ?? null));
-    return row;
+    const bindings: BoundColumnValues = {};
+    cols.forEach((c, i) => {
+      const bound = fromLiteral(vals[i] ?? null, undefined, {}, `dml.insert.value:${table}.${c}`);
+      row[c] = bound.value;
+      bindings[c] = bound;
+    });
+    return { row, bindings };
   }
 
   private planUpdate(sql: string): UpdatePlan {
