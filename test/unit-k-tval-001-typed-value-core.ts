@@ -6,6 +6,7 @@ assert.equal(implicit.type, SqlRuntimeType.INT);
 assert.equal(implicit.value, 7);
 assert.equal(implicit.runtimeType, implicit.metadata.runtimeType);
 assert.equal(implicit.metadata.runtimeType.name, SqlRuntimeType.INT);
+assert.equal(implicit.metadata.source, "js");
 
 assert.equal(Object.isFrozen(implicit), true);
 assert.equal(Object.isFrozen(implicit.metadata), true);

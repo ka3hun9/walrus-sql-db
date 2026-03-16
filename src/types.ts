@@ -352,14 +352,157 @@ export function inferRuntimeType(value: SqlPrimitive): SqlRuntimeTypeName {
   return inferRuntimeTypeModel(value).name;
 }
 
+export type SqlTypedValueSource = "js" | "literal" | "storage";
+
+export interface SqlTypedValueMetadata {
+  runtimeType: SqlRuntimeTypeModel;
+  source: SqlTypedValueSource;
+  sourceContext?: string;
+}
+
 export interface SqlTypedValue {
   type: SqlRuntimeTypeName;
   value: SqlPrimitive;
-  metadata: Readonly<{
-    runtimeType: SqlRuntimeTypeModel;
-  }>;
+  metadata: Readonly<SqlTypedValueMetadata>;
   // Compatibility alias for existing callers; points to metadata.runtimeType.
   runtimeType: SqlRuntimeTypeModel;
+}
+
+function parseIntegerString(value: string): bigint | null {
+  const trimmed = value.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) return null;
+  return BigInt(trimmed);
+}
+
+function parseDecimalString(value: string): boolean {
+  return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(value.trim());
+}
+
+const SMALLINT_MIN = -32768;
+const SMALLINT_MAX = 32767;
+const INT_MIN = -2147483648;
+const INT_MAX = 2147483647;
+const BIGINT_MIN = BigInt("-9223372036854775808");
+const BIGINT_MAX = BigInt("9223372036854775807");
+const U64_MIN = BigInt(0);
+const U64_MAX = BigInt("18446744073709551615");
+
+function validateIntegerRange(value: number, min: number, max: number, typeName: string): void {
+  if (!Number.isInteger(value)) {
+    throw new TypeError(`${typeName} value must be an integer`);
+  }
+  if (value < min || value > max) {
+    throw new TypeError(`${typeName} value out of range`);
+  }
+}
+
+function validateBigIntRange(value: number | string, min: bigint, max: bigint, typeName: string): void {
+  let normalized: bigint;
+  if (typeof value === "number") {
+    if (!Number.isInteger(value)) throw new TypeError(`${typeName} value must be an integer`);
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(`${typeName} numeric input must be a safe integer; use a string for large integers`);
+    }
+    normalized = BigInt(value);
+  } else {
+    const parsed = parseIntegerString(value);
+    if (parsed === null) throw new TypeError(`${typeName} string value must be an integer`);
+    normalized = parsed;
+  }
+  if (normalized < min || normalized > max) {
+    throw new TypeError(`${typeName} value out of range`);
+  }
+}
+
+export function validateTypedValue(value: SqlPrimitive, runtimeType: SqlRuntimeTypeModel): void {
+  const type = runtimeType.name;
+  if (type === "NULL") {
+    if (value !== null) throw new TypeError("NULL typed value must be null");
+    return;
+  }
+  if (value === null) return;
+
+  switch (type) {
+    case "SMALLINT":
+      if (typeof value !== "number") throw new TypeError("SMALLINT value must be a number");
+      validateIntegerRange(value, SMALLINT_MIN, SMALLINT_MAX, "SMALLINT");
+      return;
+    case "INT":
+      if (typeof value !== "number") throw new TypeError("INT value must be a number");
+      validateIntegerRange(value, INT_MIN, INT_MAX, "INT");
+      return;
+    case "BIGINT":
+      if (typeof value !== "number" && typeof value !== "string") {
+        throw new TypeError("BIGINT value must be a number or integer string");
+      }
+      validateBigIntRange(value, BIGINT_MIN, BIGINT_MAX, "BIGINT");
+      return;
+    case "U64":
+      if (typeof value !== "number" && typeof value !== "string") {
+        throw new TypeError("U64 value must be a number or integer string");
+      }
+      validateBigIntRange(value, U64_MIN, U64_MAX, "U64");
+      return;
+    case "DECIMAL":
+      if (typeof value === "number") {
+        if (!Number.isFinite(value)) throw new TypeError("DECIMAL numeric value must be finite");
+        return;
+      }
+      if (typeof value === "string" && parseDecimalString(value)) return;
+      throw new TypeError("DECIMAL value must be a finite number or decimal string");
+    case "FLOAT":
+    case "DOUBLE":
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new TypeError(`${type} value must be a finite number`);
+      }
+      return;
+    case "BOOLEAN":
+      if (typeof value !== "boolean") throw new TypeError("BOOLEAN value must be true/false");
+      return;
+    case "CHAR":
+    case "VARCHAR":
+    case "TEXT":
+    case "STRING":
+    case "DATE":
+    case "TIME":
+    case "TIMESTAMP":
+    case "BLOB":
+      if (typeof value !== "string") throw new TypeError(`${type} value must be a string`);
+      if ((type === "CHAR" || type === "VARCHAR") && runtimeType.metadata.length !== undefined) {
+        if (value.length > runtimeType.metadata.length) {
+          throw new TypeError(`${type} value exceeds max length ${runtimeType.metadata.length}`);
+        }
+      }
+      return;
+    default:
+      // Exhaustive fallback for future types.
+      throw new TypeError(`Unsupported runtime type validation: ${type as string}`);
+  }
+}
+
+function createTypedValue(
+  value: SqlPrimitive,
+  source: SqlTypedValueSource,
+  explicitType?: SqlRuntimeTypeName,
+  runtimeTypeMetadata: Partial<SqlRuntimeTypeMetadata> = {},
+  sourceContext?: string,
+): SqlTypedValue {
+  const runtimeType = explicitType ? createRuntimeTypeModel(explicitType, runtimeTypeMetadata) : inferRuntimeTypeModel(value);
+  validateTypedValue(value, runtimeType);
+
+  const typedMetadata: SqlTypedValueMetadata = {
+    runtimeType,
+    source,
+  };
+  if (sourceContext !== undefined) typedMetadata.sourceContext = sourceContext;
+
+  const frozenMetadata = Object.freeze(typedMetadata);
+  return Object.freeze({
+    type: runtimeType.name,
+    value,
+    metadata: frozenMetadata,
+    runtimeType: frozenMetadata.runtimeType,
+  });
 }
 
 export function toTypedValue(
@@ -367,17 +510,34 @@ export function toTypedValue(
   explicitType?: SqlRuntimeTypeName,
   metadata: Partial<SqlRuntimeTypeMetadata> = {},
 ): SqlTypedValue {
-  const runtimeType = explicitType ? createRuntimeTypeModel(explicitType, metadata) : inferRuntimeTypeModel(value);
-  const typedMetadata = Object.freeze({
-    runtimeType,
-  });
+  return createTypedValue(value, "js", explicitType, metadata);
+}
 
-  return Object.freeze({
-    type: runtimeType.name,
-    value,
-    metadata: typedMetadata,
-    runtimeType: typedMetadata.runtimeType,
-  });
+export function fromJs(
+  value: SqlPrimitive,
+  explicitType?: SqlRuntimeTypeName,
+  metadata: Partial<SqlRuntimeTypeMetadata> = {},
+  sourceContext?: string,
+): SqlTypedValue {
+  return createTypedValue(value, "js", explicitType, metadata, sourceContext);
+}
+
+export function fromLiteral(
+  value: SqlPrimitive,
+  explicitType?: SqlRuntimeTypeName,
+  metadata: Partial<SqlRuntimeTypeMetadata> = {},
+  sourceContext?: string,
+): SqlTypedValue {
+  return createTypedValue(value, "literal", explicitType, metadata, sourceContext);
+}
+
+export function fromStorage(
+  value: SqlPrimitive,
+  explicitType?: SqlRuntimeTypeName,
+  metadata: Partial<SqlRuntimeTypeMetadata> = {},
+  sourceContext?: string,
+): SqlTypedValue {
+  return createTypedValue(value, "storage", explicitType, metadata, sourceContext);
 }
 
 export function fromTypedValue(v: SqlTypedValue): SqlPrimitive {
