@@ -596,8 +596,7 @@ export class WalrusSqlClient {
               for (const r of rightRows) {
                 const leftVal = l[leftField];
                 const rightVal = r[rightField];
-                if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
-                if (String(leftVal) !== String(rightVal)) continue;
+                if (!this.joinKeyEqual(leftVal, rightVal)) continue;
                 matched = true;
                 const merged: SqlRow = {};
                 for (const [k, v] of Object.entries(l)) {
@@ -693,8 +692,7 @@ export class WalrusSqlClient {
               for (const r of rightRows) {
                 const leftVal = l[leftField];
                 const rightVal = r[rightField];
-                if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
-                if (String(leftVal) !== String(rightVal)) continue;
+                if (!this.joinKeyEqual(leftVal, rightVal)) continue;
                 matched = true;
 
                 const merged: SqlRow = {};
@@ -2363,8 +2361,7 @@ export class WalrusSqlClient {
         const r = rightRows[ri]!;
         const leftVal = l[leftField];
         const rightVal = r[rightField];
-        if (leftVal === null || leftVal === undefined || rightVal === null || rightVal === undefined) continue;
-        if (String(leftVal) !== String(rightVal)) continue;
+        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
         matched = true;
         matchedRightIndexes.add(ri);
         const merged: SqlRow = {};
@@ -3154,6 +3151,19 @@ export class WalrusSqlClient {
     return resolveIdentifierValue(row, field, "strict");
   }
 
+  private encodeTypedKey(value: SqlPrimitive | undefined, sourceContext: string): string {
+    const typed = fromStorage((value ?? null) as SqlPrimitive, undefined, {}, sourceContext);
+    return JSON.stringify({ type: typed.type, value: typed.value });
+  }
+
+  private joinKeyEqual(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined): boolean {
+    if (left === null || left === undefined || right === null || right === undefined) return false;
+    return (
+      this.encodeTypedKey(left, "join.key.left")
+      === this.encodeTypedKey(right, "join.key.right")
+    );
+  }
+
   private compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
     const toTruthValue = (value: boolean | null): TruthValue => {
       if (value === null) return "UNKNOWN";
@@ -3522,8 +3532,18 @@ export class WalrusSqlClient {
     if (aNull) return 1;
     if (bNull) return -1;
 
-    const base = this.compare(a, b);
-    return direction === "DESC" ? -base : base;
+    try {
+      const leftTyped = fromStorage((a ?? null) as SqlPrimitive, undefined, {}, "order.key.left");
+      const rightTyped = fromStorage((b ?? null) as SqlPrimitive, undefined, {}, "order.key.right");
+      const lt = typedValueComparator.lt(leftTyped, rightTyped);
+      if (lt === true) return direction === "DESC" ? 1 : -1;
+      const gt = typedValueComparator.gt(leftTyped, rightTyped);
+      if (gt === true) return direction === "DESC" ? -1 : 1;
+      return 0;
+    } catch {
+      const base = this.compare(a, b);
+      return direction === "DESC" ? -base : base;
+    }
   }
 
   private applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
@@ -3541,7 +3561,7 @@ export class WalrusSqlClient {
     const buckets = new Map<string, SqlRow[]>();
 
     for (const row of rows) {
-      const key = groupBy.map((g) => String(row[g])).join("||");
+      const key = groupBy.map((g) => this.encodeTypedKey(row[g], `group.key:${g}`)).join("||");
       const bucket = buckets.get(key) ?? [];
       bucket.push(row);
       buckets.set(key, bucket);
@@ -3649,9 +3669,9 @@ export class WalrusSqlClient {
     const ordered = Object.keys(row)
       .sort()
       .reduce((acc, k) => {
-        acc[k] = row[k] ?? null;
+        acc[k] = this.encodeTypedKey(row[k], `distinct.key:${k}`);
         return acc;
-      }, {} as SqlRow);
+      }, {} as Record<string, string>);
     return JSON.stringify(ordered);
   }
 
