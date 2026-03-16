@@ -34,3 +34,11 @@
   - rollback keeps reader-visible state unchanged
   - commit makes changes visible afterwards
 - Covered by `test/unit-c-exec-016-dirty-read-prohibition-regression.ts`.
+
+## P2-ISO-005: Non-Repeatable Read in RC
+- READ COMMITTED intentionally allows non-repeatable reads.
+- Verified scenario:
+  - Session A opens transaction and reads row value `v1`
+  - Session B commits an update to the same row
+  - Session A re-reads inside same transaction and sees `v2 != v1`
+- Covered by `test/unit-c-exec-017-non-repeatable-read-rc.ts`.
