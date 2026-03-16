@@ -334,6 +334,7 @@ export class WalrusSqlClient {
   private transitionTransactionToAbortedOnError(sql: string): void {
     if (this.transactionState !== "active" && this.transactionState !== "committing") return;
     this.transitionTransactionState("error", sql);
+    this.clearTransactionWriteSet();
   }
 
   private async waitTransactionCommitTurn(): Promise<void> {
@@ -348,6 +349,12 @@ export class WalrusSqlClient {
 
   private createEmptyTransactionWriteSet(): TransactionWriteSet {
     return { tables: new Map<string, TransactionTableWriteSet>() };
+  }
+
+  private clearTransactionWriteSet(): void {
+    if (!this.transactionWriteSet) return;
+    this.transactionWriteSet.tables.clear();
+    this.transactionWriteSet = null;
   }
 
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
@@ -451,7 +458,7 @@ export class WalrusSqlClient {
 
     if (action === "ROLLBACK") {
       this.transitionTransactionState("rollback", sql);
-      this.transactionWriteSet = null;
+      this.clearTransactionWriteSet();
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "ROLLBACK",
@@ -465,7 +472,7 @@ export class WalrusSqlClient {
       await this.waitTransactionCommitTurn();
       if (this.isSimulatorMode()) this.applyTransactionWriteSetOnCommit();
       this.transitionTransactionState("commit_done", sql);
-      this.transactionWriteSet = null;
+      this.clearTransactionWriteSet();
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "COMMIT",

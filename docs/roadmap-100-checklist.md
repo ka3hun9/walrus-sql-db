@@ -11,7 +11,7 @@
 - [x] P2-TXN-002 会话级事务上下文（状态机：idle/active/committing/aborted）
 - [x] P2-TXN-003 事务内写集暂存（insert/update/delete）
 - [x] P2-TXN-004 原子提交：事务变更整体成功或整体失败
-- [ ] P2-TXN-005 回滚语义：显式回滚与异常自动回滚一致
+- [x] P2-TXN-005 回滚语义：显式回滚与异常自动回滚一致
 - [ ] P2-TXN-006 DDL in TX 策略（允许/禁止/延迟生效）与一致实现
 
 ## P2-B. 日志与提交路径（WAL/事务日志 + 批量上链）
