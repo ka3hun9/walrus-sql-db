@@ -37,9 +37,10 @@
     "test:ci:unit": "tsx scripts/run-ci-tests.ts unit",
     "test:ci:integration": "tsx scripts/run-ci-tests.ts integration",
     "test:ci:regression": "tsx scripts/run-ci-tests.ts regression",
+    "test:ci:typedvalue": "tsx scripts/run-typedvalue-tests.ts",
     "test:ci:benchmark": "tsx test/unit-h-test-006-performance-benchmark-gate.ts",
     "test:ci": "npm run test:ci:unit && npm run test:ci:integration && npm run test:ci:regression",
-    "ci:full": "npm run build && npm run test:ci && npm run test:ci:benchmark",
+    "ci:full": "npm run build && npm run test:ci && npm run test:ci:typedvalue && npm run test:ci:benchmark",
     "sql:verify:full": "npm run build && npm run sql:compare:matrix && npm run sql:compare:matrix:nightly && npm run sql:roadmap",
     "onchain:smoke": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "start": "node dist/examples/crud.js"
