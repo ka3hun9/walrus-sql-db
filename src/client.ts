@@ -749,6 +749,59 @@ export class WalrusSqlClient {
     return out;
   }
 
+  private buildLatestCommittedSnapshotTables(): Map<string, SqlRow[]> {
+    const snapshot = new Map<string, SqlRow[]>();
+    const allTables = new Set<string>([...this.tables.keys(), ...this.tableVersionObjects.keys()]);
+    for (const table of allTables.values()) {
+      const latest = this.tableVersionObjects.get(table)?.at(-1);
+      if (latest) {
+        snapshot.set(table, latest.rows.map((row) => ({ ...row })));
+        continue;
+      }
+      const committedRows = this.tables.get(table);
+      if (!committedRows) continue;
+      snapshot.set(table, this.deepCloneRows(committedRows));
+    }
+    return snapshot;
+  }
+
+  async queryLatestCommitted(sql: string): Promise<QueryResult> {
+    const snapshotClient = new WalrusSqlClient({
+      ...this.opts,
+      mode: "simulator",
+      readCache: { enabled: false },
+      wal: { ...(this.opts.wal ?? {}), enabled: false },
+      onchainExecutor: undefined,
+      onchainQueryExecutor: undefined,
+      transactionCommitExecutor: undefined,
+    });
+
+    const internals = snapshotClient as unknown as {
+      tables: Map<string, SqlRow[]>;
+      schemas: Map<string, TableSchema>;
+      uniqueIndexes: Map<string, Map<string, Map<string, SqlRow>>>;
+      uniqueGroupsCache: Map<string, string[][]>;
+      constraintCost: Map<string, ConstraintIndexCostStats>;
+      rowVersions: Map<string, Map<string, number>>;
+      tableVersionObjects: Map<string, VersionedStorageObject[]>;
+    };
+
+    internals.tables.clear();
+    for (const [table, rows] of this.buildLatestCommittedSnapshotTables().entries()) {
+      internals.tables.set(table, rows);
+    }
+
+    internals.schemas.clear();
+    for (const [table, schema] of this.schemas.entries()) internals.schemas.set(table, schema);
+    internals.uniqueIndexes.clear();
+    internals.uniqueGroupsCache.clear();
+    internals.constraintCost.clear();
+    internals.rowVersions.clear();
+    internals.tableVersionObjects.clear();
+
+    return snapshotClient.query(sql);
+  }
+
   private buildTransactionRowKey(table: string, keySource: SqlRow): Record<string, SqlPrimitive> {
     const key: Record<string, SqlPrimitive> = {};
     const schema = this.schemas.get(table);

@@ -29,3 +29,9 @@
   - restored tables
   - pending WAL txn ids before/after recovery
 - Covered by `test/unit-g-stor-013-crash-recovery-wal-version-chain.ts`.
+
+## P2-DUR-004: Read Path by Latest Committed Version
+- Added `queryLatestCommitted(sql)` read path.
+- It executes query against a snapshot sourced from each table's latest committed version object.
+- This path ignores caller's uncommitted staged writes and returns deterministic latest-commit results.
+- Covered by `test/unit-g-stor-014-query-latest-committed-version.ts`.
