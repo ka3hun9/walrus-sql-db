@@ -530,6 +530,47 @@ export class WalrusSqlClient {
     return [...pending.values()];
   }
 
+  async replayPendingTransactionLogsFromWal(): Promise<{ replayedTxnIds: string[]; failedTxnIds: string[] }> {
+    const pending = await this.recoverPendingTransactionLogsFromWal();
+    const replayedTxnIds: string[] = [];
+    const failedTxnIds: string[] = [];
+
+    for (const record of pending) {
+      try {
+        const payload = this.buildTransactionCommitBatchPayload(record);
+        await this.executeTransactionCommitBatch(payload);
+        await this.appendTransactionWalEntry({
+          phase: "COMMIT",
+          txnId: record.txnId,
+          at: Date.now(),
+        });
+        replayedTxnIds.push(record.txnId);
+      } catch (err) {
+        this.logger.warn("WAL replay failed", {
+          txnId: record.txnId,
+          error: this.stringifyError(err),
+        });
+        failedTxnIds.push(record.txnId);
+      }
+    }
+
+    return { replayedTxnIds, failedTxnIds };
+  }
+
+  async rollbackPendingTransactionLogsFromWal(): Promise<string[]> {
+    const pending = await this.recoverPendingTransactionLogsFromWal();
+    const rolledBackTxnIds: string[] = [];
+    for (const record of pending) {
+      await this.appendTransactionWalEntry({
+        phase: "ROLLBACK",
+        txnId: record.txnId,
+        at: Date.now(),
+      });
+      rolledBackTxnIds.push(record.txnId);
+    }
+    return rolledBackTxnIds;
+  }
+
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
     this.tables.set(table, tableStage.rows);
     this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
@@ -674,17 +715,6 @@ export class WalrusSqlClient {
         affectedRows: 0,
       };
     } catch (err) {
-      if (walRecord) {
-        try {
-          await this.appendTransactionWalEntry({
-            phase: "ROLLBACK",
-            txnId: walRecord.txnId,
-            at: Date.now(),
-          });
-        } catch (walErr) {
-          this.logger.warn("failed to append WAL rollback marker", { error: this.stringifyError(walErr) });
-        }
-      }
       this.transitionTransactionToAbortedOnError(sql);
       throw err;
     }

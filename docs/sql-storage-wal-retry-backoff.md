@@ -48,3 +48,16 @@
 - COMMIT flow (`mode=simulator`) invokes the hook once per transaction commit after `PREPARE` and before local apply.
 - This provides one-shot transaction aggregation for chain-side submission adapters.
 - Covered by `test/unit-g-stor-008-transaction-commit-batch-processor.ts`.
+
+## P2-LOG-004
+- Commit interruption now keeps `PREPARE` pending instead of auto-marking rollback.
+- Compensation APIs:
+  - `replayPendingTransactionLogsFromWal()`:
+    - replays pending prepared transactions through commit batch processor
+    - appends `COMMIT` markers for successful replays
+    - returns replayed vs failed txn ids
+  - `rollbackPendingTransactionLogsFromWal()`:
+    - appends `ROLLBACK` markers for pending prepared transactions
+    - returns rolled-back txn ids
+- Both APIs are idempotent across repeated calls (second call sees no pending entries).
+- Covered by `test/unit-g-stor-009-wal-compensation-replay-rollback.ts`.
