@@ -72,7 +72,7 @@
 - [x] P2-BENCH-002 含事务冲突场景的吞吐/延迟基线报告
 - [x] P2-BENCH-003 长跑稳定性（N 小时无一致性错误）
 - [x] P2-MILE-001 事务 ACID 验收通过（含异常与恢复）
-- [ ] P2-MILE-002 FK 全路径验收通过（含 CASCADE）
+- [x] P2-MILE-002 FK 全路径验收通过（含 CASCADE）
 - [ ] P2-MILE-003 Walrus 链上版本一致性验收通过
 - [ ] P2-MILE-004 TPC-C 类基准可运行且数据一致性通过
 - [ ] P2-MILE-005 全测试管线绿灯（build/unit/integration/regression/bench）
