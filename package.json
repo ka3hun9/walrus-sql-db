@@ -33,6 +33,7 @@
     "sql:tpcc:bench:conflict": "tsx examples/sql-tpcc-like-benchmark.ts reports/sql-tpcc-like-conflict-baseline.json 800 2 200",
     "sql:tpcc:soak": "tsx examples/sql-tpcc-like-soak.ts reports/sql-tpcc-like-soak.json 60000",
     "sql:ast:smoke": "tsx examples/sql-ast-smoke.ts",
+    "sql:p2:txn:consistency": "tsx examples/sql-p2-transaction-consistency.ts",
     "sql:typedvalue:migration": "tsx examples/sql-typedvalue-migration.ts",
     "sql:semantic:grouped": "tsx examples/sql-semantic-grouped-runner.ts",
     "sql:logic": "tsx examples/sql-logic-runner.ts test/sqllogic/p1-basic.slt",

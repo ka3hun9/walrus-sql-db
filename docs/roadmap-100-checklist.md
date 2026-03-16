@@ -76,7 +76,7 @@
 - [x] P2-MILE-003 Walrus 链上版本一致性验收通过
 - [x] P2-MILE-004 TPC-C 类基准可运行且数据一致性通过
 - [ ] P2-MILE-005 全测试管线绿灯（build/unit/integration/regression/bench）
-- [ ] P2-MILE-006 文档、示例、运维手册同步
+- [x] P2-MILE-006 文档、示例、运维手册同步
 
 ---
 
