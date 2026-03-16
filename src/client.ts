@@ -9,6 +9,7 @@ import {
   normalizeRuntimeTypeName,
   SqlRuntimeType,
   typedValueComparator,
+  typedValueOperators,
 } from "./types.js";
 import type {
   ExecuteResult,
@@ -3577,16 +3578,59 @@ export class WalrusSqlClient {
       throw sqlError("ERR_UNSUPPORTED_SELECT", `${aggregate} requires a numeric field`);
     }
 
-    const nums = rows
+    const typedNums = rows
       .map((r) => r[aggregateField])
       .filter((v) => v !== null && v !== undefined)
-      .map((v) => Number(v))
-      .filter((n) => Number.isFinite(n));
+      .map((v) => fromStorage((v ?? null) as SqlPrimitive, undefined, {}, `aggregate.source:${aggregateField}`))
+      .map((typed) => {
+        try {
+          return convertTypedValue(typed, SqlRuntimeType.DOUBLE, {
+            mode: "explicit",
+            sourceContext: `aggregate.numeric:${aggregateField}`,
+          });
+        } catch {
+          return null;
+        }
+      })
+      .filter((typed): typed is NonNullable<typeof typed> => typed !== null && typed.value !== null);
 
-    if (aggregate === "SUM") return { sum: nums.length ? nums.reduce((a, b) => a + b, 0) : null };
-    if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null };
-    if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
-    return { max: nums.length ? Math.max(...nums) : null };
+    if (aggregate === "SUM") {
+      if (!typedNums.length) return { sum: null };
+      let state = typedNums[0]!;
+      for (let i = 1; i < typedNums.length; i++) {
+        state = typedValueOperators.add(state, typedNums[i]!);
+      }
+      return { sum: state.value as SqlPrimitive };
+    }
+
+    if (aggregate === "AVG") {
+      if (!typedNums.length) return { avg: null };
+      let sumState = typedNums[0]!;
+      for (let i = 1; i < typedNums.length; i++) {
+        sumState = typedValueOperators.add(sumState, typedNums[i]!);
+      }
+      const divisor = fromJs(typedNums.length, SqlRuntimeType.INT, {}, `aggregate.avg.divisor:${aggregateField}`);
+      const avg = typedValueOperators.div(sumState, divisor);
+      return { avg: avg.value as SqlPrimitive };
+    }
+
+    if (aggregate === "MIN") {
+      if (!typedNums.length) return { min: null };
+      let state = typedNums[0]!;
+      for (let i = 1; i < typedNums.length; i++) {
+        const lt = typedValueComparator.lt(typedNums[i]!, state);
+        if (lt === true) state = typedNums[i]!;
+      }
+      return { min: state.value as SqlPrimitive };
+    }
+
+    if (!typedNums.length) return { max: null };
+    let state = typedNums[0]!;
+    for (let i = 1; i < typedNums.length; i++) {
+      const gt = typedValueComparator.gt(typedNums[i]!, state);
+      if (gt === true) state = typedNums[i]!;
+    }
+    return { max: state.value as SqlPrimitive };
   }
 
   private pickFields(row: SqlRow, fields: string[] | ["*"]): SqlRow {
