@@ -31,6 +31,7 @@ import type {
   TransactionLogRecord,
   TransactionLogWriteEntry,
   TransactionLogWriteOperation,
+  VersionedStorageObject,
   WalrusSqlClientOptions,
 } from "./types.js";
 import { buildMoveCall } from "./onchain.js";
@@ -217,6 +218,7 @@ type TransactionCommitRuntimeSnapshot = {
   dirtyTables: Set<string>;
   storageWriteLog: StorageWriteEvent[];
   rowVersions: Map<string, Map<string, number>>;
+  tableVersionObjects: Map<string, VersionedStorageObject[]>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
 };
@@ -274,6 +276,7 @@ export class WalrusSqlClient {
   private readonly queryCache = new Map<string, QueryCacheEntry>();
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly rowVersions = new Map<string, Map<string, number>>();
+  private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -694,6 +697,53 @@ export class WalrusSqlClient {
     versions.set(encoded, (versions.get(encoded) ?? 0) + 1);
   }
 
+  private toImmutableRows(rows: SqlRow[]): ReadonlyArray<Readonly<SqlRow>> {
+    return Object.freeze(rows.map((row) => Object.freeze({ ...row })));
+  }
+
+  private cloneVersionObject(object: VersionedStorageObject): VersionedStorageObject {
+    return {
+      ...object,
+      rows: object.rows.map((row) => ({ ...row })),
+    };
+  }
+
+  private recordImmutableVersionObject(table: string, rows: SqlRow[]): void {
+    const history = this.tableVersionObjects.get(table) ?? [];
+    const version = (history[history.length - 1]?.version ?? 0) + 1;
+    const immutableRows = this.toImmutableRows(rows);
+    const createdAt = Date.now();
+    const commitDigest = createHash("sha256")
+      .update(JSON.stringify({ table, version, createdAt, rows: immutableRows }))
+      .digest("hex");
+    const objectId = `0x${commitDigest.slice(0, 40)}`;
+
+    const object = Object.freeze({
+      table,
+      objectId,
+      version,
+      commitDigest,
+      createdAt,
+      immutable: true as const,
+      rows: immutableRows,
+    }) as VersionedStorageObject;
+
+    history.push(object);
+    this.tableVersionObjects.set(table, history);
+  }
+
+  getTableVersionObjects(table?: string): VersionedStorageObject[] | Record<string, VersionedStorageObject[]> {
+    if (table) {
+      return (this.tableVersionObjects.get(table) ?? []).map((object) => this.cloneVersionObject(object));
+    }
+
+    const out: Record<string, VersionedStorageObject[]> = {};
+    for (const [name, history] of this.tableVersionObjects.entries()) {
+      out[name] = history.map((object) => this.cloneVersionObject(object));
+    }
+    return out;
+  }
+
   private buildTransactionRowKey(table: string, keySource: SqlRow): Record<string, SqlPrimitive> {
     const key: Record<string, SqlPrimitive> = {};
     const schema = this.schemas.get(table);
@@ -846,6 +896,9 @@ export class WalrusSqlClient {
       rowVersions: new Map(
         [...this.rowVersions.entries()].map(([table, versions]) => [table, new Map(versions)] as const),
       ),
+      tableVersionObjects: new Map(
+        [...this.tableVersionObjects.entries()].map(([table, history]) => [table, [...history]] as const),
+      ),
       writeVersion: this.writeVersion,
       queryCache: new Map(this.queryCache),
     };
@@ -873,6 +926,11 @@ export class WalrusSqlClient {
       this.rowVersions.set(table, new Map(versions));
     }
 
+    this.tableVersionObjects.clear();
+    for (const [table, history] of snapshot.tableVersionObjects.entries()) {
+      this.tableVersionObjects.set(table, [...history]);
+    }
+
     this.writeVersion = snapshot.writeVersion;
     this.queryCache.clear();
     for (const [sql, entry] of snapshot.queryCache.entries()) this.queryCache.set(sql, entry);
@@ -896,6 +954,7 @@ export class WalrusSqlClient {
             table,
             stats: { insertRows, updateRows, deleteRows },
           });
+          this.recordImmutableVersionObject(table, tableStage.rows);
           committedRows += insertRows + updateRows + deleteRows;
         }
       }
@@ -1315,6 +1374,7 @@ export class WalrusSqlClient {
       this.ensureUniqueIndexMaps(schema.name);
       this.constraintCost.set(schema.name, emptyConstraintCostStats());
       this.rowVersions.delete(schema.name);
+      this.tableVersionObjects.delete(schema.name);
       this.dirtyTables.add(schema.name);
       this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -1345,6 +1405,7 @@ export class WalrusSqlClient {
       this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
       this.rowVersions.delete(table);
+      this.tableVersionObjects.delete(table);
       this.dirtyTables.delete(table);
       this.recordStorageWrite(table, "DROP_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();

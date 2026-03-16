@@ -1136,6 +1136,16 @@ export interface TransactionCommitBatchResult {
   raw?: unknown;
 }
 
+export interface VersionedStorageObject {
+  table: string;
+  objectId: string;
+  version: number;
+  commitDigest: string;
+  createdAt: number;
+  immutable: true;
+  rows: ReadonlyArray<Readonly<SqlRow>>;
+}
+
 function stableSerializeJson(value: unknown): string {
   if (value === null) return "null";
 
