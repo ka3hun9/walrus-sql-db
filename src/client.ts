@@ -1561,13 +1561,14 @@ export class WalrusSqlClient {
           : this.bindTypedValue((raw ?? null) as SqlPrimitive, "literal", `dml.default:${table}.${c.name}`));
 
       const coerced = this.coerceByType(c.type, bound, `dml.coerce:${table}.${c.name}`);
-      if ((c.notNull || c.primaryKey) && (coerced === null || coerced === undefined)) {
+      const coercedTyped = fromStorage((coerced ?? null) as SqlPrimitive, undefined, {}, `constraint.value:${table}.${c.name}`);
+      if ((c.notNull || c.primaryKey) && (coercedTyped.value === null || coercedTyped.value === undefined)) {
         throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`, {
           clause: "NOT NULL",
           field: `${table}.${c.name}`,
         });
       }
-      out[c.name] = coerced;
+      out[c.name] = coercedTyped.value;
     }
 
     const rows = this.requireTable(table);
@@ -1636,7 +1637,7 @@ export class WalrusSqlClient {
     for (const c of group) {
       const v = row[c];
       if (v === null || v === undefined) return null;
-      vals.push(String(v));
+      vals.push(this.encodeTypedKey(v as SqlPrimitive, `constraint.unique:${c}`));
     }
     return vals.join("||");
   }
