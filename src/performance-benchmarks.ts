@@ -24,11 +24,41 @@ export interface PerformanceBenchmarkReport {
   samples: PerformanceBenchmarkSample[];
 }
 
+export interface TypedValuePerformanceThreshold {
+  minOpsPerSecRatio: number;
+}
+
+export interface TypedValuePerformanceGatePolicy {
+  write_throughput: TypedValuePerformanceThreshold;
+  cold_query_throughput: TypedValuePerformanceThreshold;
+  hot_query_throughput: TypedValuePerformanceThreshold;
+}
+
+export interface TypedValuePerformanceGateCheck {
+  name: PerformanceBenchmarkSample["name"];
+  baselineOpsPerSec: number;
+  currentOpsPerSec: number;
+  ratio: number;
+  minOpsPerSecRatio: number;
+  pass: boolean;
+}
+
+export interface TypedValuePerformanceGateResult {
+  passed: boolean;
+  checks: TypedValuePerformanceGateCheck[];
+}
+
 const DEFAULT_CONFIG: PerformanceBenchmarkConfig = {
   writeRows: 1_000,
   coldQueries: 1,
   hotQueries: 1_000,
 };
+
+export const DEFAULT_TYPED_VALUE_PERF_POLICY: TypedValuePerformanceGatePolicy = Object.freeze({
+  write_throughput: { minOpsPerSecRatio: 0.005 },
+  cold_query_throughput: { minOpsPerSecRatio: 0.002 },
+  hot_query_throughput: { minOpsPerSecRatio: 0.005 },
+});
 
 function elapsedMs(start: number, end: number): number {
   return Number((end - start).toFixed(3));
@@ -121,4 +151,45 @@ export async function runPerformanceBenchmarks(
 export async function writePerformanceBenchmarkReport(outputPath: string, report: PerformanceBenchmarkReport): Promise<void> {
   await fs.mkdir(dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
+
+export function evaluateTypedValuePerformanceRegression(
+  current: PerformanceBenchmarkReport,
+  baseline: PerformanceBenchmarkReport,
+  policy: TypedValuePerformanceGatePolicy = DEFAULT_TYPED_VALUE_PERF_POLICY,
+): TypedValuePerformanceGateResult {
+  const names: Array<PerformanceBenchmarkSample["name"]> = [
+    "write_throughput",
+    "cold_query_throughput",
+    "hot_query_throughput",
+  ];
+  const currentByName = new Map(current.samples.map((sample) => [sample.name, sample]));
+  const baselineByName = new Map(baseline.samples.map((sample) => [sample.name, sample]));
+
+  const checks = names.map((name): TypedValuePerformanceGateCheck => {
+    const currentSample = currentByName.get(name);
+    if (!currentSample) throw new Error(`missing current performance sample: ${name}`);
+    const baselineSample = baselineByName.get(name);
+    if (!baselineSample) throw new Error(`missing baseline performance sample: ${name}`);
+
+    const baselineOpsPerSec = Math.max(0, baselineSample.opsPerSec);
+    const currentOpsPerSec = Math.max(0, currentSample.opsPerSec);
+    const ratio = baselineOpsPerSec <= 0 ? 1 : Number((currentOpsPerSec / baselineOpsPerSec).toFixed(6));
+    const minOpsPerSecRatio = policy[name].minOpsPerSecRatio;
+    const pass = ratio >= minOpsPerSecRatio;
+
+    return {
+      name,
+      baselineOpsPerSec,
+      currentOpsPerSec,
+      ratio,
+      minOpsPerSecRatio,
+      pass,
+    };
+  });
+
+  return {
+    passed: checks.every((check) => check.pass),
+    checks,
+  };
 }

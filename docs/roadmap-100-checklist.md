@@ -154,7 +154,7 @@
 
 ### K6. 工程化与可观测
 - [x] K-TVAL-019 日志与调试输出支持 TypedValue 可读格式（含类型标签）
-- [ ] K-TVAL-020 性能回归守门：TypedValue 引入后关键查询/写入开销在阈值内
+- [x] K-TVAL-020 性能回归守门：TypedValue 引入后关键查询/写入开销在阈值内
 - [ ] K-TVAL-021 Feature flag 迁移开关移除（最终仅保留 TypedValue 路径）
 
 ### K7. 测试与验收门
