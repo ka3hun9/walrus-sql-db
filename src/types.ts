@@ -734,6 +734,19 @@ export interface SerializedTypedValueV1 {
 
 export type SerializedTypedValue = SerializedTypedValueV1;
 
+export interface LegacySerializedTypedValue {
+  type: string;
+  value: SqlPrimitive;
+  runtimeType?: {
+    metadata?: Partial<SqlRuntimeTypeMetadata>;
+  };
+  metadata?: {
+    source?: SqlTypedValueSource;
+    sourceContext?: string;
+    runtimeTypeMetadata?: Partial<SqlRuntimeTypeMetadata>;
+  };
+}
+
 function isSqlPrimitiveValue(value: unknown): value is SqlPrimitive {
   return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
@@ -755,9 +768,10 @@ export function serializeTypedValue(value: SqlTypedValue): SerializedTypedValueV
   };
 }
 
-export function deserializeTypedValue(payload: SerializedTypedValue): SqlTypedValue {
-  if (payload.version !== 1) {
-    throw new TypeError(`unsupported TypedValue serialization version: ${String((payload as { version?: number }).version)}`);
+export function deserializeTypedValue(payload: SerializedTypedValue | LegacySerializedTypedValue): SqlTypedValue {
+  const version = "version" in payload ? payload.version : undefined;
+  if (version !== undefined && version !== 1) {
+    throw new TypeError(`unsupported TypedValue serialization version: ${String(version)}`);
   }
 
   if (!isSqlPrimitiveValue(payload.value)) {
@@ -767,9 +781,11 @@ export function deserializeTypedValue(payload: SerializedTypedValue): SqlTypedVa
   const normalizedType = normalizeRuntimeTypeName(payload.type);
   if (!normalizedType) throw new TypeError(`invalid serialized TypedValue type: ${String(payload.type)}`);
 
-  const source = isTypedValueSource(payload.metadata?.source) ? payload.metadata!.source : "storage";
-  const sourceContext = payload.metadata?.sourceContext;
-  const runtimeTypeMetadata = payload.metadata?.runtimeTypeMetadata ?? {};
+  const metadata = payload.metadata;
+  const source = isTypedValueSource(metadata?.source) ? metadata!.source : "storage";
+  const sourceContext = metadata?.sourceContext;
+  const legacyRuntimeTypeMetadata = "runtimeType" in payload ? payload.runtimeType?.metadata : undefined;
+  const runtimeTypeMetadata = metadata?.runtimeTypeMetadata ?? legacyRuntimeTypeMetadata ?? {};
   return createTypedValue(payload.value, source, normalizedType, runtimeTypeMetadata, sourceContext);
 }
 
