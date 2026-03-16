@@ -173,6 +173,22 @@ type DeletePlan = DmlPlan & {
 
 type SessionTransactionEvent = "begin" | "commit" | "commit_done" | "rollback" | "error";
 
+type TransactionTableWriteStats = {
+  insertRows: number;
+  updateRows: number;
+  deleteRows: number;
+};
+
+type TransactionTableWriteSet = {
+  rows: SqlRow[];
+  uniqueIndexes: Map<string, Map<string, SqlRow>>;
+  stats: TransactionTableWriteStats;
+};
+
+type TransactionWriteSet = {
+  tables: Map<string, TransactionTableWriteSet>;
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -207,6 +223,7 @@ export class WalrusSqlClient {
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
+  private transactionWriteSet: TransactionWriteSet | null = null;
   private writeVersion = 0;
 
   constructor(opts: WalrusSqlClientOptions) {
@@ -299,9 +316,40 @@ export class WalrusSqlClient {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
+  private isSimulatorMode(): boolean {
+    return (this.opts.mode ?? "simulator") === "simulator";
+  }
+
+  private createEmptyTransactionWriteSet(): TransactionWriteSet {
+    return { tables: new Map<string, TransactionTableWriteSet>() };
+  }
+
+  private applyTransactionWriteSetOnCommit(): void {
+    const staged = this.transactionWriteSet;
+    if (!staged || staged.tables.size === 0) return;
+
+    let committedRows = 0;
+    for (const [table, tableStage] of staged.tables.entries()) {
+      this.tables.set(table, tableStage.rows);
+      this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
+
+      const { insertRows, updateRows, deleteRows } = tableStage.stats;
+      if (insertRows + updateRows + deleteRows > 0) {
+        this.dirtyTables.add(table);
+        if (insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", insertRows, "simulator");
+        if (updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", updateRows, "simulator");
+        if (deleteRows > 0) this.recordStorageWrite(table, "DELETE_ROW", deleteRows, "simulator");
+        committedRows += insertRows + updateRows + deleteRows;
+      }
+    }
+
+    if (committedRows > 0) this.invalidateReadCacheOnWrite();
+  }
+
   private async executeTransactionControl(sql: string, action: SqlTransactionAction): Promise<ExecuteResult> {
     if (action === "BEGIN") {
       this.transitionTransactionState("begin", sql);
+      if (this.isSimulatorMode()) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "BEGIN",
@@ -311,6 +359,7 @@ export class WalrusSqlClient {
 
     if (action === "ROLLBACK") {
       this.transitionTransactionState("rollback", sql);
+      this.transactionWriteSet = null;
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "ROLLBACK",
@@ -322,7 +371,9 @@ export class WalrusSqlClient {
     try {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
+      if (this.isSimulatorMode()) this.applyTransactionWriteSetOnCommit();
       this.transitionTransactionState("commit_done", sql);
+      this.transactionWriteSet = null;
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "COMMIT",
@@ -491,6 +542,7 @@ export class WalrusSqlClient {
   private getCachedQuery(sql: string): SqlRow[] | null {
     const cfg = this.getReadCacheConfig();
     if (!cfg.enabled) return null;
+    if (this.transactionState !== "idle") return null;
 
     const hit = this.queryCache.get(sql);
     if (!hit) return null;
@@ -512,6 +564,7 @@ export class WalrusSqlClient {
   private setCachedQuery(sql: string, rows: SqlRow[]): void {
     const cfg = this.getReadCacheConfig();
     if (!cfg.enabled) return;
+    if (this.transactionState !== "idle") return;
 
     if (this.queryCache.has(sql)) this.queryCache.delete(sql);
     this.queryCache.set(sql, {
@@ -707,13 +760,17 @@ export class WalrusSqlClient {
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       const parsedInsert = this.parseInsert(normalized);
-      const bucket = this.requireTable(table);
+      const bucket = this.requireWritableTableForDml(table);
       const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
-      this.dirtyTables.add(table);
-      this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
-      this.invalidateReadCacheOnWrite();
+      if (this.isDmlWriteStagingActive()) {
+        this.bumpTableWriteStats(table, { insertRows: 1 });
+      } else {
+        this.dirtyTables.add(table);
+        this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "INSERT",
@@ -723,7 +780,7 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("UPDATE")) {
       const plan = this.planUpdate(normalized);
-      const bucket = this.requireTable(plan.table);
+      const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
         ? (() => {
@@ -811,11 +868,15 @@ export class WalrusSqlClient {
         Object.assign(row, next);
         this.addRowToUniqueIndexes(plan.table, row);
         this.bumpConstraintCost(plan.table, { updateOps: 1 });
-        this.dirtyTables.add(plan.table);
         touched++;
       }
-      if (touched > 0) this.recordStorageWrite(plan.table, "UPDATE_ROW", touched, "simulator");
-      this.invalidateReadCacheOnWrite();
+      if (this.isDmlWriteStagingActive()) {
+        if (touched > 0) this.bumpTableWriteStats(plan.table, { updateRows: touched });
+      } else {
+        if (touched > 0) this.dirtyTables.add(plan.table);
+        if (touched > 0) this.recordStorageWrite(plan.table, "UPDATE_ROW", touched, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "UPDATE",
@@ -825,7 +886,7 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DELETE")) {
       const plan = this.planDelete(normalized);
-      const bucket = this.requireTable(plan.table);
+      const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
         ? (() => {
@@ -894,10 +955,14 @@ export class WalrusSqlClient {
           next.push(row);
         }
       }
-      this.tables.set(plan.table, next);
-      this.dirtyTables.add(plan.table);
-      if (touched > 0) this.recordStorageWrite(plan.table, "DELETE_ROW", touched, "simulator");
-      this.invalidateReadCacheOnWrite();
+      this.setTableRows(plan.table, next);
+      if (this.isDmlWriteStagingActive()) {
+        if (touched > 0) this.bumpTableWriteStats(plan.table, { deleteRows: touched });
+      } else {
+        this.dirtyTables.add(plan.table);
+        if (touched > 0) this.recordStorageWrite(plan.table, "DELETE_ROW", touched, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
@@ -1118,7 +1183,90 @@ export class WalrusSqlClient {
       .slice(0, 40);
   }
 
+  private getStagedTableWriteSet(table: string): TransactionTableWriteSet | null {
+    return this.transactionWriteSet?.tables.get(table) ?? null;
+  }
+
+  private getOrCreateTableWriteSet(table: string): TransactionTableWriteSet {
+    const staged = this.getStagedTableWriteSet(table);
+    if (staged) return staged;
+    const source = this.tables.get(table);
+    if (!source) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+    const rows = this.deepCloneRows(source);
+    const uniqueIndexes = this.buildUniqueIndexSnapshot(table, rows);
+    const created: TransactionTableWriteSet = {
+      rows,
+      uniqueIndexes,
+      stats: { insertRows: 0, updateRows: 0, deleteRows: 0 },
+    };
+    if (!this.transactionWriteSet) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
+    this.transactionWriteSet.tables.set(table, created);
+    return created;
+  }
+
+  private bumpTableWriteStats(table: string, patch: Partial<TransactionTableWriteStats>): void {
+    const staged = this.getStagedTableWriteSet(table);
+    if (!staged) return;
+    staged.stats.insertRows += patch.insertRows ?? 0;
+    staged.stats.updateRows += patch.updateRows ?? 0;
+    staged.stats.deleteRows += patch.deleteRows ?? 0;
+  }
+
+  private isDmlWriteStagingActive(): boolean {
+    return this.isSimulatorMode() && this.transactionState === "active";
+  }
+
+  private requireWritableTableForDml(name: string): SqlRow[] {
+    if (!this.isDmlWriteStagingActive()) return this.requireTable(name);
+    return this.getOrCreateTableWriteSet(name).rows;
+  }
+
+  private setTableRows(table: string, rows: SqlRow[]): void {
+    const staged = this.getStagedTableWriteSet(table);
+    if (staged) {
+      staged.rows = rows;
+      return;
+    }
+    this.tables.set(table, rows);
+  }
+
+  private getUniqueIndexesForTable(table: string): Map<string, Map<string, SqlRow>> | undefined {
+    const staged = this.getStagedTableWriteSet(table);
+    if (staged) return staged.uniqueIndexes;
+    return this.uniqueIndexes.get(table);
+  }
+
+  private setUniqueIndexesForTable(table: string, indexes: Map<string, Map<string, SqlRow>>): void {
+    const staged = this.getStagedTableWriteSet(table);
+    if (staged) {
+      staged.uniqueIndexes = indexes;
+      return;
+    }
+    this.uniqueIndexes.set(table, indexes);
+  }
+
+  private buildUniqueIndexSnapshot(table: string, rows: SqlRow[]): Map<string, Map<string, SqlRow>> {
+    const schema = this.schemas.get(table);
+    const out = new Map<string, Map<string, SqlRow>>();
+    if (!schema) return out;
+
+    for (const group of this.getUniqueGroups(table, schema)) {
+      const keyName = this.uniqueGroupName(group);
+      const groupIndex = new Map<string, SqlRow>();
+      for (const row of rows) {
+        const keyVal = this.uniqueGroupValue(row, group);
+        if (keyVal === null) continue;
+        groupIndex.set(keyVal, row);
+      }
+      out.set(keyName, groupIndex);
+    }
+    return out;
+  }
+
   private requireTable(name: string): SqlRow[] {
+    const staged = this.getStagedTableWriteSet(name);
+    if (staged) return staged.rows;
     const table = this.tables.get(name);
     if (!table) throw sqlError("ERR_TABLE_NOT_FOUND", name);
     return table;
@@ -1800,9 +1948,9 @@ export class WalrusSqlClient {
       out[c.name] = coercedTyped.value;
     }
 
-    const rows = this.requireTable(table);
+    this.requireTable(table);
     this.ensureUniqueIndexMaps(table);
-    const indexByKey = this.uniqueIndexes.get(table) ?? new Map<string, Map<string, SqlRow>>();
+    const indexByKey = this.getUniqueIndexesForTable(table) ?? new Map<string, Map<string, SqlRow>>();
 
     for (const group of this.getUniqueGroups(table, schema)) {
       const keyName = this.uniqueGroupName(group);
@@ -1884,19 +2032,21 @@ export class WalrusSqlClient {
   private ensureUniqueIndexMaps(table: string): void {
     const schema = this.schemas.get(table);
     if (!schema) return;
-    if (this.uniqueIndexes.has(table)) return;
+    if (this.getUniqueIndexesForTable(table)) return;
 
     const idxMap = new Map<string, Map<string, SqlRow>>();
     for (const g of this.getUniqueGroups(table, schema)) {
       idxMap.set(this.uniqueGroupName(g), new Map<string, SqlRow>());
     }
-    this.uniqueIndexes.set(table, idxMap);
+    this.setUniqueIndexesForTable(table, idxMap);
   }
 
   private rebuildUniqueIndexes(table: string): void {
     const schema = this.schemas.get(table);
     if (!schema) {
-      this.uniqueIndexes.delete(table);
+      const staged = this.getStagedTableWriteSet(table);
+      if (staged) staged.uniqueIndexes = new Map<string, Map<string, SqlRow>>();
+      else this.uniqueIndexes.delete(table);
       return;
     }
 
@@ -1912,7 +2062,7 @@ export class WalrusSqlClient {
       }
       idxMap.set(this.uniqueGroupName(g), colMap);
     }
-    this.uniqueIndexes.set(table, idxMap);
+    this.setUniqueIndexesForTable(table, idxMap);
     this.bumpConstraintCost(table, { rebuildOps: 1 });
   }
 
@@ -1920,7 +2070,7 @@ export class WalrusSqlClient {
     const schema = this.schemas.get(table);
     if (!schema) return;
     this.ensureUniqueIndexMaps(table);
-    const idxMap = this.uniqueIndexes.get(table);
+    const idxMap = this.getUniqueIndexesForTable(table);
     if (!idxMap) return;
 
     for (const g of this.getUniqueGroups(table, schema)) {
@@ -1935,7 +2085,7 @@ export class WalrusSqlClient {
   private removeRowFromUniqueIndexes(table: string, row: SqlRow): void {
     const schema = this.schemas.get(table);
     if (!schema) return;
-    const idxMap = this.uniqueIndexes.get(table);
+    const idxMap = this.getUniqueIndexesForTable(table);
     if (!idxMap) return;
 
     for (const g of this.getUniqueGroups(table, schema)) {
