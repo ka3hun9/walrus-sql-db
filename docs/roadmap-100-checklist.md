@@ -145,7 +145,7 @@
 - [x] K-TVAL-012 INSERT/UPDATE 写入前校验统一走 TypedValue（禁止旁路校验）
 - [x] K-TVAL-013 NOT NULL/UNIQUE/PRIMARY KEY 冲突检测统一消费 TypedValue
 - [x] K-TVAL-014 DEFAULT 值、ALTER ADD COLUMN 回填值统一走 TypedValue
-- [ ] K-TVAL-015 错误信息增强：违反类型/约束时报错携带 TypedValue 上下文快照
+- [x] K-TVAL-015 错误信息增强：违反类型/约束时报错携带 TypedValue 上下文快照
 
 ### K5. 存储与序列化
 - [ ] K-TVAL-016 TypedValue 序列化协议（含版本）定义并落地

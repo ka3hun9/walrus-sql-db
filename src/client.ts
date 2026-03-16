@@ -1329,6 +1329,12 @@ export class WalrusSqlClient {
     return fromJs(value, undefined, {}, sourceContext);
   }
 
+  private formatTypedValueSnapshot(value: SqlTypedValue): string {
+    const valueText = typeof value.value === "string" ? JSON.stringify(value.value) : String(value.value);
+    const context = value.metadata.sourceContext ? `,context=${value.metadata.sourceContext}` : "";
+    return `typedValue={type=${value.type},value=${valueText},source=${value.metadata.source}${context}}`;
+  }
+
   private runtimeTypeMetadataFromColumnType(type: ColumnTypeSpec): Partial<SqlRuntimeTypeMetadata> {
     if (type.name === "DECIMAL") {
       return {
@@ -1354,6 +1360,8 @@ export class WalrusSqlClient {
 
     const targetType = type.name as SqlRuntimeTypeName;
     const targetMetadata = this.runtimeTypeMetadataFromColumnType(type);
+    const typedSnapshot = this.formatTypedValueSnapshot(typedInput);
+    const withSnapshot = (message: string): string => `${message}; ${typedSnapshot}`;
     try {
       convertTypedValue(typedInput, targetType, {
         mode: "implicit",
@@ -1362,9 +1370,10 @@ export class WalrusSqlClient {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      throw sqlError("ERR_TYPE_CONSTRAINT", msg);
+      throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(msg));
     }
 
+    const convert = (): SqlPrimitive => {
     const toNum = (v: SqlPrimitive): number => {
       const n = Number(v);
       if (!Number.isFinite(n)) throw sqlError("ERR_TYPE_CONSTRAINT", `expected numeric for ${type.name}, got ${String(v)}`);
@@ -1531,6 +1540,18 @@ export class WalrusSqlClient {
     }
 
     throw sqlError("ERR_UNSUPPORTED_TYPE", type.name);
+    };
+
+    try {
+      return convert();
+    } catch (err) {
+      if (err instanceof Error && /^ERR_TYPE_CONSTRAINT:/.test(err.message)) {
+        if (err.message.includes("typedValue={")) throw err;
+        const base = err.message.replace(/^ERR_TYPE_CONSTRAINT:\s*/, "");
+        throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(base));
+      }
+      throw err;
+    }
   }
 
   private applySchemaOnWrite(
@@ -1566,7 +1587,8 @@ export class WalrusSqlClient {
       const coerced = this.coerceByType(c.type, bound, `dml.coerce:${table}.${c.name}`);
       const coercedTyped = fromStorage((coerced ?? null) as SqlPrimitive, undefined, {}, `constraint.value:${table}.${c.name}`);
       if ((c.notNull || c.primaryKey) && (coercedTyped.value === null || coercedTyped.value === undefined)) {
-        throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL`, {
+        const snapshot = this.formatTypedValueSnapshot(coercedTyped);
+        throw constraintError("NOT_NULL", `${table}.${c.name} is NOT NULL (${snapshot})`, {
           clause: "NOT NULL",
           field: `${table}.${c.name}`,
         });
@@ -1587,10 +1609,20 @@ export class WalrusSqlClient {
       this.bumpConstraintCost(table, { conflictChecks: 1 });
       if (hitRow !== undefined) {
         if (!previous || hitRow !== previous) {
-          throw constraintError("DUPLICATE_KEY", `Duplicate key value for ${table}(${group.join(",")})`, {
+          const snapshots = group
+            .map((column) => {
+              const typed = fromStorage((out[column] ?? null) as SqlPrimitive, undefined, {}, `constraint.unique:${table}.${column}`);
+              return this.formatTypedValueSnapshot(typed);
+            })
+            .join(", ");
+          throw constraintError(
+            "DUPLICATE_KEY",
+            `Duplicate key value for ${table}(${group.join(",")}): ${snapshots}`,
+            {
             clause: "UNIQUE",
             field: group.join(","),
-          });
+            },
+          );
         }
       }
     }
