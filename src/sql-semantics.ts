@@ -5,6 +5,26 @@ import type { SqlPrimitive } from "./types.js";
 
 export type SqlDataType = "NULL" | "BOOLEAN" | "INT" | "REAL" | "TEXT" | "UNKNOWN";
 
+export function inferLiteralType(value: SqlPrimitive | undefined): SqlDataType {
+  if (value === null) return "NULL";
+  if (value === undefined) return "UNKNOWN";
+  if (typeof value === "boolean") return "BOOLEAN";
+  if (typeof value === "number") return Number.isInteger(value) ? "INT" : "REAL";
+  if (typeof value === "string") return "TEXT";
+  return "UNKNOWN";
+}
+
+export function inferExprLiteralType(expr: ExprAst): SqlDataType {
+  if (expr.kind === "literal") return inferLiteralType(expr.typedValue.value);
+
+  // unary literal-like forms: -123, +1.5
+  if (expr.kind === "unary" && expr.expr.kind === "literal" && typeof expr.expr.typedValue.value === "number") {
+    return Number.isInteger(expr.expr.typedValue.value) ? "INT" : "REAL";
+  }
+
+  return "UNKNOWN";
+}
+
 export type IdentifierRef = {
   name: string;
   source?: string;

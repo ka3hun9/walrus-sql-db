@@ -9,6 +9,7 @@ import type {
   SqlAstStatement,
   TableRefAst,
 } from "./sql-ast.js";
+import { fromLiteral, type SqlPrimitive } from "./types.js";
 
 function detectUnsupportedDialectCastType(sql: string, dialect: SqlDialectProfile = "ansi"): string | null {
   const text = sql.toUpperCase();
@@ -102,13 +103,17 @@ function trimQuoted(v: string): string {
   return v;
 }
 
-function castLiteral(raw: string): string | number | boolean | null {
+function castLiteral(raw: string): SqlPrimitive {
   const v = trimQuoted(raw.trim());
   if (/^null$/i.test(v)) return null;
   if (/^true$/i.test(v)) return true;
   if (/^false$/i.test(v)) return false;
   if (v !== "" && !Number.isNaN(Number(v))) return Number(v);
   return v;
+}
+
+function literalExpr(value: SqlPrimitive): ExprAst {
+  return { kind: "literal", typedValue: fromLiteral(value) };
 }
 
 function splitCommaAware(input: string): string[] {
@@ -246,7 +251,7 @@ function parsePrimary(ts: TokenStream): ExprAst {
   }
 
   if (/^(null|true|false|\-?\d+(?:\.\d+)?)$/i.test(t) || /^'.*'$/.test(t) || /^".*"$/.test(t)) {
-    return { kind: "literal", value: castLiteral(t) };
+    return literalExpr(castLiteral(t));
   }
 
   if (isIdentifierToken(t) && ts.peek() === "(") {
@@ -262,7 +267,7 @@ function parsePrimary(ts: TokenStream): ExprAst {
       return {
         kind: "function",
         name: "CAST",
-        args: [valueExpr, { kind: "literal", value: targetType.toUpperCase() }],
+        args: [valueExpr, literalExpr(targetType.toUpperCase())],
       };
     }
 
@@ -325,11 +330,11 @@ function parseCompare(ts: TokenStream): ExprAst {
 
   if (ts.match("IS")) {
     if (ts.match("NOT")) {
-      if (ts.match("NULL")) return { kind: "binary", op: "IS NOT", left, right: { kind: "literal", value: null } };
+      if (ts.match("NULL")) return { kind: "binary", op: "IS NOT", left, right: literalExpr(null) };
       const right = parseAdd(ts);
       return { kind: "binary", op: "IS NOT", left, right };
     }
-    if (ts.match("NULL")) return { kind: "binary", op: "IS", left, right: { kind: "literal", value: null } };
+    if (ts.match("NULL")) return { kind: "binary", op: "IS", left, right: literalExpr(null) };
     const right = parseAdd(ts);
     return { kind: "binary", op: "IS", left, right };
   }

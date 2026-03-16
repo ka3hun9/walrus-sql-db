@@ -1,3 +1,5 @@
+import type { SqlTypedValue } from "./types.js";
+
 export type SqlAstStatement = SelectStatementAst | UnionStatementAst | UnknownStatementAst;
 
 export type UnknownStatementAst = {
@@ -66,7 +68,7 @@ export type OrderItemAst = {
 
 export type ExprAst =
   | { kind: "identifier"; name: string }
-  | { kind: "literal"; value: string | number | boolean | null }
+  | { kind: "literal"; typedValue: SqlTypedValue }
   | { kind: "function"; name: string; args: ExprAst[] }
   | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
   | { kind: "unary"; op: string; expr: ExprAst }

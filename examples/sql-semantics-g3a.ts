@@ -7,6 +7,7 @@ import {
 } from "../src/sql-semantics.js";
 import type { ExprAst } from "../src/sql-ast.js";
 import { SqlEngineError } from "../src/sql-errors.js";
+import { fromLiteral } from "../src/types.js";
 
 const row = {
   "users.id": 7,
@@ -63,7 +64,7 @@ const gtExpr: ExprAst = {
   kind: "binary",
   op: ">",
   left: { kind: "identifier", name: "amount" },
-  right: { kind: "literal", value: 3 },
+  right: { kind: "literal", typedValue: fromLiteral(3) },
 };
 assert.equal(evalPredicate3VL(gtExpr, row), "TRUE");
 
@@ -71,7 +72,7 @@ const nullExpr: ExprAst = {
   kind: "binary",
   op: "=",
   left: { kind: "identifier", name: "missing_col" },
-  right: { kind: "literal", value: 1 },
+  right: { kind: "literal", typedValue: fromLiteral(1) },
 };
 assert.equal(evalPredicate3VL(nullExpr, row), "UNKNOWN");
 
@@ -87,8 +88,8 @@ assert.equal((strictPredicateErr as SqlEngineError).code, "SQL_SEMANTIC_UNKNOWN_
 const andExpr: ExprAst = {
   kind: "binary",
   op: "AND",
-  left: { kind: "literal", value: true },
-  right: { kind: "literal", value: null },
+  left: { kind: "literal", typedValue: fromLiteral(true) },
+  right: { kind: "literal", typedValue: fromLiteral(null) },
 };
 assert.equal(evalPredicate3VL(andExpr, row), "UNKNOWN");
 

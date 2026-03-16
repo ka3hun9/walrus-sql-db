@@ -131,7 +131,7 @@
 - [x] K-TVAL-004 提供统一算术/逻辑操作接口（add/sub/mul/div/and/or/not）及类型提升规则
 
 ### K2. 解析层接入
-- [ ] K-TVAL-005 SQL 字面量在 AST 构建阶段统一产出 TypedValue（不再裸 primitive）
+- [x] K-TVAL-005 SQL 字面量在 AST 构建阶段统一产出 TypedValue（不再裸 primitive）
 - [ ] K-TVAL-006 参数绑定（含默认值）统一转 TypedValue 并记录来源上下文
 - [ ] K-TVAL-007 CAST 与隐式转换在解析/绑定阶段统一走 TypedValue 转换器
 

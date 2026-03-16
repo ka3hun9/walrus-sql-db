@@ -1,6 +1,14 @@
 import type { ExprAst } from "./sql-ast.js";
 import type { SqlPrimitive } from "./types.js";
 
+function toFiniteNumber(v: SqlPrimitive | undefined): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function maybeWrap(child?: ExprAst): string {
   const rendered = exprAstToSql(child) ?? "";
   if (!child) return rendered;
@@ -13,11 +21,13 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
   switch (expr.kind) {
     case "identifier":
       return expr.name;
-    case "literal":
-      if (expr.value === null) return "NULL";
-      if (typeof expr.value === "string") return `'${String(expr.value).replace(/'/g, "''")}'`;
-      if (typeof expr.value === "boolean") return expr.value ? "TRUE" : "FALSE";
-      return String(expr.value);
+    case "literal": {
+      const literal = expr.typedValue.value;
+      if (literal === null) return "NULL";
+      if (typeof literal === "string") return `'${String(literal).replace(/'/g, "''")}'`;
+      if (typeof literal === "boolean") return literal ? "TRUE" : "FALSE";
+      return String(literal);
+    }
     case "function":
       if (expr.name === "LIST") {
         return `(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})`;
@@ -43,7 +53,7 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
     case "identifier":
       return resolve(expr.name);
     case "literal":
-      return expr.value;
+      return expr.typedValue.value;
     case "unary": {
       const v = evalExprAst(expr.expr, resolve);
       if (expr.op.toUpperCase() === "NOT") {
@@ -109,18 +119,64 @@ export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimiti
         return null;
       }
 
-      if (op === "+") return Number(l) + Number(r);
-      if (op === "-") return Number(l) - Number(r);
-      if (op === "*") return Number(l) * Number(r);
-      if (op === "/") return Number(r) === 0 ? null : Number(l) / Number(r);
-      if (op === "%") return Number(r) === 0 ? null : Number(l) % Number(r);
+      if (op === "+") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        // P1 type promotion baseline: INTEGER + FLOAT => FLOAT (JS number semantics)
+        return ln + rn;
+      }
+      if (op === "-") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln - rn;
+      }
+      if (op === "*") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln * rn;
+      }
+      if (op === "/") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null || rn === 0) return null;
+        return ln / rn;
+      }
+      if (op === "%") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null || rn === 0) return null;
+        return ln % rn;
+      }
 
       if (op === "=") return String(l) === String(r);
       if (op === "!=" || op === "<>") return String(l) !== String(r);
-      if (op === ">") return Number(l) > Number(r);
-      if (op === "<") return Number(l) < Number(r);
-      if (op === ">=") return Number(l) >= Number(r);
-      if (op === "<=") return Number(l) <= Number(r);
+      if (op === ">") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln > rn;
+      }
+      if (op === "<") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln < rn;
+      }
+      if (op === ">=") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln >= rn;
+      }
+      if (op === "<=") {
+        const ln = toFiniteNumber(l);
+        const rn = toFiniteNumber(r);
+        if (ln === null || rn === null) return null;
+        return ln <= rn;
+      }
       if (op === "IS") return String(l) === String(r);
       if (op === "IS NOT") return String(l) !== String(r);
 
