@@ -46,7 +46,7 @@
 - [x] P2-FK-002 catalog 元数据：引用表/列、匹配规则、删除更新动作
 - [x] P2-FK-003 INSERT/UPDATE 引用完整性检查（事务内可见性正确）
 - [x] P2-FK-004 ON DELETE CASCADE 实现
-- [ ] P2-FK-005 ON DELETE RESTRICT/NO ACTION 实现
+- [x] P2-FK-005 ON DELETE RESTRICT/NO ACTION 实现
 - [ ] P2-FK-006 ON UPDATE CASCADE/RESTRICT 策略实现
 - [ ] P2-FK-007 FK 环与级联深度保护（防止无限级联）
 

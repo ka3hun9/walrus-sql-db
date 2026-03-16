@@ -2971,11 +2971,34 @@ export class WalrusSqlClient {
       const head = queue.shift()!;
       const refs = this.getReferencingForeignKeys(head.table);
       for (const ref of refs) {
-        if (ref.fk.onDelete !== "CASCADE") continue;
         const childRows = this.requireWritableTableForDml(ref.table);
-        for (const childRow of childRows) {
-          if (this.doesChildRowReferenceParent(head.row, childRow, ref.fk)) addTarget(ref.table, childRow);
+        const matchedChildren = childRows.filter((childRow) => this.doesChildRowReferenceParent(head.row, childRow, ref.fk));
+        if (matchedChildren.length === 0) continue;
+
+        if (ref.fk.onDelete === "CASCADE") {
+          for (const childRow of matchedChildren) addTarget(ref.table, childRow);
+          continue;
         }
+
+        if (ref.fk.onDelete === "RESTRICT" || ref.fk.onDelete === "NO ACTION") {
+          throw constraintError(
+            "FOREIGN_KEY",
+            `cannot delete ${head.table}: referenced by ${ref.table}(${ref.fk.columns.join(",")})`,
+            {
+              clause: `ON DELETE ${ref.fk.onDelete}`,
+              field: `${head.table} -> ${ref.table}`,
+            },
+          );
+        }
+
+        throw constraintError(
+          "FOREIGN_KEY",
+          `ON DELETE ${ref.fk.onDelete} is not supported in delete path yet`,
+          {
+            clause: `ON DELETE ${ref.fk.onDelete}`,
+            field: `${head.table} -> ${ref.table}`,
+          },
+        );
       }
     }
 
