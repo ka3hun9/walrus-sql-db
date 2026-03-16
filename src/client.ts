@@ -331,6 +331,21 @@ export class WalrusSqlClient {
     }
   }
 
+  private isDdlStatement(sql: string): boolean {
+    return /^(?:CREATE|ALTER|DROP)\b/i.test(sql);
+  }
+
+  private assertDdlTransactionPolicy(sql: string): void {
+    if (this.transactionState !== "active") return;
+    if (!this.isDdlStatement(sql)) return;
+    const token = sql.split(/\s+/, 1)[0]?.toUpperCase() ?? "DDL";
+    throw sqlError(
+      ClientErrorCodeEnum.UnsupportedDdl,
+      `DDL statements are not supported in active transactions (policy=forbid_ddl_in_tx): ${sql}`,
+      { clause: "TRANSACTION", token },
+    );
+  }
+
   private transitionTransactionToAbortedOnError(sql: string): void {
     if (this.transactionState !== "active" && this.transactionState !== "committing") return;
     this.transitionTransactionState("error", sql);
@@ -505,6 +520,12 @@ export class WalrusSqlClient {
       }
 
       this.assertStatementAllowedDuringTransaction(normalized);
+      try {
+        this.assertDdlTransactionPolicy(normalized);
+      } catch (err) {
+        this.transitionTransactionToAbortedOnError(normalized);
+        throw err;
+      }
 
       let result: ExecuteResult;
       if ((this.opts.mode ?? "simulator") === "onchain") {
