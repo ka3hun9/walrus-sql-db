@@ -3027,7 +3027,9 @@ export class WalrusSqlClient {
     if (nullifMatch) {
       const a = this.evalExpr(row, nullifMatch[1]!);
       const b = this.evalExpr(row, nullifMatch[2]!);
-      return this.eq(a, b) ? null : a;
+      const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(a, b, "expr.nullif");
+      const eq = typedValueComparator.eq(leftTyped, rightTyped);
+      return eq === true ? null : a;
     }
 
     let castValueExpr: string | undefined;
@@ -3502,12 +3504,14 @@ export class WalrusSqlClient {
       case "IS_DISTINCT_FROM": {
         if (left == null && right == null) return "FALSE";
         if (left == null || right == null) return "TRUE";
-        return this.eq(left, right) ? "FALSE" : "TRUE";
+        const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(left, right, "predicate.isDistinctFrom");
+        return typedValueComparator.eq(leftTyped, rightTyped) === true ? "FALSE" : "TRUE";
       }
       case "IS_NOT_DISTINCT_FROM": {
         if (left == null && right == null) return "TRUE";
         if (left == null || right == null) return "FALSE";
-        return this.eq(left, right) ? "TRUE" : "FALSE";
+        const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(left, right, "predicate.isNotDistinctFrom");
+        return typedValueComparator.eq(leftTyped, rightTyped) === true ? "TRUE" : "FALSE";
       }
       default:
         return "FALSE";
@@ -3740,24 +3744,6 @@ export class WalrusSqlClient {
         return acc;
       }, {} as Record<string, string>);
     return JSON.stringify(ordered);
-  }
-
-  private eq(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): boolean {
-    if (a == null && b == null) return true;
-    return String(a) === String(b);
-  }
-
-  private compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): number {
-    const aNull = a === null || a === undefined;
-    const bNull = b === null || b === undefined;
-    if (aNull && bNull) return 0;
-    if (aNull) return 1;
-    if (bNull) return -1;
-
-    const an = Number(a);
-    const bn = Number(b);
-    if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
-    return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
   }
 
   private castValue(raw: string): string | number | boolean | null {

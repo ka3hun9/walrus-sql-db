@@ -11,8 +11,11 @@ import {
   fromStorage,
   normalizeRuntimeTypeName,
   serializeTypedValue,
+  SqlRuntimeType,
+  typedValueComparator,
+  typedValueOperators,
 } from "./types.js";
-import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SerializedTypedValue, SqlPrimitive, SqlRow } from "./types.js";
+import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SerializedTypedValue, SqlPrimitive, SqlRow, SqlTypedValue } from "./types.js";
 
 type Payload =
   | {
@@ -484,7 +487,7 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
   if (nullifMatch) {
     const a = evalExpr(row, nullifMatch[1]!);
     const b = evalExpr(row, nullifMatch[2]!);
-    return eq(a, b) ? null : a;
+    return typedEquals(a, b, "replay.expr.nullif") === true ? null : a;
   }
 
   let castValueExpr: string | undefined;
@@ -796,35 +799,76 @@ function parseWhere(whereExpr: string): WhereClause[] {
   return out;
 }
 
-function eq(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): boolean {
-  if (a == null && b == null) return true;
-  return String(a) === String(b);
+function normalizeComparableTypedPair(
+  left: SqlPrimitive | undefined,
+  right: SqlPrimitive | undefined,
+  sourceContext: string,
+): [SqlTypedValue, SqlTypedValue] {
+  let leftTyped = fromStorage((left ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.left`);
+  let rightTyped = fromJs((right ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.right`);
+  if (leftTyped.value === null || rightTyped.value === null || leftTyped.type === rightTyped.type) {
+    return [leftTyped, rightTyped];
+  }
+
+  try {
+    rightTyped = convertTypedValue(rightTyped, leftTyped.type, {
+      mode: "implicit",
+      sourceContext: `${sourceContext}.right->left`,
+    });
+    return [leftTyped, rightTyped];
+  } catch {
+    // Try opposite conversion direction first; final fallback is TEXT/TEXT compare.
+  }
+
+  try {
+    leftTyped = convertTypedValue(leftTyped, rightTyped.type, {
+      mode: "implicit",
+      sourceContext: `${sourceContext}.left->right`,
+    });
+    return [leftTyped, rightTyped];
+  } catch {
+    // Convert both sides to TEXT for a deterministic typed fallback path.
+  }
+
+  leftTyped = convertTypedValue(leftTyped, SqlRuntimeType.TEXT, {
+    mode: "explicit",
+    sourceContext: `${sourceContext}.left->text`,
+  });
+  rightTyped = convertTypedValue(rightTyped, SqlRuntimeType.TEXT, {
+    mode: "explicit",
+    sourceContext: `${sourceContext}.right->text`,
+  });
+  return [leftTyped, rightTyped];
 }
 
-function compare(a: SqlPrimitive | undefined, b: SqlPrimitive | undefined): number {
-  const an = Number(a);
-  const bn = Number(b);
-  if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
-  return String(a ?? "").localeCompare(String(b ?? ""), undefined, { numeric: true });
+function typedEquals(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, sourceContext: string): boolean | null {
+  const [leftTyped, rightTyped] = normalizeComparableTypedPair(left, right, sourceContext);
+  return typedValueComparator.eq(leftTyped, rightTyped);
 }
 
 function compareByOp(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined, op: ComparePredicate): TruthValue {
-  if (left == null || right == null) return "UNKNOWN";
+  const toReplayTruth = (value: boolean | null): TruthValue => {
+    if (value === null) return "UNKNOWN";
+    return value ? "TRUE" : "FALSE";
+  };
+  const [leftTyped, rightTyped] = normalizeComparableTypedPair(left, right, `replay.predicate.compare.${op}`);
 
   switch (op) {
     case "=":
-      return eq(left, right) ? "TRUE" : "FALSE";
+      return toReplayTruth(typedValueComparator.eq(leftTyped, rightTyped));
     case "!=":
-    case "<>":
-      return eq(left, right) ? "FALSE" : "TRUE";
+    case "<>": {
+      const eq = typedValueComparator.eq(leftTyped, rightTyped);
+      return toReplayTruth(eq === null ? null : !eq);
+    }
     case ">":
-      return compare(left, right) > 0 ? "TRUE" : "FALSE";
+      return toReplayTruth(typedValueComparator.gt(leftTyped, rightTyped));
     case "<":
-      return compare(left, right) < 0 ? "TRUE" : "FALSE";
+      return toReplayTruth(typedValueComparator.lt(leftTyped, rightTyped));
     case ">=":
-      return compare(left, right) >= 0 ? "TRUE" : "FALSE";
+      return toReplayTruth(typedValueComparator.gte(leftTyped, rightTyped));
     case "<=":
-      return compare(left, right) <= 0 ? "TRUE" : "FALSE";
+      return toReplayTruth(typedValueComparator.lte(leftTyped, rightTyped));
     default:
       return "FALSE";
   }
@@ -883,8 +927,18 @@ function evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     case "LIKE":
     case "NOT_LIKE": {
       if (left == null || right == null) return "UNKNOWN";
-      const regex = likeToRegex(String(right ?? ""), clause.likeEscape);
-      const matched = new RegExp(regex, "i").test(String(left ?? ""));
+      const leftTyped = convertTypedValue(
+        fromStorage((left ?? null) as SqlPrimitive, undefined, {}, "replay.predicate.like.left"),
+        SqlRuntimeType.TEXT,
+        { mode: "explicit", sourceContext: "replay.predicate.like.left" },
+      );
+      const rightTyped = convertTypedValue(
+        fromJs((right ?? null) as SqlPrimitive, undefined, {}, "replay.predicate.like.right"),
+        SqlRuntimeType.TEXT,
+        { mode: "explicit", sourceContext: "replay.predicate.like.right" },
+      );
+      const regex = likeToRegex(String(rightTyped.value ?? ""), clause.likeEscape);
+      const matched = new RegExp(regex, "i").test(String(leftTyped.value ?? ""));
       const tv: TruthValue = matched ? "TRUE" : "FALSE";
       return clause.op === "LIKE" ? tv : tvNot(tv);
     }
@@ -936,8 +990,12 @@ function compareForOrder(
   if (aNull) return 1;
   if (bNull) return -1;
 
-  const base = compare(a, b);
-  return direction === "DESC" ? -base : base;
+  const [leftTyped, rightTyped] = normalizeComparableTypedPair(a, b, "replay.order.key");
+  const lt = typedValueComparator.lt(leftTyped, rightTyped);
+  if (lt === true) return direction === "DESC" ? 1 : -1;
+  const gt = typedValueComparator.gt(leftTyped, rightTyped);
+  if (gt === true) return direction === "DESC" ? -1 : 1;
+  return 0;
 }
 
 function applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
@@ -962,15 +1020,59 @@ function computeAggregateRow(
     throw new Error(`${aggregate} requires a numeric field`);
   }
 
-  const nums = rows
+  const typedNums = rows
     .map((r) => r[aggregateField])
     .filter((v) => v !== null && v !== undefined)
-    .map((v) => Number(v))
-    .filter((n) => Number.isFinite(n));
-  if (aggregate === "SUM") return { sum: nums.length ? nums.reduce((a, b) => a + b, 0) : null };
-  if (aggregate === "AVG") return { avg: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null };
-  if (aggregate === "MIN") return { min: nums.length ? Math.min(...nums) : null };
-  return { max: nums.length ? Math.max(...nums) : null };
+    .map((v) => fromStorage((v ?? null) as SqlPrimitive, undefined, {}, `replay.aggregate.source:${aggregateField}`))
+    .map((typed) => {
+      try {
+        return convertTypedValue(typed, SqlRuntimeType.DOUBLE, {
+          mode: "explicit",
+          sourceContext: `replay.aggregate.numeric:${aggregateField}`,
+        });
+      } catch {
+        return null;
+      }
+    })
+    .filter((typed): typed is NonNullable<typeof typed> => typed !== null && typed.value !== null);
+
+  if (aggregate === "SUM") {
+    if (!typedNums.length) return { sum: null };
+    let state = typedNums[0]!;
+    for (let i = 1; i < typedNums.length; i++) {
+      state = typedValueOperators.add(state, typedNums[i]!);
+    }
+    return { sum: state.value as SqlPrimitive };
+  }
+
+  if (aggregate === "AVG") {
+    if (!typedNums.length) return { avg: null };
+    let sumState = typedNums[0]!;
+    for (let i = 1; i < typedNums.length; i++) {
+      sumState = typedValueOperators.add(sumState, typedNums[i]!);
+    }
+    const divisor = fromJs(typedNums.length, SqlRuntimeType.INT, {}, `replay.aggregate.avg.divisor:${aggregateField}`);
+    const avg = typedValueOperators.div(sumState, divisor);
+    return { avg: avg.value as SqlPrimitive };
+  }
+
+  if (aggregate === "MIN") {
+    if (!typedNums.length) return { min: null };
+    let state = typedNums[0]!;
+    for (let i = 1; i < typedNums.length; i++) {
+      const lt = typedValueComparator.lt(typedNums[i]!, state);
+      if (lt === true) state = typedNums[i]!;
+    }
+    return { min: state.value as SqlPrimitive };
+  }
+
+  if (!typedNums.length) return { max: null };
+  let state = typedNums[0]!;
+  for (let i = 1; i < typedNums.length; i++) {
+    const gt = typedValueComparator.gt(typedNums[i]!, state);
+    if (gt === true) state = typedNums[i]!;
+  }
+  return { max: state.value as SqlPrimitive };
 }
 
 function groupRows(
