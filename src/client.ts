@@ -1756,29 +1756,27 @@ export class WalrusSqlClient {
         : new Map(bucket.map((row) => [row, [row]] as const));
 
       const whereTree = this.parseWhereTree(plan.whereExpr);
-      let touched = 0;
-      const next: SqlRow[] = [];
+      const matchedRows: SqlRow[] = [];
       for (const row of bucket) {
         const mergedHits = joinedRows.get(row);
         const matched = mergedHits ? mergedHits.some((merged) => this.evaluateWhereTree(merged, whereTree) === "TRUE") : false;
-        if (matched) {
-          const beforeImage = { ...row };
-          // Keep unique indexes in sync before dropping the row from the table snapshot.
-          this.removeRowFromUniqueIndexes(plan.table, row);
-          this.recordTransactionLogWrite(plan.table, "DELETE", beforeImage, beforeImage, null);
-          if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(plan.table, "DELETE", beforeImage);
-          touched++;
-        } else {
-          next.push(row);
-        }
+        if (matched) matchedRows.push(row);
       }
-      this.setTableRows(plan.table, next);
+
+      const deleteTargets = this.collectDeleteTargetsWithCascade(plan.table, matchedRows);
+      const deleteCounts = this.applyDeleteTargets(deleteTargets);
+      const touched = [...deleteCounts.values()].reduce((sum, count) => sum + count, 0);
+
       if (this.isDmlWriteStagingActive()) {
-        if (touched > 0) this.bumpTableWriteStats(plan.table, { deleteRows: touched });
+        for (const [table, count] of deleteCounts.entries()) {
+          if (count > 0) this.bumpTableWriteStats(table, { deleteRows: count });
+        }
       } else {
-        this.dirtyTables.add(plan.table);
-        if (touched > 0) this.recordStorageWrite(plan.table, "DELETE_ROW", touched, "simulator");
-        this.invalidateReadCacheOnWrite();
+        for (const [table, count] of deleteCounts.entries()) {
+          if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordStorageWrite(table, "DELETE_ROW", count, "simulator");
+        }
+        if (touched > 0) this.invalidateReadCacheOnWrite();
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -2930,6 +2928,86 @@ export class WalrusSqlClient {
         );
       }
     }
+  }
+
+  private getReferencingForeignKeys(parentTable: string): Array<{ table: string; fk: ForeignKeySpec }> {
+    const out: Array<{ table: string; fk: ForeignKeySpec }> = [];
+    for (const [table, schema] of this.schemas.entries()) {
+      for (const fk of schema.foreignKeys ?? []) {
+        if (fk.refTable.toUpperCase() === parentTable.toUpperCase()) out.push({ table, fk });
+      }
+    }
+    return out;
+  }
+
+  private doesChildRowReferenceParent(parentRow: SqlRow, childRow: SqlRow, fk: ForeignKeySpec): boolean {
+    for (let i = 0; i < fk.columns.length; i++) {
+      const childValue = (childRow[fk.columns[i]!] ?? null) as SqlPrimitive;
+      const parentValue = (parentRow[fk.refColumns[i]!] ?? null) as SqlPrimitive;
+      if (childValue === null || childValue === undefined) return false;
+      if (!this.areConstraintValuesEqual(parentValue, childValue, `constraint.fk.match:${fk.columns[i]}`)) return false;
+    }
+    return true;
+  }
+
+  private collectDeleteTargetsWithCascade(seedTable: string, seedRows: SqlRow[]): Map<string, Set<SqlRow>> {
+    const targets = new Map<string, Set<SqlRow>>();
+    const queue: Array<{ table: string; row: SqlRow }> = [];
+
+    const addTarget = (table: string, row: SqlRow): void => {
+      let rows = targets.get(table);
+      if (!rows) {
+        rows = new Set<SqlRow>();
+        targets.set(table, rows);
+      }
+      if (rows.has(row)) return;
+      rows.add(row);
+      queue.push({ table, row });
+    };
+
+    for (const row of seedRows) addTarget(seedTable, row);
+
+    while (queue.length > 0) {
+      const head = queue.shift()!;
+      const refs = this.getReferencingForeignKeys(head.table);
+      for (const ref of refs) {
+        if (ref.fk.onDelete !== "CASCADE") continue;
+        const childRows = this.requireWritableTableForDml(ref.table);
+        for (const childRow of childRows) {
+          if (this.doesChildRowReferenceParent(head.row, childRow, ref.fk)) addTarget(ref.table, childRow);
+        }
+      }
+    }
+
+    return targets;
+  }
+
+  private applyDeleteTargets(targets: Map<string, Set<SqlRow>>): Map<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const [table, toDelete] of targets.entries()) {
+      if (toDelete.size === 0) continue;
+
+      const rows = this.requireWritableTableForDml(table);
+      const keep: SqlRow[] = [];
+      let touched = 0;
+      for (const row of rows) {
+        if (!toDelete.has(row)) {
+          keep.push(row);
+          continue;
+        }
+        const beforeImage = { ...row };
+        this.removeRowFromUniqueIndexes(table, row);
+        this.recordTransactionLogWrite(table, "DELETE", beforeImage, beforeImage, null);
+        if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "DELETE", beforeImage);
+        touched++;
+      }
+
+      this.setTableRows(table, keep);
+      if (touched > 0) counts.set(table, touched);
+    }
+
+    return counts;
   }
 
   private collectUniqueGroups(schema: TableSchema): string[][] {
