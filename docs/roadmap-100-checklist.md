@@ -64,7 +64,7 @@
 - [x] P2-TEST-003 恢复测试：崩溃注入后 WAL 恢复一致性
 - [x] P2-TEST-004 FK 回归：级联删除/限制策略/循环引用保护
 - [x] P2-TEST-005 链上延迟注入：pending 与 confirmed 读策略一致性
-- [ ] P2-TEST-006 sqllogic 扩展：事务/FK fixture 套件
+- [x] P2-TEST-006 sqllogic 扩展：事务/FK fixture 套件
 
 ## P2-H. 基准与里程碑验收
 
