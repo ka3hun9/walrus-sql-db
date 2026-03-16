@@ -158,7 +158,7 @@
 - [x] K-TVAL-021 Feature flag 迁移开关移除（最终仅保留 TypedValue 路径）
 
 ### K7. 测试与验收门
-- [ ] K-TVAL-022 单测：TypedValue 构造、比较、算术、转换、NULL/错误路径全覆盖
+- [x] K-TVAL-022 单测：TypedValue 构造、比较、算术、转换、NULL/错误路径全覆盖
 - [ ] K-TVAL-023 集成：SELECT/JOIN/GROUP/HAVING/ORDER/LIMIT 全链路 TypedValue 回归
 - [ ] K-TVAL-024 DML/DDL/约束：写入、更新、冲突检测、默认值回填回归
 - [ ] K-TVAL-025 存储：序列化/反序列化/增量回放与缓存一致性回归
