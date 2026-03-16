@@ -1240,7 +1240,10 @@ export class WalrusSqlClient {
         });
       }
 
-      const seeded = defaultParsed.hasDefault ? defaultValue ?? null : null;
+      const seededTyped = defaultParsed.hasDefault
+        ? (defaultParsed.typedValue ?? fromLiteral(null, undefined, {}, `ddl.default.alter:${table}.${column}`))
+        : fromLiteral(null, undefined, {}, `ddl.backfill.null:${table}.${column}`);
+      const seeded = this.coerceByType(type, seededTyped, `ddl.backfill:${table}.${column}`);
       for (const r of rows) r[column] = seeded;
       schema.columns.push(col);
       this.uniqueGroupsCache.delete(table);
