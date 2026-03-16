@@ -189,6 +189,32 @@ type TransactionWriteSet = {
   tables: Map<string, TransactionTableWriteSet>;
 };
 
+type QueryCacheEntry = {
+  rows: SqlRow[];
+  cachedAt: number;
+  writeVersion: number;
+};
+
+type TransactionTableCommitSnapshot = {
+  hadTableRows: boolean;
+  rows?: SqlRow[];
+  hadUniqueIndexes: boolean;
+  uniqueIndexes?: Map<string, Map<string, SqlRow>>;
+};
+
+type TransactionCommitRuntimeSnapshot = {
+  tableSnapshots: Map<string, TransactionTableCommitSnapshot>;
+  dirtyTables: Set<string>;
+  storageWriteLog: StorageWriteEvent[];
+  writeVersion: number;
+  queryCache: Map<string, QueryCacheEntry>;
+};
+
+type TransactionTableCommitSideEffect = {
+  table: string;
+  stats: TransactionTableWriteStats;
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -219,7 +245,7 @@ export class WalrusSqlClient {
   private readonly uniqueGroupsCache = new Map<string, string[][]>();
   private readonly constraintCost = new Map<string, ConstraintIndexCostStats>();
   private readonly dirtyTables = new Set<string>();
-  private readonly queryCache = new Map<string, { rows: SqlRow[]; cachedAt: number; writeVersion: number }>();
+  private readonly queryCache = new Map<string, QueryCacheEntry>();
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
@@ -324,26 +350,92 @@ export class WalrusSqlClient {
     return { tables: new Map<string, TransactionTableWriteSet>() };
   }
 
+  private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
+    this.tables.set(table, tableStage.rows);
+    this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
+  }
+
+  private takeTransactionCommitRuntimeSnapshot(staged: TransactionWriteSet): TransactionCommitRuntimeSnapshot {
+    const tableSnapshots = new Map<string, TransactionTableCommitSnapshot>();
+    for (const table of staged.tables.keys()) {
+      tableSnapshots.set(table, {
+        hadTableRows: this.tables.has(table),
+        rows: this.tables.get(table),
+        hadUniqueIndexes: this.uniqueIndexes.has(table),
+        uniqueIndexes: this.uniqueIndexes.get(table),
+      });
+    }
+
+    return {
+      tableSnapshots,
+      dirtyTables: new Set(this.dirtyTables),
+      storageWriteLog: this.storageWriteLog.map((evt) => ({ ...evt })),
+      writeVersion: this.writeVersion,
+      queryCache: new Map(this.queryCache),
+    };
+  }
+
+  private restoreTransactionCommitRuntimeSnapshot(snapshot: TransactionCommitRuntimeSnapshot): void {
+    for (const [table, tableSnapshot] of snapshot.tableSnapshots.entries()) {
+      if (tableSnapshot.hadTableRows) this.tables.set(table, tableSnapshot.rows ?? []);
+      else this.tables.delete(table);
+
+      if (tableSnapshot.hadUniqueIndexes) {
+        this.uniqueIndexes.set(table, tableSnapshot.uniqueIndexes ?? new Map<string, Map<string, SqlRow>>());
+      }
+      else this.uniqueIndexes.delete(table);
+    }
+
+    this.dirtyTables.clear();
+    for (const table of snapshot.dirtyTables.values()) this.dirtyTables.add(table);
+
+    this.storageWriteLog.length = 0;
+    this.storageWriteLog.push(...snapshot.storageWriteLog.map((evt) => ({ ...evt })));
+
+    this.writeVersion = snapshot.writeVersion;
+    this.queryCache.clear();
+    for (const [sql, entry] of snapshot.queryCache.entries()) this.queryCache.set(sql, entry);
+  }
+
   private applyTransactionWriteSetOnCommit(): void {
     const staged = this.transactionWriteSet;
     if (!staged || staged.tables.size === 0) return;
 
+    const snapshot = this.takeTransactionCommitRuntimeSnapshot(staged);
     let committedRows = 0;
-    for (const [table, tableStage] of staged.tables.entries()) {
-      this.tables.set(table, tableStage.rows);
-      this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
+    const sideEffects: TransactionTableCommitSideEffect[] = [];
 
-      const { insertRows, updateRows, deleteRows } = tableStage.stats;
-      if (insertRows + updateRows + deleteRows > 0) {
-        this.dirtyTables.add(table);
-        if (insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", insertRows, "simulator");
-        if (updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", updateRows, "simulator");
-        if (deleteRows > 0) this.recordStorageWrite(table, "DELETE_ROW", deleteRows, "simulator");
-        committedRows += insertRows + updateRows + deleteRows;
+    try {
+      for (const [table, tableStage] of staged.tables.entries()) {
+        this.applyCommittedTableStage(table, tableStage);
+
+        const { insertRows, updateRows, deleteRows } = tableStage.stats;
+        if (insertRows + updateRows + deleteRows > 0) {
+          sideEffects.push({
+            table,
+            stats: { insertRows, updateRows, deleteRows },
+          });
+          committedRows += insertRows + updateRows + deleteRows;
+        }
       }
-    }
 
-    if (committedRows > 0) this.invalidateReadCacheOnWrite();
+      for (const effect of sideEffects) {
+        const { table, stats } = effect;
+        this.dirtyTables.add(table);
+        if (stats.insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", stats.insertRows, "simulator");
+        if (stats.updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", stats.updateRows, "simulator");
+        if (stats.deleteRows > 0) this.recordStorageWrite(table, "DELETE_ROW", stats.deleteRows, "simulator");
+      }
+
+      if (committedRows > 0) this.invalidateReadCacheOnWrite();
+    } catch (err) {
+      this.restoreTransactionCommitRuntimeSnapshot(snapshot);
+      throw this.wrapAsyncError(
+        err,
+        ClientErrorCodeEnum.ExecutionFailed,
+        "transaction commit apply failed; restored pre-commit state",
+      );
+    }
   }
 
   private async executeTransactionControl(sql: string, action: SqlTransactionAction): Promise<ExecuteResult> {
