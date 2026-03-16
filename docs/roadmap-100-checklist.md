@@ -42,7 +42,7 @@
 
 ## P2-E. 外键约束（FK）
 
-- [ ] P2-FK-001 SQL 解析：FOREIGN KEY（列级/表级）
+- [x] P2-FK-001 SQL 解析：FOREIGN KEY（列级/表级）
 - [ ] P2-FK-002 catalog 元数据：引用表/列、匹配规则、删除更新动作
 - [ ] P2-FK-003 INSERT/UPDATE 引用完整性检查（事务内可见性正确）
 - [ ] P2-FK-004 ON DELETE CASCADE 实现
