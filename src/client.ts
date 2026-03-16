@@ -1075,6 +1075,141 @@ export class WalrusSqlClient {
     for (const [sql, entry] of snapshot.queryCache.entries()) this.queryCache.set(sql, entry);
   }
 
+  private buildConstraintRevalidationSnapshot(staged: TransactionWriteSet): Map<string, SqlRow[]> {
+    const snapshot = new Map<string, SqlRow[]>();
+    for (const [table, rows] of this.tables.entries()) snapshot.set(table, this.deepCloneRows(rows));
+    for (const entry of staged.logEntries) {
+      const rows = snapshot.get(entry.table) ?? [];
+      const encodedKey = this.encodeRowVersionKey(entry.key);
+      const rowIndex = rows.findIndex(
+        (row) => this.encodeRowVersionKey(this.buildTransactionRowKey(entry.table, row)) === encodedKey,
+      );
+
+      if (entry.op === "DELETE") {
+        if (rowIndex >= 0) rows.splice(rowIndex, 1);
+      } else {
+        const postImage = entry.postImage ? { ...entry.postImage } : null;
+        if (!postImage) continue;
+        if (rowIndex >= 0) rows[rowIndex] = postImage;
+        else rows.push(postImage);
+      }
+
+      snapshot.set(entry.table, rows);
+    }
+    return snapshot;
+  }
+
+  private enforceForeignKeyIntegrityInSnapshot(
+    table: string,
+    row: SqlRow,
+    snapshotTables: Map<string, SqlRow[]>,
+  ): void {
+    const schema = this.schemas.get(table);
+    if (!schema?.foreignKeys?.length) return;
+
+    for (const fk of schema.foreignKeys) {
+      const childValues = fk.columns.map((column) => (row[column] ?? null) as SqlPrimitive);
+      const nullCount = childValues.filter((value) => value === null || value === undefined).length;
+      if (nullCount === fk.columns.length) continue;
+      if ((fk.matchRule === "SIMPLE" || fk.matchRule === "PARTIAL") && nullCount > 0) continue;
+      if (fk.matchRule === "FULL" && nullCount > 0) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `MATCH FULL requires all-or-none child key values: ${table}(${fk.columns.join(",")})`,
+          {
+            clause: "FOREIGN KEY",
+            field: `${table}(${fk.columns.join(",")})`,
+          },
+        );
+      }
+
+      const parentSchema = this.schemas.get(fk.refTable);
+      if (!parentSchema) {
+        throw constraintError("FOREIGN_KEY", `referenced table not found: ${fk.refTable}`, {
+          clause: "FOREIGN KEY",
+          field: `${table}(${fk.columns.join(",")})`,
+        });
+      }
+
+      for (const refColumn of fk.refColumns) {
+        if (!parentSchema.columns.some((column) => column.name.toUpperCase() === refColumn.toUpperCase())) {
+          throw constraintError(
+            "FOREIGN_KEY",
+            `referenced column not found: ${fk.refTable}.${refColumn}`,
+            {
+              clause: "FOREIGN KEY",
+              field: `${table}(${fk.columns.join(",")})`,
+            },
+          );
+        }
+      }
+
+      const parentRows = snapshotTables.get(fk.refTable) ?? [];
+      const hasMatch = parentRows.some((parentRow) => fk.refColumns.every((refColumn, idx) => {
+        const childValue = childValues[idx] ?? null;
+        const parentValue = (parentRow[refColumn] ?? null) as SqlPrimitive;
+        return this.areConstraintValuesEqual(parentValue, childValue, `constraint.fk.commit:${table}.${fk.columns[idx]}`);
+      }));
+
+      if (!hasMatch) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `referential integrity failed: ${table}(${fk.columns.join(",")}) -> ${fk.refTable}(${fk.refColumns.join(",")})`,
+          {
+            clause: "FOREIGN KEY",
+            field: `${table}(${fk.columns.join(",")})`,
+          },
+        );
+      }
+    }
+  }
+
+  private assertCommitConstraintRevalidation(staged: TransactionWriteSet): void {
+    const snapshotTables = this.buildConstraintRevalidationSnapshot(staged);
+
+    for (const [table] of staged.tables.entries()) {
+      const schema = this.schemas.get(table);
+      if (!schema) continue;
+
+      const rows = snapshotTables.get(table) ?? [];
+      const uniqueSeen = new Map<string, Map<string, number>>();
+      for (const group of this.getUniqueGroups(table, schema)) uniqueSeen.set(this.uniqueGroupName(group), new Map<string, number>());
+
+      for (const row of rows) {
+        for (const column of schema.columns) {
+          const value = row[column.name];
+          if ((column.notNull || column.primaryKey) && (value === null || value === undefined)) {
+            throw constraintError("NOT_NULL", `${table}.${column.name} is NOT NULL`, {
+              clause: "COMMIT_REVALIDATE",
+              field: `${table}.${column.name}`,
+            });
+          }
+        }
+
+        for (const group of this.getUniqueGroups(table, schema)) {
+          const keyName = this.uniqueGroupName(group);
+          const keyVal = this.uniqueGroupValue(row, group);
+          if (keyVal === null) continue;
+          const seen = uniqueSeen.get(keyName)!;
+          const hit = seen.get(keyVal) ?? 0;
+          if (hit > 0) {
+            throw constraintError(
+              "DUPLICATE_KEY",
+              `Duplicate key value for ${table}(${group.join(",")}) during COMMIT revalidation`,
+              {
+                clause: "COMMIT_REVALIDATE",
+                field: group.join(","),
+              },
+            );
+          }
+          seen.set(keyVal, hit + 1);
+        }
+
+        this.enforceForeignKeyIntegrityInSnapshot(table, row, snapshotTables);
+      }
+    }
+  }
+
   private applyTransactionWriteSetOnCommit(): void {
     const staged = this.transactionWriteSet;
     if (!staged || staged.tables.size === 0) return;
@@ -1149,7 +1284,10 @@ export class WalrusSqlClient {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
       if (this.isSimulatorMode()) {
-        if (this.transactionWriteSet) this.assertNoWriteConflicts(this.transactionWriteSet);
+        if (this.transactionWriteSet) {
+          this.assertNoWriteConflicts(this.transactionWriteSet);
+          this.assertCommitConstraintRevalidation(this.transactionWriteSet);
+        }
         walRecord = this.createCommitWalRecord();
         if (walRecord) batchPayload = this.buildTransactionCommitBatchPayload(walRecord);
         if (walRecord) {
