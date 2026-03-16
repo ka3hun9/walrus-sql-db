@@ -161,7 +161,7 @@
 - [x] K-TVAL-022 单测：TypedValue 构造、比较、算术、转换、NULL/错误路径全覆盖
 - [x] K-TVAL-023 集成：SELECT/JOIN/GROUP/HAVING/ORDER/LIMIT 全链路 TypedValue 回归
 - [x] K-TVAL-024 DML/DDL/约束：写入、更新、冲突检测、默认值回填回归
-- [ ] K-TVAL-025 存储：序列化/反序列化/增量回放与缓存一致性回归
+- [x] K-TVAL-025 存储：序列化/反序列化/增量回放与缓存一致性回归
 - [ ] K-TVAL-026 CI gate：新增 TypedValue 专项测试套件并纳入 `ci:full`
 
 ### K8. 最终里程碑（阶段一补齐）
