@@ -10,7 +10,14 @@ await db.execute("CREATE TABLE child_fk_col (id INT PRIMARY KEY, parent_id INT R
 
 const columnLevel = internals.schemas.get("child_fk_col");
 assert.deepEqual(columnLevel?.foreignKeys, [
-  { columns: ["parent_id"], refTable: "parent_fk_parse", refColumns: ["id"] },
+  {
+    columns: ["parent_id"],
+    refTable: "parent_fk_parse",
+    refColumns: ["id"],
+    matchRule: "SIMPLE",
+    onDelete: "NO ACTION",
+    onUpdate: "NO ACTION",
+  },
 ]);
 
 await db.execute(
@@ -19,7 +26,14 @@ await db.execute(
 
 const tableLevel = internals.schemas.get("child_fk_tbl");
 assert.deepEqual(tableLevel?.foreignKeys, [
-  { columns: ["parent_id", "parent_code"], refTable: "parent_fk_parse", refColumns: ["id", "code"] },
+  {
+    columns: ["parent_id", "parent_code"],
+    refTable: "parent_fk_parse",
+    refColumns: ["id", "code"],
+    matchRule: "SIMPLE",
+    onDelete: "NO ACTION",
+    onUpdate: "NO ACTION",
+  },
 ]);
 
 await assert.rejects(

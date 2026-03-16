@@ -22,6 +22,9 @@ export type ForeignKeySpec = {
   columns: string[];
   refTable: string;
   refColumns: string[];
+  matchRule: "SIMPLE" | "FULL" | "PARTIAL";
+  onDelete: "NO ACTION" | "RESTRICT" | "CASCADE" | "SET NULL" | "SET DEFAULT";
+  onUpdate: "NO ACTION" | "RESTRICT" | "CASCADE" | "SET NULL" | "SET DEFAULT";
 };
 
 export type TableSchema = {

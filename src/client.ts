@@ -2228,6 +2228,57 @@ export class WalrusSqlClient {
     return { name };
   }
 
+  private parseForeignKeyReferenceClause(
+    referenceClause: string,
+    sourceDefinition: string,
+  ): Pick<ForeignKeySpec, "refTable" | "refColumns" | "matchRule" | "onDelete" | "onUpdate"> {
+    const refMatch = referenceClause.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*(.*)$/i);
+    if (!refMatch) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${sourceDefinition}`);
+
+    const refTable = refMatch[1]!.trim();
+    const refColumns = this.splitTopLevelComma(refMatch[2]!).map((x) => x.trim()).filter((x) => x.length > 0);
+    if (!refColumns.length) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${sourceDefinition}`);
+
+    let tail = refMatch[3]!.trim();
+    let matchRule: ForeignKeySpec["matchRule"] = "SIMPLE";
+    let onDelete: ForeignKeySpec["onDelete"] = "NO ACTION";
+    let onUpdate: ForeignKeySpec["onUpdate"] = "NO ACTION";
+    const seen = new Set<"MATCH" | "ON_DELETE" | "ON_UPDATE">();
+
+    while (tail.length > 0) {
+      const matchRuleMatch = tail.match(/^MATCH\s+(SIMPLE|FULL|PARTIAL)\b(.*)$/i);
+      if (matchRuleMatch) {
+        if (seen.has("MATCH")) throw sqlError("ERR_UNSUPPORTED_DDL", `duplicate MATCH clause: ${sourceDefinition}`);
+        seen.add("MATCH");
+        matchRule = matchRuleMatch[1]!.trim().toUpperCase() as ForeignKeySpec["matchRule"];
+        tail = matchRuleMatch[2]!.trim();
+        continue;
+      }
+
+      const deleteMatch = tail.match(/^ON\s+DELETE\s+(NO\s+ACTION|RESTRICT|CASCADE|SET\s+NULL|SET\s+DEFAULT)\b(.*)$/i);
+      if (deleteMatch) {
+        if (seen.has("ON_DELETE")) throw sqlError("ERR_UNSUPPORTED_DDL", `duplicate ON DELETE clause: ${sourceDefinition}`);
+        seen.add("ON_DELETE");
+        onDelete = deleteMatch[1]!.trim().toUpperCase().replace(/\s+/g, " ") as ForeignKeySpec["onDelete"];
+        tail = deleteMatch[2]!.trim();
+        continue;
+      }
+
+      const updateMatch = tail.match(/^ON\s+UPDATE\s+(NO\s+ACTION|RESTRICT|CASCADE|SET\s+NULL|SET\s+DEFAULT)\b(.*)$/i);
+      if (updateMatch) {
+        if (seen.has("ON_UPDATE")) throw sqlError("ERR_UNSUPPORTED_DDL", `duplicate ON UPDATE clause: ${sourceDefinition}`);
+        seen.add("ON_UPDATE");
+        onUpdate = updateMatch[1]!.trim().toUpperCase().replace(/\s+/g, " ") as ForeignKeySpec["onUpdate"];
+        tail = updateMatch[2]!.trim();
+        continue;
+      }
+
+      throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${sourceDefinition}`);
+    }
+
+    return { refTable, refColumns, matchRule, onDelete, onUpdate };
+  }
+
   private parseCreateTableSchema(sql: string): TableSchema {
     const m = sql.match(/^CREATE TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)\s*$/i);
     if (!m) throw sqlError("ERR_UNSUPPORTED_DDL", sql);
@@ -2257,17 +2308,17 @@ export class WalrusSqlClient {
         continue;
       }
 
-      const fkMatch = d.match(/^FOREIGN\s+KEY\s*\((.+)\)\s+REFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.+)\)$/i);
+      const fkMatch = d.match(/^FOREIGN\s+KEY\s*\((.+)\)\s+REFERENCES\s+(.+)$/i);
       if (fkMatch) {
         const cols = this.splitTopLevelComma(fkMatch[1]!).map((x) => x.trim());
-        const refCols = this.splitTopLevelComma(fkMatch[3]!).map((x) => x.trim());
+        const refSpec = this.parseForeignKeyReferenceClause(fkMatch[2]!, d);
+        const refCols = refSpec.refColumns;
         if (!cols.length || !refCols.length || cols.length !== refCols.length) {
           throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${d}`);
         }
         foreignKeys.push({
           columns: cols,
-          refTable: fkMatch[2]!.trim(),
-          refColumns: refCols,
+          ...refSpec,
         });
         continue;
       }
@@ -2290,12 +2341,15 @@ export class WalrusSqlClient {
       }
       columns.push({ name: colName, type, notNull, primaryKey, unique, defaultValue });
 
-      const colRefMatch = consRaw.match(/\bREFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)/i);
+      const colRefMatch = consRaw.match(/\bREFERENCES\s+(.+)$/i);
       if (colRefMatch) {
+        const refSpec = this.parseForeignKeyReferenceClause(colRefMatch[1]!, d);
+        if (refSpec.refColumns.length !== 1) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `invalid FOREIGN KEY definition: ${d}`);
+        }
         foreignKeys.push({
           columns: [colName],
-          refTable: colRefMatch[1]!.trim(),
-          refColumns: [colRefMatch[2]!.trim()],
+          ...refSpec,
         });
       }
     }
