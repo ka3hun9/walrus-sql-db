@@ -1124,6 +1124,18 @@ export interface TransactionWalEntry {
   record?: TransactionLogRecord;
 }
 
+export interface TransactionCommitBatchPayload {
+  txnId: string;
+  writeSet: TransactionLogWriteEntry[];
+  checksum: string;
+  at: number;
+}
+
+export interface TransactionCommitBatchResult {
+  digest: string;
+  raw?: unknown;
+}
+
 function stableSerializeJson(value: unknown): string {
   if (value === null) return "null";
 
@@ -1276,6 +1288,7 @@ export interface WalrusSqlClientOptions {
     enabled?: boolean;
     filePath?: string;
   };
+  transactionCommitExecutor?: (payload: TransactionCommitBatchPayload) => Promise<TransactionCommitBatchResult>;
   logging?: {
     level?: import("./logger.js").LogLevel;
     sink?: import("./logger.js").LogSink;

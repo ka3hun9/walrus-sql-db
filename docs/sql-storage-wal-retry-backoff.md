@@ -36,5 +36,15 @@
   - reads WAL NDJSON
   - validates prepared record checksum
   - returns unresolved prepared transactions (`PREPARE` without `COMMIT`/`ROLLBACK`)
-  - skips malformed lines safely
+- skips malformed lines safely
 - Covered by `test/unit-g-stor-007-wal-persistence-recovery-entry.ts`.
+
+## P2-LOG-003
+- Commit batch processor hook: `WalrusSqlClientOptions.transactionCommitExecutor(payload)`.
+- `payload` is `TransactionCommitBatchPayload`:
+  - single `txnId`
+  - transaction-level `writeSet` aggregation
+  - checksum + timestamp copied from WAL prepare record
+- COMMIT flow (`mode=simulator`) invokes the hook once per transaction commit after `PREPARE` and before local apply.
+- This provides one-shot transaction aggregation for chain-side submission adapters.
+- Covered by `test/unit-g-stor-008-transaction-commit-batch-processor.ts`.

@@ -19,7 +19,7 @@
 
 - [x] P2-LOG-001 事务日志结构定义（txnId, writeSet, pre/post image, checksum）
 - [x] P2-LOG-002 写前日志（WAL）落盘/持久化策略与恢复入口
-- [ ] P2-LOG-003 提交批处理器：将事务变更聚合成一次链上写入
+- [x] P2-LOG-003 提交批处理器：将事务变更聚合成一次链上写入
 - [ ] P2-LOG-004 失败补偿：提交中断可重放/可回滚/幂等重试
 - [ ] P2-LOG-005 日志截断与归档策略（checkpoint + retention）
 

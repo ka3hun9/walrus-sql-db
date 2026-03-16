@@ -27,6 +27,7 @@ import type {
   SqlTypedValue,
   StorageWriteEvent,
   StorageWriteOperation,
+  TransactionCommitBatchPayload,
   TransactionLogRecord,
   TransactionLogWriteEntry,
   TransactionLogWriteOperation,
@@ -465,6 +466,26 @@ export class WalrusSqlClient {
     });
   }
 
+  private buildTransactionCommitBatchPayload(record: TransactionLogRecord): TransactionCommitBatchPayload {
+    return {
+      txnId: record.txnId,
+      at: record.at,
+      checksum: record.checksum,
+      writeSet: record.writeSet.map((entry) => ({
+        table: entry.table,
+        op: entry.op,
+        key: { ...entry.key },
+        preImage: entry.preImage ? { ...entry.preImage } : null,
+        postImage: entry.postImage ? { ...entry.postImage } : null,
+      })),
+    };
+  }
+
+  private async executeTransactionCommitBatch(payload: TransactionCommitBatchPayload): Promise<void> {
+    if (!this.opts.transactionCommitExecutor) return;
+    await this.opts.transactionCommitExecutor(payload);
+  }
+
   async recoverPendingTransactionLogsFromWal(): Promise<TransactionLogRecord[]> {
     const walPath = this.getWalFilePath();
     if (!walPath) return [];
@@ -620,11 +641,13 @@ export class WalrusSqlClient {
 
     this.transitionTransactionState("commit", sql);
     let walRecord: TransactionLogRecord | null = null;
+    let batchPayload: TransactionCommitBatchPayload | null = null;
     try {
       // Keep COMMIT transition observable as active -> committing -> idle.
       await this.waitTransactionCommitTurn();
       if (this.isSimulatorMode()) {
         walRecord = this.createCommitWalRecord();
+        if (walRecord) batchPayload = this.buildTransactionCommitBatchPayload(walRecord);
         if (walRecord) {
           await this.appendTransactionWalEntry({
             phase: "PREPARE",
@@ -633,6 +656,7 @@ export class WalrusSqlClient {
             record: walRecord,
           });
         }
+        if (batchPayload) await this.executeTransactionCommitBatch(batchPayload);
         this.applyTransactionWriteSetOnCommit();
         if (walRecord) {
           await this.appendTransactionWalEntry({
