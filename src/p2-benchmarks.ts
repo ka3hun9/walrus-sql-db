@@ -29,6 +29,23 @@ export interface TpccLikeBenchmarkReport {
   consistencyErrors: string[];
 }
 
+export interface TpccLikeSoakConfig {
+  durationMs: number;
+  runConfig?: Partial<TpccLikeBenchmarkConfig>;
+}
+
+export interface TpccLikeSoakReport {
+  generatedAt: string;
+  nodeVersion: string;
+  durationMs: number;
+  runs: number;
+  totalAttempted: number;
+  totalCommitted: number;
+  totalAborted: number;
+  totalConflicts: number;
+  consistencyErrors: string[];
+}
+
 const DEFAULT_CONFIG: TpccLikeBenchmarkConfig = {
   warehouses: 1,
   customersPerWarehouse: 200,
@@ -224,6 +241,46 @@ export async function writeTpccLikeBenchmarkReport(
   outputPath: string,
   report: TpccLikeBenchmarkReport,
 ): Promise<void> {
+  await fs.mkdir(dirname(outputPath), { recursive: true });
+  await fs.writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
+
+export async function runTpccLikeSoakBenchmark(config?: Partial<TpccLikeSoakConfig>): Promise<TpccLikeSoakReport> {
+  const durationMs = Math.max(1, Math.floor(config?.durationMs ?? 60_000));
+  const startedAt = Date.now();
+  let runs = 0;
+  let totalAttempted = 0;
+  let totalCommitted = 0;
+  let totalAborted = 0;
+  let totalConflicts = 0;
+  const consistencyErrors: string[] = [];
+
+  while ((Date.now() - startedAt) < durationMs) {
+    const report = await runTpccLikeBenchmark(config?.runConfig);
+    runs += 1;
+    totalAttempted += report.attemptedTransactions;
+    totalCommitted += report.committedTransactions;
+    totalAborted += report.abortedTransactions;
+    totalConflicts += report.conflictsDetected;
+    if (report.consistencyErrors.length > 0) {
+      consistencyErrors.push(`run#${runs}: ${report.consistencyErrors.join("; ")}`);
+    }
+  }
+
+  return {
+    generatedAt: new Date().toISOString(),
+    nodeVersion: process.version,
+    durationMs,
+    runs,
+    totalAttempted,
+    totalCommitted,
+    totalAborted,
+    totalConflicts,
+    consistencyErrors,
+  };
+}
+
+export async function writeTpccLikeSoakReport(outputPath: string, report: TpccLikeSoakReport): Promise<void> {
   await fs.mkdir(dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
