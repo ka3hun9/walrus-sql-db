@@ -43,6 +43,7 @@ export enum ClientErrorCodeEnum {
 export enum ConstraintViolationKindEnum {
   NotNull = "NOT_NULL",
   DuplicateKey = "DUPLICATE_KEY",
+  ForeignKey = "FOREIGN_KEY",
   WriteConflict = "WRITE_CONFLICT",
   PkDrop = "PK_DROP",
   UniqueDrop = "UNIQUE_DROP",

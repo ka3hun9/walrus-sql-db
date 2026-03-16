@@ -2860,7 +2860,76 @@ export class WalrusSqlClient {
       }
     }
 
+    this.enforceForeignKeyIntegrity(table, out);
     return out;
+  }
+
+  private areConstraintValuesEqual(left: SqlPrimitive, right: SqlPrimitive, context: string): boolean {
+    if ((left === null || left === undefined) && (right === null || right === undefined)) return true;
+    if (left === null || left === undefined || right === null || right === undefined) return false;
+    return this.encodeTypedKey(left, `${context}:left`) === this.encodeTypedKey(right, `${context}:right`);
+  }
+
+  private enforceForeignKeyIntegrity(table: string, row: SqlRow): void {
+    const schema = this.schemas.get(table);
+    if (!schema?.foreignKeys?.length) return;
+
+    for (const fk of schema.foreignKeys) {
+      const childValues = fk.columns.map((column) => (row[column] ?? null) as SqlPrimitive);
+      const nullCount = childValues.filter((value) => value === null || value === undefined).length;
+      if (nullCount === fk.columns.length) continue;
+      if (fk.matchRule === "SIMPLE" || fk.matchRule === "PARTIAL") {
+        if (nullCount > 0) continue;
+      } else if (fk.matchRule === "FULL" && nullCount > 0) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `MATCH FULL requires all-or-none child key values: ${table}(${fk.columns.join(",")})`,
+          {
+            clause: "FOREIGN KEY",
+            field: `${table}(${fk.columns.join(",")})`,
+          },
+        );
+      }
+
+      const parentSchema = this.schemas.get(fk.refTable);
+      if (!parentSchema) {
+        throw constraintError("FOREIGN_KEY", `referenced table not found: ${fk.refTable}`, {
+          clause: "FOREIGN KEY",
+          field: `${table}(${fk.columns.join(",")})`,
+        });
+      }
+
+      for (const refColumn of fk.refColumns) {
+        if (!parentSchema.columns.some((column) => column.name.toUpperCase() === refColumn.toUpperCase())) {
+          throw constraintError(
+            "FOREIGN_KEY",
+            `referenced column not found: ${fk.refTable}.${refColumn}`,
+            {
+              clause: "FOREIGN KEY",
+              field: `${table}(${fk.columns.join(",")})`,
+            },
+          );
+        }
+      }
+
+      const parentRows = this.requireTable(fk.refTable);
+      const hasMatch = parentRows.some((parentRow) => fk.refColumns.every((refColumn, idx) => {
+        const childValue = childValues[idx] ?? null;
+        const parentValue = (parentRow[refColumn] ?? null) as SqlPrimitive;
+        return this.areConstraintValuesEqual(parentValue, childValue, `constraint.fk:${table}.${fk.columns[idx]}`);
+      }));
+
+      if (!hasMatch) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `referential integrity failed: ${table}(${fk.columns.join(",")}) -> ${fk.refTable}(${fk.refColumns.join(",")})`,
+          {
+            clause: "FOREIGN KEY",
+            field: `${table}(${fk.columns.join(",")})`,
+          },
+        );
+      }
+    }
   }
 
   private collectUniqueGroups(schema: TableSchema): string[][] {
