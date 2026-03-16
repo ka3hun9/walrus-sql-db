@@ -15,6 +15,7 @@ import type {
   ExecuteResult,
   QueryProofResult,
   QueryResult,
+  SessionTransactionState,
   SqlPrimitive,
   SqlRow,
   SqlRuntimeTypeMetadata,
@@ -28,7 +29,7 @@ import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
-import type { ExprAst, SelectStatementAst } from "./sql-ast.js";
+import type { ExprAst, SelectStatementAst, SqlTransactionAction } from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
 import { ClientErrorCodeEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -170,6 +171,30 @@ type DeletePlan = DmlPlan & {
   };
 };
 
+type SessionTransactionEvent = "begin" | "commit" | "commit_done" | "rollback" | "error";
+
+const SESSION_TRANSACTION_TRANSITIONS: Record<
+  SessionTransactionState,
+  Partial<Record<SessionTransactionEvent, SessionTransactionState>>
+> = {
+  idle: {
+    begin: "active",
+  },
+  active: {
+    commit: "committing",
+    rollback: "idle",
+    error: "aborted",
+  },
+  committing: {
+    commit_done: "idle",
+    error: "aborted",
+  },
+  aborted: {
+    rollback: "idle",
+    error: "aborted",
+  },
+};
+
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly tables = new Map<string, SqlRow[]>();
@@ -181,6 +206,7 @@ export class WalrusSqlClient {
   private readonly queryCache = new Map<string, { rows: SqlRow[]; cachedAt: number; writeVersion: number }>();
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly logger: Logger;
+  private transactionState: SessionTransactionState = "idle";
   private writeVersion = 0;
 
   constructor(opts: WalrusSqlClientOptions) {
@@ -213,24 +239,144 @@ export class WalrusSqlClient {
     return sqlError(fallbackCode, `${context}: ${this.stringifyError(err)}`);
   }
 
+  getTransactionState(): SessionTransactionState {
+    return this.transactionState;
+  }
+
+  private tryParseTransactionAction(sql: string): SqlTransactionAction | null {
+    const first = sql.split(/\s+/, 1)[0]?.toUpperCase();
+    if (first !== "BEGIN" && first !== "COMMIT" && first !== "ROLLBACK") return null;
+    const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind !== "transaction") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `transaction control parse mismatch: ${sql}`,
+        { clause: "TRANSACTION" },
+      );
+    }
+    return ast.action;
+  }
+
+  private transitionTransactionState(event: SessionTransactionEvent, sql: string): SessionTransactionState {
+    const current = this.transactionState;
+    const next = SESSION_TRANSACTION_TRANSITIONS[current][event];
+    if (!next) {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `invalid transaction transition: state=${current}, event=${event}, sql=${sql}`,
+        { clause: "TRANSACTION", token: event.toUpperCase() },
+      );
+    }
+    this.transactionState = next;
+    return next;
+  }
+
+  private assertStatementAllowedDuringTransaction(sql: string): void {
+    if (this.transactionState === "aborted") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `transaction is aborted; run ROLLBACK before statement: ${sql}`,
+        { clause: "TRANSACTION", token: "ROLLBACK" },
+      );
+    }
+    if (this.transactionState === "committing") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `transaction is committing; wait for COMMIT to finish before statement: ${sql}`,
+        { clause: "COMMIT" },
+      );
+    }
+  }
+
+  private transitionTransactionToAbortedOnError(sql: string): void {
+    if (this.transactionState !== "active" && this.transactionState !== "committing") return;
+    this.transitionTransactionState("error", sql);
+  }
+
+  private async waitTransactionCommitTurn(): Promise<void> {
+    // Use a macrotask boundary so "committing" remains observable for concurrent calls
+    // until COMMIT finishes and transitions to idle.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  private async executeTransactionControl(sql: string, action: SqlTransactionAction): Promise<ExecuteResult> {
+    if (action === "BEGIN") {
+      this.transitionTransactionState("begin", sql);
+      return {
+        txDigest: this.fakeDigest(sql),
+        statementType: "BEGIN",
+        affectedRows: 0,
+      };
+    }
+
+    if (action === "ROLLBACK") {
+      this.transitionTransactionState("rollback", sql);
+      return {
+        txDigest: this.fakeDigest(sql),
+        statementType: "ROLLBACK",
+        affectedRows: 0,
+      };
+    }
+
+    this.transitionTransactionState("commit", sql);
+    try {
+      // Keep COMMIT transition observable as active -> committing -> idle.
+      await this.waitTransactionCommitTurn();
+      this.transitionTransactionState("commit_done", sql);
+      return {
+        txDigest: this.fakeDigest(sql),
+        statementType: "COMMIT",
+        affectedRows: 0,
+      };
+    } catch (err) {
+      this.transitionTransactionToAbortedOnError(sql);
+      throw err;
+    }
+  }
+
   async execute(sql: string): Promise<ExecuteResult> {
     const normalized = normalizeSql(sql);
-    this.logger.debug("execute start", { sql: normalized, mode: this.opts.mode ?? "simulator" });
+    this.logger.debug("execute start", {
+      sql: normalized,
+      mode: this.opts.mode ?? "simulator",
+      transactionState: this.transactionState,
+    });
     try {
-      if ((this.opts.mode ?? "simulator") === "onchain") {
-        const result = await this.executeOnchain(sql);
+      const txAction = this.tryParseTransactionAction(normalized);
+      if (txAction) {
+        const result = await this.executeTransactionControl(normalized, txAction);
         this.logger.debug("execute success", {
           sql: normalized,
           statementType: result.statementType,
           affectedRows: result.affectedRows ?? 0,
+          transactionState: this.transactionState,
         });
         return result;
       }
-      const result = await this.executeSimulator(sql);
+
+      this.assertStatementAllowedDuringTransaction(normalized);
+
+      let result: ExecuteResult;
+      if ((this.opts.mode ?? "simulator") === "onchain") {
+        try {
+          result = await this.executeOnchain(sql);
+        } catch (err) {
+          this.transitionTransactionToAbortedOnError(normalized);
+          throw err;
+        }
+      } else {
+        try {
+          result = await this.executeSimulator(sql);
+        } catch (err) {
+          this.transitionTransactionToAbortedOnError(normalized);
+          throw err;
+        }
+      }
       this.logger.debug("execute success", {
         sql: normalized,
         statementType: result.statementType,
         affectedRows: result.affectedRows ?? 0,
+        transactionState: this.transactionState,
       });
       return result;
     } catch (err) {
@@ -768,8 +914,13 @@ export class WalrusSqlClient {
 
   async query(sql: string): Promise<QueryResult> {
     const normalized = normalizeSql(sql);
-    this.logger.debug("query start", { sql: normalized, mode: this.opts.mode ?? "simulator" });
+    this.logger.debug("query start", {
+      sql: normalized,
+      mode: this.opts.mode ?? "simulator",
+      transactionState: this.transactionState,
+    });
     try {
+      this.assertStatementAllowedDuringTransaction(normalized);
       const normalizedSql = sql.trim().replace(/\s+/g, " ");
       const cachedRows = this.getCachedQuery(normalizedSql);
       if (cachedRows) return { rows: cachedRows };
@@ -824,8 +975,7 @@ export class WalrusSqlClient {
       }
     }
 
-    const normalized = sql.trim().replace(/\s+/g, " ");
-    const parsed = this.parseSelect(normalized, sql);
+    const parsed = this.parseSelect(normalizedSql, sql);
 
     if (parsed.explain) {
       return this.buildQueryResult(normalizedSql, [
@@ -924,6 +1074,7 @@ export class WalrusSqlClient {
       this.logger.debug("query success", successMeta);
       return result;
     } catch (err) {
+      this.transitionTransactionToAbortedOnError(normalized);
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
       this.logger.error("query failed", { sql: normalized, error: wrapped.message });
       throw wrapped;
