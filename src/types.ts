@@ -719,6 +719,60 @@ export function convertTypedValue(
   return createTypedValue(converted, "computed", targetRuntimeType.name, targetRuntimeType.metadata, options.sourceContext);
 }
 
+export interface TypedValueSerializationMetadataV1 {
+  source?: SqlTypedValueSource;
+  sourceContext?: string;
+  runtimeTypeMetadata?: Partial<SqlRuntimeTypeMetadata>;
+}
+
+export interface SerializedTypedValueV1 {
+  version: 1;
+  type: SqlRuntimeTypeName;
+  value: SqlPrimitive;
+  metadata?: TypedValueSerializationMetadataV1;
+}
+
+export type SerializedTypedValue = SerializedTypedValueV1;
+
+function isSqlPrimitiveValue(value: unknown): value is SqlPrimitive {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
+function isTypedValueSource(value: unknown): value is SqlTypedValueSource {
+  return value === "js" || value === "literal" || value === "storage" || value === "computed";
+}
+
+export function serializeTypedValue(value: SqlTypedValue): SerializedTypedValueV1 {
+  return {
+    version: 1,
+    type: value.type,
+    value: value.value,
+    metadata: {
+      source: value.metadata.source,
+      sourceContext: value.metadata.sourceContext,
+      runtimeTypeMetadata: { ...value.runtimeType.metadata },
+    },
+  };
+}
+
+export function deserializeTypedValue(payload: SerializedTypedValue): SqlTypedValue {
+  if (payload.version !== 1) {
+    throw new TypeError(`unsupported TypedValue serialization version: ${String((payload as { version?: number }).version)}`);
+  }
+
+  if (!isSqlPrimitiveValue(payload.value)) {
+    throw new TypeError("serialized TypedValue value must be SQL primitive");
+  }
+
+  const normalizedType = normalizeRuntimeTypeName(payload.type);
+  if (!normalizedType) throw new TypeError(`invalid serialized TypedValue type: ${String(payload.type)}`);
+
+  const source = isTypedValueSource(payload.metadata?.source) ? payload.metadata!.source : "storage";
+  const sourceContext = payload.metadata?.sourceContext;
+  const runtimeTypeMetadata = payload.metadata?.runtimeTypeMetadata ?? {};
+  return createTypedValue(payload.value, source, normalizedType, runtimeTypeMetadata, sourceContext);
+}
+
 export function fromTypedValue(v: SqlTypedValue): SqlPrimitive {
   return v.value;
 }

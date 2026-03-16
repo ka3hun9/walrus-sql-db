@@ -148,7 +148,7 @@
 - [x] K-TVAL-015 错误信息增强：违反类型/约束时报错携带 TypedValue 上下文快照
 
 ### K5. 存储与序列化
-- [ ] K-TVAL-016 TypedValue 序列化协议（含版本）定义并落地
+- [x] K-TVAL-016 TypedValue 序列化协议（含版本）定义并落地
 - [ ] K-TVAL-017 反序列化与旧格式兼容读取（向后兼容迁移）
 - [ ] K-TVAL-018 replay/cache/index 的键和值统一 TypedValue 编解码
 
