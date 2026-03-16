@@ -1,6 +1,9 @@
 import type { SqlTypedValue } from "./types.js";
 
-export type SqlAstStatement = SelectStatementAst | UnionStatementAst | UnknownStatementAst;
+export type SqlTransactionAction = "BEGIN" | "COMMIT" | "ROLLBACK";
+export type SqlNestedTransactionPolicy = "error_on_nested_begin";
+
+export type SqlAstStatement = SelectStatementAst | UnionStatementAst | TransactionStatementAst | UnknownStatementAst;
 
 export type UnknownStatementAst = {
   kind: "unknown";
@@ -12,6 +15,13 @@ export type UnionStatementAst = {
   all: boolean;
   leftSql: string;
   rightSql: string;
+  rawSql: string;
+};
+
+export type TransactionStatementAst = {
+  kind: "transaction";
+  action: SqlTransactionAction;
+  nestedTransactionPolicy: SqlNestedTransactionPolicy;
   rawSql: string;
 };
 

@@ -2,7 +2,7 @@ import type { SqlErrorCode } from "./sql-errors.js";
 
 export type SqlDialectProfile = "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";
 
-export type StatementKind = "select" | "union" | "other";
+export type StatementKind = "select" | "union" | "transaction" | "other";
 
 export type ClauseStatus = "present" | "absent";
 
@@ -76,7 +76,9 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
     ? "union"
     : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
       ? "select"
-      : "other";
+      : startsWithWord(up, "BEGIN") || startsWithWord(up, "COMMIT") || startsWithWord(up, "ROLLBACK")
+        ? "transaction"
+        : "other";
 
   const clauses = {
     cte: startsWithWord(up, "WITH") ? "present" : "absent",

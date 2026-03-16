@@ -7,6 +7,7 @@ import type {
   SelectItemAst,
   SelectStatementAst,
   SqlAstStatement,
+  TransactionStatementAst,
   TableRefAst,
 } from "./sql-ast.js";
 import { fromLiteral, type SqlPrimitive } from "./types.js";
@@ -599,6 +600,59 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
   return null;
 }
 
+const NESTED_TRANSACTION_POLICY = "error_on_nested_begin" as const;
+
+function parseTransactionStatement(base: string, rawSql: string): TransactionStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!normalized) return null;
+
+  if (/^BEGIN(?:\s+(WORK|TRANSACTION))?$/i.test(normalized)) {
+    return {
+      kind: "transaction",
+      action: "BEGIN",
+      nestedTransactionPolicy: NESTED_TRANSACTION_POLICY,
+      rawSql,
+    };
+  }
+
+  if (/^COMMIT(?:\s+WORK)?$/i.test(normalized)) {
+    return {
+      kind: "transaction",
+      action: "COMMIT",
+      nestedTransactionPolicy: NESTED_TRANSACTION_POLICY,
+      rawSql,
+    };
+  }
+
+  if (/^ROLLBACK(?:\s+WORK)?$/i.test(normalized)) {
+    return {
+      kind: "transaction",
+      action: "ROLLBACK",
+      nestedTransactionPolicy: NESTED_TRANSACTION_POLICY,
+      rawSql,
+    };
+  }
+
+  const firstToken = normalized.split(/\s+/)[0]?.toUpperCase();
+  if (firstToken !== "BEGIN" && firstToken !== "COMMIT" && firstToken !== "ROLLBACK") {
+    return null;
+  }
+
+  if (firstToken === "BEGIN") {
+    throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+      message:
+        "BEGIN only supports optional WORK or TRANSACTION in parser baseline; nested transactions must error (policy=error_on_nested_begin)",
+      token: "BEGIN",
+      hint: "nestedPolicy=error_on_nested_begin",
+    });
+  }
+
+  throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
+    message: `${firstToken} only supports optional WORK in parser baseline`,
+    token: firstToken,
+  });
+}
+
 export type ParseSqlToAstOptions = {
   dialect?: SqlDialectProfile;
 };
@@ -695,10 +749,13 @@ export function parseSqlToAst(
     };
   }
 
+  const transaction = parseTransactionStatement(base, sql);
+  if (transaction) return transaction;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-      message: "Only SELECT/UNION statements are currently accepted by parser baseline",
+      message: "Only SELECT/UNION/BEGIN/COMMIT/ROLLBACK statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }
