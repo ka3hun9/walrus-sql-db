@@ -136,7 +136,7 @@
 - [x] K-TVAL-007 CAST 与隐式转换在解析/绑定阶段统一走 TypedValue 转换器
 
 ### K3. 执行层全链路替换
-- [ ] K-TVAL-008 表达式求值器改造：所有中间值/结果值均为 TypedValue
+- [x] K-TVAL-008 表达式求值器改造：所有中间值/结果值均为 TypedValue
 - [ ] K-TVAL-009 谓词执行改造：比较/LIKE/IN/BETWEEN/EXISTS 全部接 TypedValue
 - [ ] K-TVAL-010 聚合执行改造：COUNT/SUM/AVG/MIN/MAX 内部态和值均 TypedValue 化
 - [ ] K-TVAL-011 JOIN/GROUP/ORDER/DISTINCT 键值规范化全部改为 TypedValue key codec

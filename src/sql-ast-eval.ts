@@ -1,13 +1,16 @@
 import type { ExprAst } from "./sql-ast.js";
-import { convertTypedValue, fromJs, normalizeRuntimeTypeName, type SqlPrimitive } from "./types.js";
-
-function toFiniteNumber(v: SqlPrimitive | undefined): number | null {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "boolean") return v ? 1 : 0;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
+import {
+  convertTypedValue,
+  fromJs,
+  fromStorage,
+  normalizeRuntimeTypeName,
+  SqlRuntimeType,
+  typedValueComparator,
+  typedValueOperators,
+  type SqlPrimitive,
+  type SqlThreeValuedLogic,
+  type SqlTypedValue,
+} from "./types.js";
 
 function maybeWrap(child?: ExprAst): string {
   const rendered = exprAstToSql(child) ?? "";
@@ -48,184 +51,218 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
   }
 }
 
-export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimitive | undefined): SqlPrimitive | undefined {
+function typedNull(sourceContext: string): SqlTypedValue {
+  return fromJs(null, undefined, {}, sourceContext);
+}
+
+function truthToTyped(truth: SqlThreeValuedLogic, sourceContext: string): SqlTypedValue {
+  return fromJs(truth, SqlRuntimeType.BOOLEAN, {}, sourceContext);
+}
+
+function tvNot(value: SqlThreeValuedLogic): SqlThreeValuedLogic {
+  if (value === null) return null;
+  return !value;
+}
+
+function tvAnd(a: SqlThreeValuedLogic, b: SqlThreeValuedLogic): SqlThreeValuedLogic {
+  if (a === false || b === false) return false;
+  if (a === true && b === true) return true;
+  return null;
+}
+
+function toBooleanTyped(value: SqlTypedValue, sourceContext: string): SqlTypedValue | null {
+  try {
+    return convertTypedValue(value, SqlRuntimeType.BOOLEAN, {
+      mode: "explicit",
+      sourceContext,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function toDoubleTyped(value: SqlTypedValue, sourceContext: string): SqlTypedValue | null {
+  try {
+    return convertTypedValue(value, SqlRuntimeType.DOUBLE, {
+      mode: "explicit",
+      sourceContext,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function evalExprAstTyped(
+  expr: ExprAst,
+  resolve: (name: string) => SqlTypedValue | undefined,
+): SqlTypedValue {
   switch (expr.kind) {
     case "identifier":
-      return resolve(expr.name);
+      return resolve(expr.name) ?? typedNull(`expr.identifier:${expr.name}`);
     case "literal":
-      return expr.typedValue.value;
+      return expr.typedValue;
     case "unary": {
-      const v = evalExprAst(expr.expr, resolve);
+      const value = evalExprAstTyped(expr.expr, resolve);
       if (expr.op.toUpperCase() === "NOT") {
-        if (v == null) return null;
-        return !Boolean(v);
+        const boolValue = toBooleanTyped(value, "expr.unary.not");
+        if (!boolValue) return typedNull("expr.unary.not");
+        return typedValueOperators.not(boolValue);
       }
       if (expr.op === "-") {
-        if (v == null) return null;
-        const n = Number(v);
-        return Number.isFinite(n) ? -n : null;
+        const num = toDoubleTyped(value, "expr.unary.minus");
+        if (!num) return typedNull("expr.unary.minus");
+        return typedValueOperators.sub(fromJs(0, SqlRuntimeType.INT, {}, "expr.unary.zero"), num);
       }
       if (expr.op === "+") {
-        if (v == null) return null;
-        const n = Number(v);
-        return Number.isFinite(n) ? n : null;
+        const num = toDoubleTyped(value, "expr.unary.plus");
+        return num ?? typedNull("expr.unary.plus");
       }
-      return null;
+      return typedNull(`expr.unary.${expr.op}`);
     }
     case "binary": {
-      const l = evalExprAst(expr.left, resolve);
+      const left = evalExprAstTyped(expr.left, resolve);
       const op = expr.op.toUpperCase();
 
-      if (op === "AND") {
-        const r = evalExprAst(expr.right, resolve);
-        if (l === false || r === false) return false;
-        if (l == null || r == null) return null;
-        return Boolean(l) && Boolean(r);
-      }
-      if (op === "OR") {
-        const r = evalExprAst(expr.right, resolve);
-        if (l === true || r === true) return true;
-        if (l == null || r == null) return null;
-        return Boolean(l) || Boolean(r);
+      if (op === "AND" || op === "OR") {
+        const right = evalExprAstTyped(expr.right, resolve);
+        const l = toBooleanTyped(left, `expr.binary.${op}.left`);
+        const r = toBooleanTyped(right, `expr.binary.${op}.right`);
+        if (!l || !r) return typedNull(`expr.binary.${op}`);
+        return op === "AND" ? typedValueOperators.and(l, r) : typedValueOperators.or(l, r);
       }
 
       if (op === "BETWEEN" || op === "NOT BETWEEN") {
-        if (l == null) return null;
         if (expr.right.kind === "function" && expr.right.name === "RANGE") {
-          const a = evalExprAst(expr.right.args[0]!, resolve);
-          const b = evalExprAst(expr.right.args[1]!, resolve);
-          if (a == null || b == null) return null;
-          const ok = Number(l) >= Number(a) && Number(l) <= Number(b);
-          return op === "BETWEEN" ? ok : !ok;
+          const lower = evalExprAstTyped(expr.right.args[0]!, resolve);
+          const upper = evalExprAstTyped(expr.right.args[1]!, resolve);
+          const ge = typedValueComparator.gte(left, lower);
+          const le = typedValueComparator.lte(left, upper);
+          const between = tvAnd(ge, le);
+          const result = op === "BETWEEN" ? between : tvNot(between);
+          return truthToTyped(result, `expr.binary.${op}`);
         }
       }
 
       if (op === "IN" || op === "NOT IN") {
-        if (l == null) return null;
         if (expr.right.kind === "function" && expr.right.name === "LIST") {
-          const vals = expr.right.args.map((a) => evalExprAst(a, resolve));
-          const has = vals.some((v) => v != null && String(v) === String(l));
-          if (has) return op === "IN" ? true : false;
-          const hasNull = vals.some((v) => v == null);
-          if (hasNull) return null;
-          return op === "IN" ? false : true;
+          let hasNull = false;
+          for (const arg of expr.right.args) {
+            const candidate = evalExprAstTyped(arg, resolve);
+            const eq = typedValueComparator.eq(left, candidate);
+            if (eq === true) return truthToTyped(op === "IN", `expr.binary.${op}`);
+            if (eq === null) hasNull = true;
+          }
+          if (hasNull) return typedNull(`expr.binary.${op}`);
+          return truthToTyped(op !== "IN", `expr.binary.${op}`);
         }
       }
 
-      const r = evalExprAst(expr.right, resolve);
-      if (l == null || r == null) {
-        if (op === "IS") return l == null && r == null;
-        if (op === "IS NOT") return !(l == null && r == null);
-        return null;
+      const right = evalExprAstTyped(expr.right, resolve);
+      if (left.value == null || right.value == null) {
+        if (op === "IS") return truthToTyped(left.value == null && right.value == null, "expr.binary.IS");
+        if (op === "IS NOT") return truthToTyped(!(left.value == null && right.value == null), "expr.binary.IS_NOT");
+        return typedNull(`expr.binary.${op}`);
       }
 
-      if (op === "+") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        // P1 type promotion baseline: INTEGER + FLOAT => FLOAT (JS number semantics)
-        return ln + rn;
+      try {
+        if (op === "+") return typedValueOperators.add(left, right);
+        if (op === "-") return typedValueOperators.sub(left, right);
+        if (op === "*") return typedValueOperators.mul(left, right);
+        if (op === "/") return typedValueOperators.div(left, right);
+      } catch {
+        return typedNull(`expr.binary.${op}`);
       }
-      if (op === "-") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln - rn;
-      }
-      if (op === "*") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln * rn;
-      }
-      if (op === "/") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null || rn === 0) return null;
-        return ln / rn;
-      }
+
       if (op === "%") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null || rn === 0) return null;
-        return ln % rn;
+        const l = toDoubleTyped(left, "expr.binary.mod.left");
+        const r = toDoubleTyped(right, "expr.binary.mod.right");
+        if (!l || !r || l.value == null || r.value == null || r.value === 0) return typedNull("expr.binary.mod");
+        return fromJs((l.value as number) % (r.value as number), SqlRuntimeType.DOUBLE, {}, "expr.binary.mod");
       }
 
-      if (op === "=") return String(l) === String(r);
-      if (op === "!=" || op === "<>") return String(l) !== String(r);
-      if (op === ">") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln > rn;
+      if (op === "=") return truthToTyped(typedValueComparator.eq(left, right), "expr.binary.eq");
+      if (op === "!=" || op === "<>") {
+        const eq = typedValueComparator.eq(left, right);
+        return truthToTyped(eq === null ? null : !eq, "expr.binary.neq");
       }
-      if (op === "<") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln < rn;
-      }
-      if (op === ">=") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln >= rn;
-      }
-      if (op === "<=") {
-        const ln = toFiniteNumber(l);
-        const rn = toFiniteNumber(r);
-        if (ln === null || rn === null) return null;
-        return ln <= rn;
-      }
-      if (op === "IS") return String(l) === String(r);
-      if (op === "IS NOT") return String(l) !== String(r);
+      if (op === ">") return truthToTyped(typedValueComparator.gt(left, right), "expr.binary.gt");
+      if (op === "<") return truthToTyped(typedValueComparator.lt(left, right), "expr.binary.lt");
+      if (op === ">=") return truthToTyped(typedValueComparator.gte(left, right), "expr.binary.gte");
+      if (op === "<=") return truthToTyped(typedValueComparator.lte(left, right), "expr.binary.lte");
+      if (op === "IS") return truthToTyped(left.value === right.value, "expr.binary.is");
+      if (op === "IS NOT") return truthToTyped(left.value !== right.value, "expr.binary.is_not");
 
       if (op === "LIKE" || op === "NOT LIKE") {
-        const pat = String(r).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
-        const m = new RegExp(`^${pat}$`, "i").test(String(l));
-        return op === "LIKE" ? m : !m;
+        try {
+          const leftText = convertTypedValue(left, SqlRuntimeType.TEXT, {
+            mode: "explicit",
+            sourceContext: "expr.binary.like.left",
+          });
+          const rightText = convertTypedValue(right, SqlRuntimeType.TEXT, {
+            mode: "explicit",
+            sourceContext: "expr.binary.like.right",
+          });
+          if (leftText.value == null || rightText.value == null) return typedNull(`expr.binary.${op}`);
+          const pat = String(rightText.value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
+          const matched = new RegExp(`^${pat}$`, "i").test(String(leftText.value));
+          return truthToTyped(op === "LIKE" ? matched : !matched, `expr.binary.${op}`);
+        } catch {
+          return typedNull(`expr.binary.${op}`);
+        }
       }
 
-      return null;
+      return typedNull(`expr.binary.${op}`);
     }
     case "function": {
       const fn = expr.name.toUpperCase();
-      const args = expr.args.map((a) => evalExprAst(a, resolve));
+      const args = expr.args.map((a) => evalExprAstTyped(a, resolve));
 
       if (fn === "COALESCE") {
-        for (const v of args) {
-          if (v !== null && v !== undefined) return v;
+        for (const value of args) {
+          if (value.value !== null && value.value !== undefined) return value;
         }
-        return null;
+        return typedNull("expr.function.coalesce");
       }
 
       if (fn === "NULLIF") {
         const a = args[0];
         const b = args[1];
-        if (a == null || b == null) return a ?? null;
-        return String(a) === String(b) ? null : a;
+        if (!a || !b) return typedNull("expr.function.nullif");
+        if (a.value == null || b.value == null) return a.value == null ? typedNull("expr.function.nullif") : a;
+        const eq = typedValueComparator.eq(a, b);
+        return eq === true ? typedNull("expr.function.nullif") : a;
       }
 
       if (fn === "CAST") {
-        const a = args[0];
-        const normalizedTarget = normalizeRuntimeTypeName(String(args[1] ?? ""));
-        if (a == null) return null;
-        if (!normalizedTarget || normalizedTarget === "NULL") return null;
+        const value = args[0];
+        const targetRaw = args[1]?.value;
+        if (!value || value.value == null) return typedNull("expr.function.cast");
+        const normalizedTarget = normalizeRuntimeTypeName(String(targetRaw ?? ""));
+        if (!normalizedTarget || normalizedTarget === "NULL") return typedNull("expr.function.cast");
         try {
-          return convertTypedValue(fromJs(a, undefined, {}, "expr.cast"), normalizedTarget, {
+          return convertTypedValue(value, normalizedTarget, {
             mode: "explicit",
-            sourceContext: "expr.cast",
-          }).value;
+            sourceContext: "expr.function.cast",
+          });
         } catch {
-          return null;
+          return typedNull("expr.function.cast");
         }
       }
 
-      return null;
+      return typedNull(`expr.function.${fn}`);
     }
     case "raw":
-      return null;
+      return typedNull("expr.raw");
     default:
-      return null;
+      return typedNull("expr.default");
   }
+}
+
+export function evalExprAst(expr: ExprAst, resolve: (name: string) => SqlPrimitive | undefined): SqlPrimitive | undefined {
+  const typed = evalExprAstTyped(expr, (name) => {
+    const value = resolve(name);
+    if (value === undefined) return undefined;
+    return fromStorage(value ?? null, undefined, {}, `expr.resolve:${name}`);
+  });
+  return typed.value;
 }
