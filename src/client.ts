@@ -233,6 +233,11 @@ type TransactionWalEntry = {
   record?: TransactionLogRecord;
 };
 
+type ReadCommittedView = {
+  isolationLevel: "read_committed";
+  getTableRows: (name: string) => SqlRow[];
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -257,6 +262,7 @@ const SESSION_TRANSACTION_TRANSITIONS: Record<
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
+  private readonly isolationLevel: "read_committed";
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
@@ -272,6 +278,15 @@ export class WalrusSqlClient {
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
+    const isolation = String(opts.isolationLevel ?? "read_committed").toLowerCase();
+    if (isolation !== "read_committed") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `unsupported isolation level: ${String(opts.isolationLevel)}`,
+        { clause: "TRANSACTION", token: String(opts.isolationLevel) },
+      );
+    }
+    this.isolationLevel = "read_committed";
     this.logger = createLogger({
       level: opts.logging?.level ?? "error",
       sink: opts.logging?.sink,
@@ -302,6 +317,10 @@ export class WalrusSqlClient {
 
   getTransactionState(): SessionTransactionState {
     return this.transactionState;
+  }
+
+  getIsolationLevel(): "read_committed" {
+    return this.isolationLevel;
   }
 
   private tryParseTransactionAction(sql: string): SqlTransactionAction | null {
@@ -1719,12 +1738,21 @@ export class WalrusSqlClient {
     return out;
   }
 
+  private createReadCommittedView(): ReadCommittedView {
+    return {
+      isolationLevel: this.isolationLevel,
+      getTableRows: (name: string) => {
+        const staged = this.getStagedTableWriteSet(name);
+        if (staged) return staged.rows;
+        const table = this.tables.get(name);
+        if (!table) throw sqlError("ERR_TABLE_NOT_FOUND", name);
+        return table;
+      },
+    };
+  }
+
   private requireTable(name: string): SqlRow[] {
-    const staged = this.getStagedTableWriteSet(name);
-    if (staged) return staged.rows;
-    const table = this.tables.get(name);
-    if (!table) throw sqlError("ERR_TABLE_NOT_FOUND", name);
-    return table;
+    return this.createReadCommittedView().getTableRows(name);
   }
 
   private extractTableName(sql: string, pattern: RegExp): string {

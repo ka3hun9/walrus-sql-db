@@ -25,7 +25,7 @@
 
 ## P2-C. 隔离级别与并发控制（至少 READ COMMITTED）
 
-- [ ] P2-ISO-001 READ COMMITTED 读视图定义并实现
+- [x] P2-ISO-001 READ COMMITTED 读视图定义并实现
 - [ ] P2-ISO-002 行级锁管理器（S/X 锁）或 OCC 版本冲突检测器
 - [ ] P2-ISO-003 死锁检测/超时机制（wait-for graph 或 timeout）
 - [ ] P2-ISO-004 脏读禁止验证（跨会话并发回归）

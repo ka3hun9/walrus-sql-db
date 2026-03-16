@@ -1270,6 +1270,7 @@ export interface WalrusSqlClientOptions {
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
   signerAddress?: string;
   mode?: "simulator" | "onchain";
+  isolationLevel?: "read_committed";
   moduleName?: string;
   dialect?: "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";
   onchainExecutor?: import("./onchain.js").OnchainExecutor;
