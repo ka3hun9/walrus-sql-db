@@ -240,7 +240,18 @@ export function evalExprAstTyped(
         const normalizedTarget = normalizeRuntimeTypeName(String(targetRaw ?? ""));
         if (!normalizedTarget || normalizedTarget === "NULL") return typedNull("expr.function.cast");
         try {
-          return convertTypedValue(value, normalizedTarget, {
+          let castInput = value;
+          if (
+            typeof castInput.value === "number"
+            && Number.isFinite(castInput.value)
+            && (normalizedTarget === "SMALLINT"
+              || normalizedTarget === "INT"
+              || normalizedTarget === "BIGINT"
+              || normalizedTarget === "U64")
+          ) {
+            castInput = fromJs(Math.trunc(castInput.value), undefined, {}, "expr.function.cast.truncate");
+          }
+          return convertTypedValue(castInput, normalizedTarget, {
             mode: "explicit",
             sourceContext: "expr.function.cast",
           });

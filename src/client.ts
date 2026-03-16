@@ -641,17 +641,23 @@ export class WalrusSqlClient {
         if (!matched) continue;
 
         // Validate/coerce and enforce constraints before mutating row or indexes.
-        const boundSetValue = fromLiteral(
-          this.castValue(plan.setValue),
-          undefined,
-          {},
-          `dml.update.set:${plan.table}.${targetSetField}`,
-        );
+        const rawSetValue = this.castValue(plan.setValue);
+        let boundSetValue: SqlTypedValue | undefined;
+        try {
+          boundSetValue = fromLiteral(
+            rawSetValue,
+            undefined,
+            {},
+            `dml.update.set:${plan.table}.${targetSetField}`,
+          );
+        } catch {
+          // Invalid literal shape will be re-validated against column type in applySchemaOnWrite.
+        }
         const next = this.applySchemaOnWrite(
           plan.table,
-          { ...row, [targetSetField]: boundSetValue.value },
+          { ...row, [targetSetField]: (boundSetValue?.value ?? rawSetValue) as SqlPrimitive },
           row,
-          { [targetSetField]: boundSetValue },
+          boundSetValue ? { [targetSetField]: boundSetValue } : {},
         );
         // Commit in deterministic order: drop old unique keys, mutate row, add new unique keys.
         this.removeRowFromUniqueIndexes(plan.table, row);
@@ -1385,6 +1391,20 @@ export class WalrusSqlClient {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const invalidLiteral = msg.match(/^invalid (FLOAT|DOUBLE) literal:\s*(.+)$/i);
+      if (invalidLiteral) {
+        const coercedType = invalidLiteral[1]!.toUpperCase();
+        const raw = invalidLiteral[2]!.trim();
+        throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(`expected numeric for ${coercedType}, got ${raw}`));
+      }
+      const finiteOnly = msg.match(/^(FLOAT|DOUBLE) value must be a finite number$/i);
+      if (finiteOnly) {
+        const coercedType = finiteOnly[1]!.toUpperCase();
+        throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(`expected numeric for ${coercedType}, got ${String(value)}`));
+      }
+      if (targetType === "BLOB" && /blob/i.test(msg)) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(`invalid BLOB: ${String(value)}`));
+      }
       throw sqlError("ERR_TYPE_CONSTRAINT", withSnapshot(msg));
     }
 
@@ -1589,15 +1609,25 @@ export class WalrusSqlClient {
       const hasCandidate = Object.prototype.hasOwnProperty.call(candidate, c.name);
       const raw = hasCandidate ? candidate[c.name] : (c.defaultValue ?? null);
 
-      const bound =
-        boundInputs[c.name]
-        ?? (hasCandidate
-          ? this.bindTypedValue(
-              (raw ?? null) as SqlPrimitive,
-              previous && Object.prototype.hasOwnProperty.call(previous, c.name) ? "storage" : "js",
-              `dml.bind:${table}.${c.name}`,
-            )
-          : this.bindTypedValue((raw ?? null) as SqlPrimitive, "literal", `dml.default:${table}.${c.name}`));
+      let bound: SqlTypedValue;
+      try {
+        bound =
+          boundInputs[c.name]
+          ?? (hasCandidate
+            ? this.bindTypedValue(
+                (raw ?? null) as SqlPrimitive,
+                previous && Object.prototype.hasOwnProperty.call(previous, c.name) ? "storage" : "js",
+                `dml.bind:${table}.${c.name}`,
+              )
+            : this.bindTypedValue((raw ?? null) as SqlPrimitive, "literal", `dml.default:${table}.${c.name}`));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if ((c.type.name === "FLOAT" || c.type.name === "DOUBLE") && /finite number/i.test(msg)) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", `expected numeric for ${c.type.name}, got ${String(raw)}`);
+        }
+        if (err instanceof Error && /^ERR_[A-Z_]+:/.test(err.message)) throw err;
+        throw sqlError("ERR_TYPE_CONSTRAINT", msg);
+      }
 
       const coerced = this.coerceByType(c.type, bound, `dml.coerce:${table}.${c.name}`);
       const coercedTyped = fromStorage((coerced ?? null) as SqlPrimitive, undefined, {}, `constraint.value:${table}.${c.name}`);
@@ -1782,9 +1812,14 @@ export class WalrusSqlClient {
     const row: SqlRow = {};
     const bindings: BoundColumnValues = {};
     cols.forEach((c, i) => {
-      const bound = fromLiteral(vals[i] ?? null, undefined, {}, `dml.insert.value:${table}.${c}`);
-      row[c] = bound.value;
-      bindings[c] = bound;
+      const rawValue = (vals[i] ?? null) as SqlPrimitive;
+      row[c] = rawValue;
+      try {
+        const bound = fromLiteral(rawValue, undefined, {}, `dml.insert.value:${table}.${c}`);
+        bindings[c] = bound;
+      } catch {
+        // Invalid literal shape will be re-validated against column type in applySchemaOnWrite.
+      }
     });
     return { row, bindings };
   }
@@ -3058,8 +3093,19 @@ export class WalrusSqlClient {
       }
       if (v === null || v === undefined) return null;
       try {
+        let castSource: SqlPrimitive = v;
+        if (
+          typeof castSource === "number"
+          && Number.isFinite(castSource)
+          && (normalizedTarget === "SMALLINT"
+            || normalizedTarget === "INT"
+            || normalizedTarget === "BIGINT"
+            || normalizedTarget === "U64")
+        ) {
+          castSource = Math.trunc(castSource);
+        }
         const casted = convertTypedValue(
-          fromJs(v, undefined, {}, `expr.cast.source:${castValueExpr}`),
+          fromJs(castSource, undefined, {}, `expr.cast.source:${castValueExpr}`),
           normalizedTarget,
           {
             mode: "explicit",

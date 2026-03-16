@@ -515,7 +515,18 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
       throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
     }
     if (v == null) return null;
-    return convertTypedValue(fromJs(v, undefined, {}, `replay.cast.source:${castValueExpr}`), normalizedTarget, {
+    let castSource: SqlPrimitive = v;
+    if (
+      typeof castSource === "number"
+      && Number.isFinite(castSource)
+      && (normalizedTarget === "SMALLINT"
+        || normalizedTarget === "INT"
+        || normalizedTarget === "BIGINT"
+        || normalizedTarget === "U64")
+    ) {
+      castSource = Math.trunc(castSource);
+    }
+    return convertTypedValue(fromJs(castSource, undefined, {}, `replay.cast.source:${castValueExpr}`), normalizedTarget, {
       mode: "explicit",
       sourceContext: `replay.cast.target:${normalizedTarget}`,
     }).value;

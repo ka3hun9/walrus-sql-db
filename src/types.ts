@@ -340,6 +340,7 @@ export function inferRuntimeTypeModel(value: SqlPrimitive): SqlRuntimeTypeModel 
   if (typeof value === "boolean") return createRuntimeTypeModel(SqlRuntimeType.BOOLEAN);
   if (typeof value === "number") {
     if (Number.isInteger(value)) {
+      if (!Number.isSafeInteger(value)) return createRuntimeTypeModel(SqlRuntimeType.DOUBLE);
       const intType = value >= -2147483648 && value <= 2147483647 ? SqlRuntimeType.INT : SqlRuntimeType.BIGINT;
       return createRuntimeTypeModel(intType);
     }
