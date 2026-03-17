@@ -1,0 +1,41 @@
+﻿{
+    "generatedAt":  "2026-03-17T11:14:43.3784339+08:00",
+    "network":  "testnet",
+    "acceptance":  {
+                       "tests":  [
+                                     "test/unit-c-exec-010-transaction-atomic-commit.ts",
+                                     "test/unit-c-exec-011-transaction-rollback-consistency.ts",
+                                     "test/unit-c-exec-013-read-committed-view.ts",
+                                     "test/unit-p2-exe-002-commit-revalidation.ts",
+                                     "test/unit-g-stor-013-crash-recovery-wal-version-chain.ts",
+                                     "test/unit-g-stor-015-pending-confirmed-read-strategy.ts"
+                                 ],
+                       "passed":  true,
+                       "log":  "acceptance-suite.log"
+                   },
+    "tpccConflict":  {
+                         "attempted":  1800,
+                         "committed":  1200,
+                         "aborted":  600,
+                         "conflicts":  600,
+                         "throughputTps":  42.936,
+                         "consistencyErrors":  [
+
+                                               ]
+                     },
+    "tpccSoak":  {
+                     "durationMs":  30000,
+                     "runs":  9,
+                     "attempted":  2250,
+                     "committed":  1800,
+                     "aborted":  450,
+                     "conflicts":  450,
+                     "consistencyErrors":  [
+
+                                           ]
+                 },
+    "passCriteria":  {
+                         "tpccConflictConsistencyZero":  true,
+                         "tpccSoakConsistencyZero":  true
+                     }
+}

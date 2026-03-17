@@ -1,0 +1,12 @@
+﻿[RUN] test/unit-c-exec-010-transaction-atomic-commit.ts
+ok: C-EXEC-010 transaction commit is atomic and rolls back on induced mid-commit failure
+[RUN] test/unit-c-exec-011-transaction-rollback-consistency.ts
+ok: C-EXEC-011 explicit and implicit rollback clear staged state consistently
+[RUN] test/unit-c-exec-013-read-committed-view.ts
+ok: C-EXEC-013 read committed view blocks dirty reads
+[RUN] test/unit-p2-exe-002-commit-revalidation.ts
+ok: P2-EXE-002 commit-point constraint revalidation
+[RUN] test/unit-g-stor-013-crash-recovery-wal-version-chain.ts
+ok: G-STOR-013 crash recovery with WAL + version chain
+[RUN] test/unit-g-stor-015-pending-confirmed-read-strategy.ts
+ok: G-STOR-015 pending/confirmed read strategy

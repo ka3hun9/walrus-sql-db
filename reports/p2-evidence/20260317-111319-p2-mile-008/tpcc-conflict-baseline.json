@@ -1,0 +1,23 @@
+{
+  "generatedAt": "2026-03-17T03:14:09.490Z",
+  "nodeVersion": "v24.14.0",
+  "config": {
+    "warehouses": 1,
+    "customersPerWarehouse": 240,
+    "transactions": 1200,
+    "conflictEvery": 2,
+    "amountStep": 5
+  },
+  "attemptedTransactions": 1800,
+  "committedTransactions": 1200,
+  "abortedTransactions": 600,
+  "abortRatio": 0.333,
+  "conflictsDetected": 600,
+  "throughputTps": 42.936,
+  "latencyMs": {
+    "avg": 23.273,
+    "p95": 38.895,
+    "max": 52.388
+  },
+  "consistencyErrors": []
+}
