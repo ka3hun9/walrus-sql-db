@@ -1,4 +1,4 @@
-# roadmap-100-checklist — Phase 2: 事务与数据一致性（Full Scope）
+# roadmap-100-checklist — Phase 3: 性能优化与复杂查询（Full Scope）
 
 > 原则：不做最小可上线，按全量能力实施与验收。
 > 判定：仅当“实现 + 测试 + 文档 + 基准”全部通过，条目才可勾选。
@@ -6,81 +6,84 @@
 
 ---
 
-## P2-A. 事务模型（BEGIN / COMMIT / ROLLBACK）
+## P3-A. 索引系统（CREATE INDEX + 索引对象分离存储）
 
-- [x] P2-TXN-001 语法支持：BEGIN / COMMIT / ROLLBACK（含嵌套事务策略声明）
-- [x] P2-TXN-002 会话级事务上下文（状态机：idle/active/committing/aborted）
-- [x] P2-TXN-003 事务内写集暂存（insert/update/delete）
-- [x] P2-TXN-004 原子提交：事务变更整体成功或整体失败
-- [x] P2-TXN-005 回滚语义：显式回滚与异常自动回滚一致
-- [x] P2-TXN-006 DDL in TX 策略（允许/禁止/延迟生效）与一致实现
+- [ ] P3-IDX-001 语法支持：`CREATE INDEX` / `DROP INDEX` / 命名索引
+- [ ] P3-IDX-002 索引元数据 catalog（索引名、表、列、类型、唯一性、状态）
+- [ ] P3-IDX-003 索引结构：哈希索引（等值查询路径）
+- [ ] P3-IDX-004 索引结构：B+ 树索引（范围/排序查询路径）
+- [ ] P3-IDX-005 索引与表数据分离持久化（独立对象存储，支持版本链）
+- [ ] P3-IDX-006 DML 同步维护索引（INSERT/UPDATE/DELETE 增量更新）
+- [ ] P3-IDX-007 索引回放与恢复（WAL/版本链恢复后索引一致）
+- [ ] P3-IDX-008 索引可观测性（命中率、维护成本、失效率）
 
-## P2-B. 日志与提交路径（WAL/事务日志 + 批量上链）
+## P3-B. 查询优化器（CBO）
 
-- [x] P2-LOG-001 事务日志结构定义（txnId, writeSet, pre/post image, checksum）
-- [x] P2-LOG-002 写前日志（WAL）落盘/持久化策略与恢复入口
-- [x] P2-LOG-003 提交批处理器：将事务变更聚合成一次链上写入
-- [x] P2-LOG-004 失败补偿：提交中断可重放/可回滚/幂等重试
-- [x] P2-LOG-005 日志截断与归档策略（checkpoint + retention）
+- [ ] P3-OPT-001 逻辑计划与物理计划分层（规则重写 + 代价评估）
+- [ ] P3-OPT-002 统计信息收集框架（行数、NDV、NULL 比例、直方图）
+- [ ] P3-OPT-003 统计信息持久化与版本管理（可回放、可比对）
+- [ ] P3-OPT-004 选择率估算模型（谓词/组合谓词）
+- [ ] P3-OPT-005 索引选择策略（全表扫 vs 索引扫 vs 索引回表）
+- [ ] P3-OPT-006 连接顺序搜索（基于代价的 join reorder）
+- [ ] P3-OPT-007 连接算法实现：Nested Loop / Hash Join / Sort-Merge Join
+- [ ] P3-OPT-008 计划稳定性与回退策略（bad plan fallback）
 
-## P2-C. 隔离级别与并发控制（至少 READ COMMITTED）
+## P3-C. 子查询与集合操作
 
-- [x] P2-ISO-001 READ COMMITTED 读视图定义并实现
-- [x] P2-ISO-002 行级锁管理器（S/X 锁）或 OCC 版本冲突检测器
-- [x] P2-ISO-003 死锁检测/超时机制（wait-for graph 或 timeout）
-- [x] P2-ISO-004 脏读禁止验证（跨会话并发回归）
-- [x] P2-ISO-005 不可重复读行为与文档（RC 允许）
-- [x] P2-ISO-006 并发写冲突检测与标准化错误码
+- [ ] P3-SUB-001 标量子查询执行与错误语义（单行约束）
+- [ ] P3-SUB-002 相关子查询执行（outer 引用绑定与代价控制）
+- [ ] P3-SUB-003 `EXISTS` / `NOT EXISTS` 语义与短路优化
+- [ ] P3-SUB-004 `IN` / `NOT IN` 子查询语义（含 NULL 三值逻辑）
+- [ ] P3-SET-001 `UNION` / `UNION ALL`
+- [ ] P3-SET-002 `INTERSECT` / `INTERSECT ALL`
+- [ ] P3-SET-003 `EXCEPT` / `EXCEPT ALL`
+- [ ] P3-SET-004 集合操作与排序/分页/投影兼容性
 
-## P2-D. 持久性与一致性（Walrus 版本化特性）
+## P3-D. 视图系统（只读视图）
 
-- [x] P2-DUR-001 提交生成新版本存储对象（immutable object）
-- [x] P2-DUR-002 版本链元数据（prevVersion/currentVersion/commitDigest）
-- [x] P2-DUR-003 崩溃恢复：基于 WAL + version chain 恢复到一致状态
-- [x] P2-DUR-004 读路径支持按“最新已提交版本”可重复解析
-- [x] P2-DUR-005 链上确认延迟场景的一致读策略（pending/confirmed）
+- [ ] P3-VIEW-001 `CREATE VIEW` / `DROP VIEW` 语法与 catalog 元数据
+- [ ] P3-VIEW-002 视图展开（query rewrite）与列映射一致性
+- [ ] P3-VIEW-003 对视图执行 `SELECT`（含过滤、排序、聚合、连接）
+- [ ] P3-VIEW-004 视图依赖分析与失效检测（底表/列变更）
+- [ ] P3-VIEW-005 视图权限/命名冲突基础策略（最小可控）
+- [ ] P3-VIEW-006 明确“可更新视图暂缓”边界与错误码
 
-## P2-E. 外键约束（FK）
+## P3-E. 执行引擎与存储联动（大数据场景）
 
-- [x] P2-FK-001 SQL 解析：FOREIGN KEY（列级/表级）
-- [x] P2-FK-002 catalog 元数据：引用表/列、匹配规则、删除更新动作
-- [x] P2-FK-003 INSERT/UPDATE 引用完整性检查（事务内可见性正确）
-- [x] P2-FK-004 ON DELETE CASCADE 实现
-- [x] P2-FK-005 ON DELETE RESTRICT/NO ACTION 实现
-- [x] P2-FK-006 ON UPDATE CASCADE/RESTRICT 策略实现
-- [x] P2-FK-007 FK 环与级联深度保护（防止无限级联）
+- [ ] P3-EXE-001 索引扫描执行器（等值、范围、前缀）
+- [ ] P3-EXE-002 Join 执行器多算法切换与内存预算控制
+- [ ] P3-EXE-003 大结果集管道化执行（避免全量物化）
+- [ ] P3-EXE-004 Spill/分块策略（内存受限场景）
+- [ ] P3-EXE-005 链上/回放读路径下的索引一致读策略
 
-## P2-F. 执行器与存储联动
+## P3-F. 测试体系（性能与复杂查询专项）
 
-- [x] P2-EXE-001 执行计划接入事务上下文（读已提交 + 本事务写）
-- [x] P2-EXE-002 索引/约束检查在事务提交点二次验证
-- [x] P2-EXE-003 批量提交与回放路径统一（线上/恢复同逻辑）
-- [x] P2-EXE-004 事务统计与可观测（txn latency, lock wait, abort ratio）
+- [ ] P3-TEST-001 单测：索引结构正确性与更新一致性
+- [ ] P3-TEST-002 单测：统计信息采集/持久化/恢复
+- [ ] P3-TEST-003 集成：CBO 计划选择与计划稳定性回归
+- [ ] P3-TEST-004 集成：复杂子查询（标量/相关/EXISTS/IN）
+- [ ] P3-TEST-005 集成：集合操作全矩阵（含 ALL 变体）
+- [ ] P3-TEST-006 集成：视图展开与依赖变更回归
+- [ ] P3-TEST-007 压测：百万级行数据下索引加速收益验证
+- [ ] P3-TEST-008 稳定性：长跑无一致性错误与性能退化阈值控制
 
-## P2-G. 测试体系（事务与一致性专项）
+## P3-G. 基准与里程碑验收
 
-- [x] P2-TEST-001 单测：事务状态机、WAL 编解码、冲突检测
-- [x] P2-TEST-002 并发集成：多会话 RC 语义（脏读/写冲突/回滚可见性）
-- [x] P2-TEST-003 恢复测试：崩溃注入后 WAL 恢复一致性
-- [x] P2-TEST-004 FK 回归：级联删除/限制策略/循环引用保护
-- [x] P2-TEST-005 链上延迟注入：pending 与 confirmed 读策略一致性
-- [x] P2-TEST-006 sqllogic 扩展：事务/FK fixture 套件
-
-## P2-H. 基准与里程碑验收
-
-- [x] P2-BENCH-001 TPC-C 类最小工作负载实现（仓库本地可重复运行）
-- [x] P2-BENCH-002 含事务冲突场景的吞吐/延迟基线报告
-- [x] P2-BENCH-003 长跑稳定性（N 小时无一致性错误）
-- [x] P2-MILE-001 事务 ACID 验收通过（含异常与恢复）
-- [x] P2-MILE-002 FK 全路径验收通过（含 CASCADE）
-- [x] P2-MILE-003 Walrus 链上版本一致性验收通过
-- [x] P2-MILE-004 TPC-C 类基准可运行且数据一致性通过
-- [ ] P2-MILE-005 全测试管线绿灯（build/unit/integration/regression/bench）
-- [x] P2-MILE-006 文档、示例、运维手册同步
+- [ ] P3-BENCH-001 基线：无索引复杂查询吞吐/延迟报告
+- [ ] P3-BENCH-002 对照：有索引同负载收益报告（QPS、P95、成本）
+- [ ] P3-BENCH-003 CBO 收益：计划选择优于固定规则基线
+- [ ] P3-BENCH-004 大数据集复杂连接/子查询压测报告
+- [ ] P3-MILE-001 索引系统验收通过（建索引、命中、恢复一致）
+- [ ] P3-MILE-002 CBO 验收通过（统计驱动计划选择）
+- [ ] P3-MILE-003 子查询与集合操作全路径验收通过
+- [ ] P3-MILE-004 视图 SELECT 能力验收通过（可更新视图暂缓）
+- [ ] P3-MILE-005 大数据复杂查询性能达标且稳定
+- [ ] P3-MILE-006 全测试管线绿灯（build/unit/integration/regression/bench）
+- [ ] P3-MILE-007 文档、示例、运维手册同步
 
 ---
 
-## Phase 2 DoD（统一验收标准）
+## Phase 3 DoD（统一验收标准）
 
 任一条目打勾前必须同时满足：
 1. 代码实现完成并通过评审；
