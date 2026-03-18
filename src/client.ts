@@ -40,7 +40,13 @@ import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
-import type { ExprAst, SelectStatementAst, SqlTransactionAction } from "./sql-ast.js";
+import type {
+  CreateIndexStatementAst,
+  DropIndexStatementAst,
+  ExprAst,
+  SelectStatementAst,
+  SqlTransactionAction,
+} from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
 import { ClientErrorCodeEnum, ConstraintViolationKindEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -210,6 +216,28 @@ type QueryCacheEntry = {
   writeVersion: number;
 };
 
+type BtreeIndexLeafEntry = {
+  key: SqlPrimitive;
+  rows: Set<SqlRow>;
+};
+
+type BtreeRuntimeIndex = {
+  column: string;
+  entries: BtreeIndexLeafEntry[];
+};
+
+type BtreeRuntimeIndexMap = Map<string, BtreeRuntimeIndex>;
+
+type BtreeRangeBound = {
+  value: SqlPrimitive;
+  inclusive: boolean;
+};
+
+type BtreeRangePredicate = {
+  lower?: BtreeRangeBound;
+  upper?: BtreeRangeBound;
+};
+
 type TransactionTableCommitSnapshot = {
   hadTableRows: boolean;
   rows?: SqlRow[];
@@ -220,7 +248,7 @@ type TransactionTableCommitSnapshot = {
   hadHashIndexStats: boolean;
   hashIndexStats?: { keys: number; rowsIndexed: number };
   hadBtreeIndexes: boolean;
-  btreeIndexes?: Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>;
+  btreeIndexes?: BtreeRuntimeIndexMap;
   hadBtreeIndexStats: boolean;
   btreeIndexStats?: { keys: number; rowsIndexed: number };
 };
@@ -294,10 +322,7 @@ export class WalrusSqlClient {
   private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
   private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
   private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
-  private readonly btreeIndexes = new Map<
-    string,
-    Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>
-  >();
+  private readonly btreeIndexes = new Map<string, BtreeRuntimeIndexMap>();
   private readonly btreeIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
   private readonly uniqueGroupsCache = new Map<string, string[][]>();
@@ -1059,7 +1084,7 @@ export class WalrusSqlClient {
       const restoredRows = latest.rows.map((row) => ({ ...row }));
       this.tables.set(table, restoredRows);
       this.uniqueIndexes.set(table, this.buildUniqueIndexSnapshot(table, restoredRows));
-      this.rebuildHashIndexesForTable(table);
+      this.rebuildSecondaryIndexesForTable(table);
 
       const versions = new Map<string, number>();
       for (const row of restoredRows) {
@@ -1097,7 +1122,7 @@ export class WalrusSqlClient {
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
     this.tables.set(table, tableStage.rows);
     this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
-    this.rebuildHashIndexesForTable(table);
+    this.rebuildSecondaryIndexesForTable(table);
   }
 
   private takeTransactionCommitRuntimeSnapshot(staged: TransactionWriteSet): TransactionCommitRuntimeSnapshot {
@@ -1157,7 +1182,7 @@ export class WalrusSqlClient {
       if (tableSnapshot.hadBtreeIndexes) {
         this.btreeIndexes.set(
           table,
-          tableSnapshot.btreeIndexes ?? new Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>(),
+          tableSnapshot.btreeIndexes ?? new Map<string, BtreeRuntimeIndex>(),
         );
       }
       else this.btreeIndexes.delete(table);
@@ -1583,7 +1608,7 @@ export class WalrusSqlClient {
     });
   }
 
-  private recordHashIndexMaintenance(table: string, op: "INDEX_REBUILD", affectedRows: number): void {
+  private recordIndexMaintenance(table: string, op: "INDEX_REBUILD", affectedRows: number): void {
     this.storageWriteLog.push({
       table,
       op,
@@ -1803,6 +1828,34 @@ export class WalrusSqlClient {
         statementType: "CREATE",
         tableObjectId: `0x${randomUUID().replace(/-/g, "")}`,
         affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("CREATE INDEX") || upper.startsWith("CREATE UNIQUE INDEX")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_index") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const table = this.executeCreateIndexStatement(ast);
+      this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("DROP INDEX")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_index") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const table = this.executeDropIndexStatement(ast);
+      if (table) {
+        this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: table ? 1 : 0,
       };
     }
 
@@ -2196,11 +2249,26 @@ export class WalrusSqlClient {
     }
 
     const bucket = this.requireTable(parsed.table);
-    if (!parsed.join && !(parsed.joins?.length)) this.rebuildHashIndexesForTable(parsed.table);
-    const whereHashCandidates = (!parsed.join && !(parsed.joins?.length) && parsed.whereClauses.length)
+    const canUseSingleTableIndexes = !parsed.join && !(parsed.joins?.length);
+    if (canUseSingleTableIndexes) this.rebuildSecondaryIndexesForTable(parsed.table);
+
+    const btreeOrderedScan = canUseSingleTableIndexes
+      ? this.getBtreeOrderedScanCandidates(parsed.table, bucket, {
+          orderByList: parsed.orderByList,
+          whereClauses: parsed.whereClauses,
+          groupBy: parsed.groupBy,
+          aggregate: parsed.aggregate,
+          rowNumberAlias: parsed.rowNumberAlias,
+          having: parsed.having,
+        })
+      : null;
+    const whereHashCandidates = (canUseSingleTableIndexes && !btreeOrderedScan && parsed.whereClauses.length)
       ? this.getHashIndexedCandidates(parsed.table, parsed.whereClauses)
       : null;
-    const scannedRows = whereHashCandidates ? whereHashCandidates.rows : bucket;
+    const whereBtreeCandidates = (canUseSingleTableIndexes && !btreeOrderedScan && !whereHashCandidates && parsed.whereClauses.length)
+      ? this.getBtreeIndexedCandidates(parsed.table, parsed.whereClauses)
+      : null;
+    const scannedRows = btreeOrderedScan?.rows ?? whereHashCandidates?.rows ?? whereBtreeCandidates?.rows ?? bucket;
     const baseRows = parsed.joins?.length
       ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), scannedRows)
       : parsed.join
@@ -2236,7 +2304,7 @@ export class WalrusSqlClient {
     const withWindow = parsed.rowNumberAlias
       ? this.applyRowNumber(filtered, parsed.rowNumberAlias, parsed.rowNumberSpec)
       : filtered;
-    const ordered = this.applyOrder(withWindow, parsed.orderByList);
+    const ordered = btreeOrderedScan?.orderSatisfied ? withWindow : this.applyOrder(withWindow, parsed.orderByList);
     const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
 
       const result = this.buildQueryResult(
@@ -2787,6 +2855,8 @@ export class WalrusSqlClient {
       this.uniqueGroupsCache.delete(table);
       this.rebuildUniqueIndexes(table);
       this.syncConstraintIndexesToCatalog(table);
+      this.pruneInvalidIndexesForTable(table);
+      this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -2834,6 +2904,8 @@ export class WalrusSqlClient {
       for (const r of rows) delete r[column];
       this.rebuildUniqueIndexes(table);
       this.syncConstraintIndexesToCatalog(table);
+      this.pruneInvalidIndexesForTable(table);
+      this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -3490,6 +3562,73 @@ export class WalrusSqlClient {
     return name.trim().toUpperCase();
   }
 
+  private pruneInvalidIndexesForTable(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+
+    const validColumns = new Set(schema.columns.map((column) => column.name.toUpperCase()));
+    for (const [indexName, entry] of [...this.indexCatalog.entries()]) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.columns.every((column) => validColumns.has(column.toUpperCase()))) continue;
+      this.indexCatalog.delete(indexName);
+    }
+  }
+
+  private executeCreateIndexStatement(ast: CreateIndexStatementAst): string {
+    const table = ast.tableName.trim();
+    const schema = this.schemas.get(table);
+    if (!schema || !this.tables.has(table)) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+    const indexName = this.normalizeIndexName(ast.indexName);
+    if (this.indexCatalog.has(indexName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index already exists: ${ast.indexName}`);
+    }
+
+    if (ast.columns.length !== 1) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", "CREATE INDEX execution currently supports single-column BTREE indexes only");
+    }
+
+    const requestedColumn = ast.columns[0]!.trim();
+    const schemaColumn = schema.columns.find((column) => column.name.toUpperCase() === requestedColumn.toUpperCase());
+    if (!schemaColumn) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index column not found on table ${table}: ${requestedColumn}`);
+    }
+
+    this.indexCatalog.set(indexName, {
+      name: indexName,
+      table,
+      columns: [schemaColumn.name],
+      type: "BTREE",
+      unique: ast.unique,
+      status: "ACTIVE",
+    });
+    this.rebuildBtreeIndexesForTable(table);
+    return table;
+  }
+
+  private executeDropIndexStatement(ast: DropIndexStatementAst): string | null {
+    const indexName = this.normalizeIndexName(ast.indexName);
+    const entry = this.indexCatalog.get(indexName);
+    const tableHint = ast.tableName?.trim();
+    if (!entry || (tableHint && entry.table.toUpperCase() !== tableHint.toUpperCase())) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index not found: ${ast.indexName}`);
+    }
+
+    if (entry.unique && indexName.startsWith(`__${entry.table.toUpperCase()}__`)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `cannot drop internal constraint index: ${entry.name}`);
+    }
+
+    this.indexCatalog.delete(indexName);
+    this.rebuildSecondaryIndexesForTable(entry.table);
+    return entry.table;
+  }
+
+  private rebuildSecondaryIndexesForTable(table: string): void {
+    this.rebuildHashIndexesForTable(table);
+    this.rebuildBtreeIndexesForTable(table);
+  }
+
   private rebuildHashIndexesForTable(table: string): void {
     const rows = this.tables.get(table);
     if (!rows) {
@@ -3529,10 +3668,66 @@ export class WalrusSqlClient {
     if (indexesForTable.size > 0) {
       this.hashIndexes.set(table, indexesForTable);
       this.hashIndexStats.set(table, { keys, rowsIndexed });
-      this.recordHashIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
+      this.recordIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
     } else {
       this.hashIndexes.delete(table);
       this.hashIndexStats.delete(table);
+    }
+  }
+
+  private rebuildBtreeIndexesForTable(table: string): void {
+    const rows = this.tables.get(table);
+    if (!rows) {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    const indexesForTable: BtreeRuntimeIndexMap = new Map();
+    let keys = 0;
+    let rowsIndexed = 0;
+
+    for (const entry of this.indexCatalog.values()) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.type !== "BTREE") continue;
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+
+      const column = entry.columns[0]!;
+      const leafMap = new Map<string, BtreeIndexLeafEntry>();
+      for (const row of rows) {
+        const val = this.resolveRowValue(row, column);
+        if (val === null || val === undefined) continue;
+
+        const encoded = this.encodeTypedKey(val, `btree.index.key:${table}.${entry.name}.${column}`);
+        const existing = leafMap.get(encoded);
+        if (existing) {
+          existing.rows.add(row);
+        } else {
+          leafMap.set(encoded, {
+            key: val as SqlPrimitive,
+            rows: new Set<SqlRow>([row]),
+          });
+          keys += 1;
+        }
+        rowsIndexed += 1;
+      }
+
+      if (leafMap.size === 0) continue;
+      const leaves = [...leafMap.values()].sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+      indexesForTable.set(entry.name.toUpperCase(), {
+        column,
+        entries: leaves,
+      });
+    }
+
+    if (indexesForTable.size > 0) {
+      this.btreeIndexes.set(table, indexesForTable);
+      this.btreeIndexStats.set(table, { keys, rowsIndexed });
+      this.recordIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
+    } else {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
     }
   }
 
@@ -3570,9 +3765,233 @@ export class WalrusSqlClient {
     return null;
   }
 
+  private compareBtreeKey(a: SqlPrimitive, b: SqlPrimitive): number {
+    const lt = this.compareByOp(a, b, "<");
+    if (lt === "TRUE") return -1;
+    const gt = this.compareByOp(a, b, ">");
+    if (gt === "TRUE") return 1;
+    return 0;
+  }
+
+  private pickTighterBtreeBound(
+    current: BtreeRangeBound | undefined,
+    candidate: BtreeRangeBound,
+    edge: "lower" | "upper",
+  ): BtreeRangeBound {
+    if (!current) return candidate;
+    const cmp = this.compareBtreeKey(candidate.value, current.value);
+
+    if (edge === "lower") {
+      if (cmp > 0) return candidate;
+      if (cmp < 0) return current;
+      if (!candidate.inclusive && current.inclusive) return candidate;
+      return current;
+    }
+
+    if (cmp < 0) return candidate;
+    if (cmp > 0) return current;
+    if (!candidate.inclusive && current.inclusive) return candidate;
+    return current;
+  }
+
+  private isSimpleLiteralExpr(rawExpr: string): boolean {
+    const trimmed = rawExpr.trim();
+    if (!trimmed) return false;
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return false;
+    if (/^(TRUE|FALSE|NULL)$/i.test(trimmed)) return true;
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) return true;
+    if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+      return true;
+    }
+    return false;
+  }
+
+  private parseIndexLiteral(rawExpr: string): SqlPrimitive | undefined {
+    if (!this.isSimpleLiteralExpr(rawExpr)) return undefined;
+    const parsed = this.castValue(rawExpr);
+    if (parsed === null || parsed === undefined) return undefined;
+    return parsed as SqlPrimitive;
+  }
+
+  private extractBtreeRangePredicate(column: string, whereClauses: WhereClause[]): BtreeRangePredicate | null {
+    if (whereClauses.length === 0) return null;
+    if (whereClauses.some((clause) => clause.logic === "OR")) return null;
+
+    let lower: BtreeRangeBound | undefined;
+    let upper: BtreeRangeBound | undefined;
+    const target = column.toUpperCase();
+
+    for (const clause of whereClauses) {
+      if (!clause.field || clause.field.includes(".")) continue;
+      if (clause.field.toUpperCase() !== target) continue;
+      if (clause.valueExpr) continue;
+
+      if (clause.op === "=") {
+        const eqRaw = clause.valueExprs?.[0];
+        if (!eqRaw) continue;
+        const eqValue = this.parseIndexLiteral(eqRaw);
+        if (eqValue === undefined) continue;
+        const bound: BtreeRangeBound = { value: eqValue, inclusive: true };
+        lower = this.pickTighterBtreeBound(lower, bound, "lower");
+        upper = this.pickTighterBtreeBound(upper, bound, "upper");
+        continue;
+      }
+
+      if (clause.op === ">" || clause.op === ">=" || clause.op === "<" || clause.op === "<=") {
+        const cmpRaw = clause.valueExprs?.[0];
+        if (!cmpRaw) continue;
+        const cmpValue = this.parseIndexLiteral(cmpRaw);
+        if (cmpValue === undefined) continue;
+
+        if (clause.op === ">" || clause.op === ">=") {
+          lower = this.pickTighterBtreeBound(
+            lower,
+            { value: cmpValue, inclusive: clause.op === ">=" },
+            "lower",
+          );
+        } else {
+          upper = this.pickTighterBtreeBound(
+            upper,
+            { value: cmpValue, inclusive: clause.op === "<=" },
+            "upper",
+          );
+        }
+        continue;
+      }
+
+      if (clause.op === "BETWEEN") {
+        const lowRaw = clause.valueExprs?.[0];
+        const highRaw = clause.valueExprs?.[1];
+        if (!lowRaw || !highRaw) continue;
+        const lowValue = this.parseIndexLiteral(lowRaw);
+        const highValue = this.parseIndexLiteral(highRaw);
+        if (lowValue === undefined || highValue === undefined) continue;
+
+        lower = this.pickTighterBtreeBound(lower, { value: lowValue, inclusive: true }, "lower");
+        upper = this.pickTighterBtreeBound(upper, { value: highValue, inclusive: true }, "upper");
+      }
+    }
+
+    if (!lower && !upper) return null;
+    return { lower, upper };
+  }
+
+  private isBtreePredicateEmpty(predicate: BtreeRangePredicate): boolean {
+    if (!predicate.lower || !predicate.upper) return false;
+    const cmp = this.compareBtreeKey(predicate.lower.value, predicate.upper.value);
+    if (cmp > 0) return true;
+    if (cmp < 0) return false;
+    return !predicate.lower.inclusive || !predicate.upper.inclusive;
+  }
+
+  private scanBtreeIndexRows(
+    index: BtreeRuntimeIndex,
+    direction: "ASC" | "DESC",
+    predicate?: BtreeRangePredicate,
+  ): SqlRow[] {
+    if (predicate && this.isBtreePredicateEmpty(predicate)) return [];
+
+    const entries = direction === "DESC" ? [...index.entries].reverse() : index.entries;
+    const out: SqlRow[] = [];
+    for (const leaf of entries) {
+      if (predicate?.lower) {
+        const cmpLower = this.compareBtreeKey(leaf.key, predicate.lower.value);
+        const tooLow = cmpLower < 0 || (cmpLower === 0 && !predicate.lower.inclusive);
+        if (tooLow) {
+          if (direction === "DESC") break;
+          continue;
+        }
+      }
+
+      if (predicate?.upper) {
+        const cmpUpper = this.compareBtreeKey(leaf.key, predicate.upper.value);
+        const tooHigh = cmpUpper > 0 || (cmpUpper === 0 && !predicate.upper.inclusive);
+        if (tooHigh) {
+          if (direction === "ASC") break;
+          continue;
+        }
+      }
+
+      out.push(...leaf.rows.values());
+    }
+    return out;
+  }
+
+  private getBtreeIndexedCandidates(
+    table: string,
+    whereClauses: WhereClause[],
+  ): { rows: SqlRow[]; indexName: string; column: string } | null {
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    for (const [indexName, runtime] of tableIndexes.entries()) {
+      const entry = this.indexCatalog.get(indexName);
+      if (!entry || entry.columns.length !== 1) continue;
+
+      const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
+      if (!predicate) continue;
+      const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
+      return { rows, indexName, column: runtime.column };
+    }
+
+    return null;
+  }
+
+  private getBtreeOrderedScanCandidates(
+    table: string,
+    rows: SqlRow[],
+    parsed: Pick<ParsedSelect, "orderByList" | "whereClauses" | "groupBy" | "aggregate" | "rowNumberAlias" | "having">,
+  ): { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null {
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias) return null;
+    if (!parsed.orderByList || parsed.orderByList.length !== 1) return null;
+
+    const orderExpr = parsed.orderByList[0]!.field.trim();
+    const orderExprMatch = orderExpr.match(/^[a-zA-Z_][a-zA-Z0-9_\.]*$/);
+    if (!orderExprMatch) return null;
+
+    const orderField = orderExpr.includes(".") ? orderExpr.split(".").at(-1)! : orderExpr;
+    const direction = parsed.orderByList[0]!.direction;
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    for (const [indexName, runtime] of tableIndexes.entries()) {
+      if (runtime.column.toUpperCase() !== orderField.toUpperCase()) continue;
+      const predicate = this.extractBtreeRangePredicate(runtime.column, parsed.whereClauses);
+      const orderedRows = this.scanBtreeIndexRows(runtime, direction, predicate ?? undefined);
+
+      const isBoundByOrderColumn = Boolean(predicate && (predicate.lower || predicate.upper));
+      if (!isBoundByOrderColumn) {
+        const nullTail = rows.filter((row) => {
+          const value = this.resolveRowValue(row, runtime.column);
+          return value === null || value === undefined;
+        });
+        orderedRows.push(...nullTail);
+      }
+
+      return {
+        rows: orderedRows,
+        indexName,
+        column: runtime.column,
+        orderSatisfied: true,
+      };
+    }
+
+    return null;
+  }
+
   getHashIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {
     const out: { table: string; keys: number; rowsIndexed: number }[] = [];
     for (const [tableName, stats] of this.hashIndexStats.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
+    }
+    out.sort((a, b) => a.table.localeCompare(b.table));
+    return out;
+  }
+
+  getBtreeIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {
+    const out: { table: string; keys: number; rowsIndexed: number }[] = [];
+    for (const [tableName, stats] of this.btreeIndexStats.entries()) {
       if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
       out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
     }
