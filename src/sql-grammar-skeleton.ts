@@ -2,7 +2,7 @@ import type { SqlErrorCode } from "./sql-errors.js";
 
 export type SqlDialectProfile = "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";
 
-export type StatementKind = "select" | "union" | "transaction" | "other";
+export type StatementKind = "select" | "union" | "transaction" | "create_index" | "drop_index" | "other";
 
 export type ClauseStatus = "present" | "absent";
 
@@ -72,13 +72,17 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
   const up = upper(sql);
   const dialect = options?.dialect ?? "ansi";
 
-  const statement: StatementKind = hasWord(up, "UNION")
-    ? "union"
-    : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
-      ? "select"
-      : startsWithWord(up, "BEGIN") || startsWithWord(up, "COMMIT") || startsWithWord(up, "ROLLBACK")
-        ? "transaction"
-        : "other";
+  const statement: StatementKind = startsWithWord(up, "CREATE INDEX")
+    ? "create_index"
+    : startsWithWord(up, "DROP INDEX")
+      ? "drop_index"
+      : hasWord(up, "UNION")
+        ? "union"
+        : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
+          ? "select"
+          : startsWithWord(up, "BEGIN") || startsWithWord(up, "COMMIT") || startsWithWord(up, "ROLLBACK")
+            ? "transaction"
+            : "other";
 
   const clauses = {
     cte: startsWithWord(up, "WITH") ? "present" : "absent",

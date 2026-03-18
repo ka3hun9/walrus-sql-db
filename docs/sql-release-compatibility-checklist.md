@@ -8,7 +8,7 @@
 - Existing error-code namespace contracts (`ERR_*`, `SQL_*`) remain stable and machine-parseable.
 
 ## Pre-Release Gate Checklist
-- [ ] Build passes (`npm run build`)
+- [ ] Build passes (`npm run build`, must clean `dist/` before compile)
 - [ ] Unit/integration/regression gates pass (`npm run test:ci`)
 - [ ] Benchmark gate passes (`npm run test:ci:benchmark`)
 - [ ] Public API export compatibility check passes (`test/unit-i-eng-004-release-compatibility-checklist.ts`)

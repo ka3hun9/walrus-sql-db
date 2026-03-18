@@ -37,6 +37,26 @@ npm run sql:verify:full
 npm run onchain:select-replay
 npm run onchain:join-replay
 npm run onchain:benchmark-replay
+npm run p2:bench:tpcc
+npm run p2:bench:conflict
+npm run p2:bench:longrun
+npm run sql:logic
+npm run sql:logic:p2
+```
+
+## P2 运维手册
+
+- 运维手册：`docs/sql-p2-operations-runbook.md`
+- 建议的 P2 验收流程：
+
+```bash
+npm run build
+npm run test:ci
+npm run p2:bench:tpcc
+npm run p2:bench:conflict
+npm run p2:bench:longrun
+npm run sql:logic
+npm run sql:logic:p2
 ```
 
 ## CI / 验证

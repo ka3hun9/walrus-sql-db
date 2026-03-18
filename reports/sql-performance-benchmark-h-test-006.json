@@ -1,0 +1,29 @@
+{
+  "generatedAt": "2026-03-18T00:00:23.952Z",
+  "nodeVersion": "v24.14.0",
+  "config": {
+    "writeRows": 300,
+    "coldQueries": 1,
+    "hotQueries": 200
+  },
+  "samples": [
+    {
+      "name": "write_throughput",
+      "operations": 300,
+      "durationMs": 34.786,
+      "opsPerSec": 8624.16
+    },
+    {
+      "name": "cold_query_throughput",
+      "operations": 1,
+      "durationMs": 41.967,
+      "opsPerSec": 23.83
+    },
+    {
+      "name": "hot_query_throughput",
+      "operations": 200,
+      "durationMs": 3.03,
+      "opsPerSec": 66006.6
+    }
+  ]
+}

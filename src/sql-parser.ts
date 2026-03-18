@@ -1,6 +1,8 @@
 import { createSqlError } from "./sql-errors.js";
 import { inspectSqlGrammarSkeleton, type SqlDialectProfile, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
+  CreateIndexStatementAst,
+  DropIndexStatementAst,
   ExprAst,
   JoinAst,
   OrderItemAst,
@@ -653,6 +655,69 @@ function parseTransactionStatement(base: string, rawSql: string): TransactionSta
   });
 }
 
+function parseCreateIndexStatement(base: string, rawSql: string): CreateIndexStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(
+    /^CREATE\s+(UNIQUE\s+)?INDEX\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]+)\)$/i,
+  );
+
+  if (!match) {
+    if (/^CREATE\s+(UNIQUE\s+)?INDEX\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "CREATE INDEX requires syntax: CREATE [UNIQUE] INDEX <name> ON <table>(<col,...>)",
+        token: "INDEX",
+      });
+    }
+    return null;
+  }
+
+  const columns = splitCommaAware(match[4]!).map((c) => c.trim()).filter(Boolean);
+  if (columns.length === 0 || columns.some((c) => !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(c))) {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE INDEX column list must contain valid identifiers",
+      token: match[4]!.trim(),
+    });
+  }
+
+  return {
+    kind: "create_index",
+    unique: !!match[1],
+    indexName: match[2]!,
+    tableName: match[3]!,
+    columns,
+    rawSql,
+  };
+}
+
+function parseDropIndexStatement(base: string, rawSql: string): DropIndexStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(
+    /^DROP\s+INDEX\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*))?$/i,
+  );
+
+  if (!match) {
+    if (/^DROP\s+INDEX\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "DROP INDEX requires syntax: DROP INDEX [IF EXISTS] <name> [ON <table>]",
+        token: "INDEX",
+      });
+    }
+    return null;
+  }
+
+  return {
+    kind: "drop_index",
+    ifExists: !!match[1],
+    indexName: match[2]!,
+    tableName: match[3]?.trim() || undefined,
+    rawSql,
+  };
+}
+
 export type ParseSqlToAstOptions = {
   dialect?: SqlDialectProfile;
 };
@@ -752,10 +817,16 @@ export function parseSqlToAst(
   const transaction = parseTransactionStatement(base, sql);
   if (transaction) return transaction;
 
+  const createIndex = parseCreateIndexStatement(base, sql);
+  if (createIndex) return createIndex;
+
+  const dropIndex = parseDropIndexStatement(base, sql);
+  if (dropIndex) return dropIndex;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-      message: "Only SELECT/UNION/BEGIN/COMMIT/ROLLBACK statements are currently accepted by parser baseline",
+      message: "Only SELECT/UNION/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }

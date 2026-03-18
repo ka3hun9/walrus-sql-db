@@ -50,6 +50,7 @@ import {
   type ColumnTypeSpec,
   type ConstraintIndexCostStats,
   type ForeignKeySpec,
+  type IndexCatalogEntry,
   type SqlTypeName,
   type TableSchema,
 } from "./sql-catalog.js";
@@ -214,6 +215,14 @@ type TransactionTableCommitSnapshot = {
   rows?: SqlRow[];
   hadUniqueIndexes: boolean;
   uniqueIndexes?: Map<string, Map<string, SqlRow>>;
+  hadHashIndexes: boolean;
+  hashIndexes?: Map<string, Map<string, Set<SqlRow>>>;
+  hadHashIndexStats: boolean;
+  hashIndexStats?: { keys: number; rowsIndexed: number };
+  hadBtreeIndexes: boolean;
+  btreeIndexes?: Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>;
+  hadBtreeIndexStats: boolean;
+  btreeIndexStats?: { keys: number; rowsIndexed: number };
 };
 
 type TransactionCommitRuntimeSnapshot = {
@@ -282,6 +291,14 @@ export class WalrusSqlClient {
   private readonly isolationLevel: "read_committed";
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
+  private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
+  private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
+  private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
+  private readonly btreeIndexes = new Map<
+    string,
+    Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>
+  >();
+  private readonly btreeIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
   private readonly uniqueGroupsCache = new Map<string, string[][]>();
   private readonly constraintCost = new Map<string, ConstraintIndexCostStats>();
@@ -1042,6 +1059,7 @@ export class WalrusSqlClient {
       const restoredRows = latest.rows.map((row) => ({ ...row }));
       this.tables.set(table, restoredRows);
       this.uniqueIndexes.set(table, this.buildUniqueIndexSnapshot(table, restoredRows));
+      this.rebuildHashIndexesForTable(table);
 
       const versions = new Map<string, number>();
       for (const row of restoredRows) {
@@ -1079,6 +1097,7 @@ export class WalrusSqlClient {
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
     this.tables.set(table, tableStage.rows);
     this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
+    this.rebuildHashIndexesForTable(table);
   }
 
   private takeTransactionCommitRuntimeSnapshot(staged: TransactionWriteSet): TransactionCommitRuntimeSnapshot {
@@ -1089,6 +1108,14 @@ export class WalrusSqlClient {
         rows: this.tables.get(table),
         hadUniqueIndexes: this.uniqueIndexes.has(table),
         uniqueIndexes: this.uniqueIndexes.get(table),
+        hadHashIndexes: this.hashIndexes.has(table),
+        hashIndexes: this.hashIndexes.get(table),
+        hadHashIndexStats: this.hashIndexStats.has(table),
+        hashIndexStats: this.hashIndexStats.get(table),
+        hadBtreeIndexes: this.btreeIndexes.has(table),
+        btreeIndexes: this.btreeIndexes.get(table),
+        hadBtreeIndexStats: this.btreeIndexStats.has(table),
+        btreeIndexStats: this.btreeIndexStats.get(table),
       });
     }
 
@@ -1116,6 +1143,29 @@ export class WalrusSqlClient {
         this.uniqueIndexes.set(table, tableSnapshot.uniqueIndexes ?? new Map<string, Map<string, SqlRow>>());
       }
       else this.uniqueIndexes.delete(table);
+
+      if (tableSnapshot.hadHashIndexes) {
+        this.hashIndexes.set(table, tableSnapshot.hashIndexes ?? new Map<string, Map<string, Set<SqlRow>>>());
+      }
+      else this.hashIndexes.delete(table);
+
+      if (tableSnapshot.hadHashIndexStats) {
+        this.hashIndexStats.set(table, tableSnapshot.hashIndexStats ?? { keys: 0, rowsIndexed: 0 });
+      }
+      else this.hashIndexStats.delete(table);
+
+      if (tableSnapshot.hadBtreeIndexes) {
+        this.btreeIndexes.set(
+          table,
+          tableSnapshot.btreeIndexes ?? new Map<string, { column: string; entries: Array<{ key: SqlPrimitive; rows: Set<SqlRow> }> }>(),
+        );
+      }
+      else this.btreeIndexes.delete(table);
+
+      if (tableSnapshot.hadBtreeIndexStats) {
+        this.btreeIndexStats.set(table, tableSnapshot.btreeIndexStats ?? { keys: 0, rowsIndexed: 0 });
+      }
+      else this.btreeIndexStats.delete(table);
     }
 
     this.dirtyTables.clear();
@@ -1460,6 +1510,20 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getIndexCatalog(table?: string): IndexCatalogEntry[] {
+    const out = [...this.indexCatalog.values()]
+      .filter((entry) => (table ? entry.table.toUpperCase() === table.toUpperCase() : true))
+      .map((entry) => ({ ...entry, columns: [...entry.columns] }));
+
+    out.sort((a, b) => {
+      const byTable = a.table.localeCompare(b.table);
+      if (byTable !== 0) return byTable;
+      return a.name.localeCompare(b.name);
+    });
+
+    return out;
+  }
+
   getDirtyTables(): string[] {
     return [...this.dirtyTables.values()].sort();
   }
@@ -1515,6 +1579,16 @@ export class WalrusSqlClient {
       op,
       affectedRows,
       mode,
+      at: Date.now(),
+    });
+  }
+
+  private recordHashIndexMaintenance(table: string, op: "INDEX_REBUILD", affectedRows: number): void {
+    this.storageWriteLog.push({
+      table,
+      op,
+      affectedRows,
+      mode: "simulator",
       at: Date.now(),
     });
   }
@@ -1707,9 +1781,17 @@ export class WalrusSqlClient {
       this.assertNoCascadeCycle(schema);
       this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      this.indexCatalog.forEach((entry, indexName) => {
+        if (entry.table.toUpperCase() === schema.name.toUpperCase()) this.indexCatalog.delete(indexName);
+      });
+      this.hashIndexes.delete(schema.name);
+      this.hashIndexStats.delete(schema.name);
+      this.btreeIndexes.delete(schema.name);
+      this.btreeIndexStats.delete(schema.name);
       this.uniqueIndexes.delete(schema.name);
       this.uniqueGroupsCache.set(schema.name, this.collectUniqueGroups(schema));
       this.ensureUniqueIndexMaps(schema.name);
+      this.syncConstraintIndexesToCatalog(schema.name);
       this.constraintCost.set(schema.name, emptyConstraintCostStats());
       this.rowVersions.delete(schema.name);
       this.tableVersionObjects.delete(schema.name);
@@ -1739,6 +1821,13 @@ export class WalrusSqlClient {
       }
       this.tables.delete(table);
       this.schemas.delete(table);
+      this.indexCatalog.forEach((entry, indexName) => {
+        if (entry.table.toUpperCase() === table.toUpperCase()) this.indexCatalog.delete(indexName);
+      });
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
       this.uniqueIndexes.delete(table);
       this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
@@ -2107,11 +2196,16 @@ export class WalrusSqlClient {
     }
 
     const bucket = this.requireTable(parsed.table);
+    if (!parsed.join && !(parsed.joins?.length)) this.rebuildHashIndexesForTable(parsed.table);
+    const whereHashCandidates = (!parsed.join && !(parsed.joins?.length) && parsed.whereClauses.length)
+      ? this.getHashIndexedCandidates(parsed.table, parsed.whereClauses)
+      : null;
+    const scannedRows = whereHashCandidates ? whereHashCandidates.rows : bucket;
     const baseRows = parsed.joins?.length
-      ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), bucket)
+      ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), scannedRows)
       : parsed.join
-      ? this.applyJoin(parsed.table, bucket, parsed.join)
-      : bucket;
+      ? this.applyJoin(parsed.table, scannedRows, parsed.join)
+      : scannedRows;
     const filtered = parsed.whereAst
       ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
       : parsed.whereTree
@@ -2692,6 +2786,7 @@ export class WalrusSqlClient {
       schema.columns.push(col);
       this.uniqueGroupsCache.delete(table);
       this.rebuildUniqueIndexes(table);
+      this.syncConstraintIndexesToCatalog(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -2738,6 +2833,7 @@ export class WalrusSqlClient {
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
       this.rebuildUniqueIndexes(table);
+      this.syncConstraintIndexesToCatalog(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -3388,6 +3484,126 @@ export class WalrusSqlClient {
     if (schema.primaryKeyGroup?.length) pushGroup(schema.primaryKeyGroup);
     for (const g of schema.uniqueGroups ?? []) pushGroup(g);
     return groups;
+  }
+
+  private normalizeIndexName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
+  private rebuildHashIndexesForTable(table: string): void {
+    const rows = this.tables.get(table);
+    if (!rows) {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      return;
+    }
+
+    const indexesForTable = new Map<string, Map<string, Set<SqlRow>>>();
+    let keys = 0;
+    let rowsIndexed = 0;
+
+    for (const entry of this.indexCatalog.values()) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.type !== "HASH") continue;
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+
+      const column = entry.columns[0]!;
+      const bucket = new Map<string, Set<SqlRow>>();
+      for (const row of rows) {
+        const val = this.resolveRowValue(row, column);
+        if (val === null || val === undefined) continue;
+        const key = this.encodeTypedKey(val, `hash.index.key:${table}.${entry.name}.${column}`);
+        const set = bucket.get(key) ?? new Set<SqlRow>();
+        set.add(row);
+        bucket.set(key, set);
+        rowsIndexed += 1;
+      }
+
+      if (bucket.size > 0) {
+        keys += bucket.size;
+        indexesForTable.set(entry.name.toUpperCase(), bucket);
+      }
+    }
+
+    if (indexesForTable.size > 0) {
+      this.hashIndexes.set(table, indexesForTable);
+      this.hashIndexStats.set(table, { keys, rowsIndexed });
+      this.recordHashIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
+    } else {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+    }
+  }
+
+  private getHashIndexedCandidates(
+    table: string,
+    whereClauses: WhereClause[],
+  ): { rows: SqlRow[]; indexName: string; column: string } | null {
+    const tableIndexes = this.hashIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    for (const clause of whereClauses) {
+      if (clause.logic === "OR") continue;
+      if (clause.op !== "=") continue;
+      if (!clause.field || clause.field.includes(".")) continue;
+      if (!clause.valueExprs?.length) continue;
+
+      const eqValueRaw = clause.valueExprs[0]!.trim();
+      if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(eqValueRaw)) continue;
+      const eqValue = this.castValue(eqValueRaw);
+      if (eqValue === null || eqValue === undefined) continue;
+
+      for (const [indexName, buckets] of tableIndexes.entries()) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.columns.length !== 1) continue;
+        const column = entry.columns[0]!;
+        if (column.toUpperCase() !== clause.field.toUpperCase()) continue;
+
+        const key = this.encodeTypedKey(eqValue as SqlPrimitive, `hash.index.lookup:${table}.${indexName}.${column}`);
+        const hit = buckets.get(key);
+        if (!hit) return { rows: [], indexName, column };
+        return { rows: [...hit], indexName, column };
+      }
+    }
+
+    return null;
+  }
+
+  getHashIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {
+    const out: { table: string; keys: number; rowsIndexed: number }[] = [];
+    for (const [tableName, stats] of this.hashIndexStats.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
+    }
+    out.sort((a, b) => a.table.localeCompare(b.table));
+    return out;
+  }
+
+  private syncConstraintIndexesToCatalog(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+
+    for (const [indexName, entry] of [...this.indexCatalog.entries()]) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (!entry.unique) continue;
+      if (!indexName.startsWith(`__${table.toUpperCase()}__`)) continue;
+      this.indexCatalog.delete(indexName);
+    }
+
+    const groups = this.getUniqueGroups(table, schema);
+    for (const group of groups) {
+      const normalizedColumns = group.map((column) => column.trim());
+      const syntheticName = this.normalizeIndexName(`__${table}__${normalizedColumns.join("_")}__UNQ`);
+      this.indexCatalog.set(syntheticName, {
+        name: syntheticName,
+        table,
+        columns: normalizedColumns,
+        type: "HASH",
+        unique: true,
+        status: "ACTIVE",
+      });
+    }
   }
 
   private getUniqueGroups(table: string, schema?: TableSchema): string[][] {

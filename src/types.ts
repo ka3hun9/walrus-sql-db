@@ -1085,7 +1085,8 @@ export type StorageWriteOperation =
   | "ALTER_TABLE"
   | "INSERT_ROW"
   | "UPDATE_ROW"
-  | "DELETE_ROW";
+  | "DELETE_ROW"
+  | "INDEX_REBUILD";
 
 export interface StorageWriteEvent {
   table: string;

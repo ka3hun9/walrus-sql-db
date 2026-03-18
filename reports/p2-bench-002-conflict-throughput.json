@@ -1,0 +1,17 @@
+{
+  "generatedAt": "2026-03-18T00:00:27.410Z",
+  "samples": [
+    {
+      "name": "p2_tx_conflict_commit",
+      "operations": 80,
+      "durationMs": 1193.367,
+      "opsPerSec": 67.04,
+      "avgLatencyMs": 13.933,
+      "conflicts": 40
+    }
+  ],
+  "notes": [
+    "rounds=40",
+    "conflicts=40"
+  ]
+}

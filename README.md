@@ -49,6 +49,26 @@ Note:
 ```bash
 npm run onchain:join-replay
 npm run onchain:benchmark-replay
+npm run p2:bench:tpcc
+npm run p2:bench:conflict
+npm run p2:bench:longrun
+npm run sql:logic
+npm run sql:logic:p2
+```
+
+## P2 Operations Runbook
+
+- Runbook: `docs/sql-p2-operations-runbook.md`
+- Recommended P2 acceptance flow:
+
+```bash
+npm run build
+npm run test:ci
+npm run p2:bench:tpcc
+npm run p2:bench:conflict
+npm run p2:bench:longrun
+npm run sql:logic
+npm run sql:logic:p2
 ```
 
 ## Current Scope

@@ -35,6 +35,18 @@ export type TableSchema = {
   foreignKeys?: ForeignKeySpec[];
 };
 
+export type IndexCatalogType = "HASH" | "BTREE";
+export type IndexCatalogStatus = "ACTIVE" | "BUILDING" | "DROPPED";
+
+export type IndexCatalogEntry = {
+  name: string;
+  table: string;
+  columns: string[];
+  type: IndexCatalogType;
+  unique: boolean;
+  status: IndexCatalogStatus;
+};
+
 export type ConstraintIndexCostStats = {
   insertOps: number;
   updateOps: number;

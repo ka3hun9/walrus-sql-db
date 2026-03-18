@@ -3,7 +3,13 @@ import type { SqlTypedValue } from "./types.js";
 export type SqlTransactionAction = "BEGIN" | "COMMIT" | "ROLLBACK";
 export type SqlNestedTransactionPolicy = "error_on_nested_begin";
 
-export type SqlAstStatement = SelectStatementAst | UnionStatementAst | TransactionStatementAst | UnknownStatementAst;
+export type SqlAstStatement =
+  | SelectStatementAst
+  | UnionStatementAst
+  | TransactionStatementAst
+  | CreateIndexStatementAst
+  | DropIndexStatementAst
+  | UnknownStatementAst;
 
 export type UnknownStatementAst = {
   kind: "unknown";
@@ -22,6 +28,23 @@ export type TransactionStatementAst = {
   kind: "transaction";
   action: SqlTransactionAction;
   nestedTransactionPolicy: SqlNestedTransactionPolicy;
+  rawSql: string;
+};
+
+export type CreateIndexStatementAst = {
+  kind: "create_index";
+  indexName: string;
+  tableName: string;
+  columns: string[];
+  unique: boolean;
+  rawSql: string;
+};
+
+export type DropIndexStatementAst = {
+  kind: "drop_index";
+  indexName: string;
+  tableName?: string;
+  ifExists: boolean;
   rawSql: string;
 };
 
