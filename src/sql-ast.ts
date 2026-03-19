@@ -11,6 +11,8 @@ export type SqlAstStatement =
   | TransactionStatementAst
   | CreateIndexStatementAst
   | DropIndexStatementAst
+  | CreateViewStatementAst
+  | DropViewStatementAst
   | UnknownStatementAst;
 
 export type UnknownStatementAst = {
@@ -62,6 +64,20 @@ export type DropIndexStatementAst = {
   kind: "drop_index";
   indexName: string;
   tableName?: string;
+  ifExists: boolean;
+  rawSql: string;
+};
+
+export type CreateViewStatementAst = {
+  kind: "create_view";
+  viewName: string;
+  querySql: string;
+  rawSql: string;
+};
+
+export type DropViewStatementAst = {
+  kind: "drop_view";
+  viewName: string;
   ifExists: boolean;
   rawSql: string;
 };

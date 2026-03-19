@@ -2,7 +2,9 @@ import { createSqlError } from "./sql-errors.js";
 import { inspectSqlGrammarSkeleton, type SqlDialectProfile, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
   CreateIndexStatementAst,
+  CreateViewStatementAst,
   DropIndexStatementAst,
+  DropViewStatementAst,
   ExprAst,
   JoinAst,
   OrderItemAst,
@@ -767,6 +769,74 @@ function parseDropIndexStatement(base: string, rawSql: string): DropIndexStateme
   };
 }
 
+function parseCreateViewStatement(
+  base: string,
+  rawSql: string,
+  dialect: SqlDialectProfile,
+): CreateViewStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(/^CREATE\s+VIEW\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+(.+)$/i);
+
+  if (!match) {
+    if (/^CREATE\s+VIEW\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "CREATE VIEW requires syntax: CREATE VIEW <name> AS <select-query>",
+        token: "VIEW",
+      });
+    }
+    return null;
+  }
+
+  const querySql = match[2]!.trim();
+  if (!/^SELECT\b/i.test(querySql)) {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE VIEW currently requires a SELECT-based query after AS",
+      token: querySql.split(/\s+/)[0] ?? querySql,
+    });
+  }
+
+  const queryAst = parseSqlToAst(querySql, { dialect });
+  if (queryAst.kind !== "select" && queryAst.kind !== "union" && queryAst.kind !== "intersect" && queryAst.kind !== "except") {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE VIEW query must be a SELECT/UNION/INTERSECT/EXCEPT statement",
+      token: querySql.split(/\s+/)[0] ?? querySql,
+    });
+  }
+
+  return {
+    kind: "create_view",
+    viewName: match[1]!,
+    querySql,
+    rawSql,
+  };
+}
+
+function parseDropViewStatement(base: string, rawSql: string): DropViewStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(/^DROP\s+VIEW\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+
+  if (!match) {
+    if (/^DROP\s+VIEW\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "DROP VIEW requires syntax: DROP VIEW [IF EXISTS] <name>",
+        token: "VIEW",
+      });
+    }
+    return null;
+  }
+
+  return {
+    kind: "drop_view",
+    ifExists: !!match[1],
+    viewName: match[2]!,
+    rawSql,
+  };
+}
+
 export type ParseSqlToAstOptions = {
   dialect?: SqlDialectProfile;
 };
@@ -872,11 +942,17 @@ export function parseSqlToAst(
   const dropIndex = parseDropIndexStatement(base, sql);
   if (dropIndex) return dropIndex;
 
+  const createView = parseCreateViewStatement(base, sql, dialect);
+  if (createView) return createView;
+
+  const dropView = parseDropViewStatement(base, sql);
+  if (dropView) return dropView;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
       message:
-        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
+        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }

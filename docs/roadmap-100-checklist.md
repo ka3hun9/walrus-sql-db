@@ -40,7 +40,7 @@
 
 ## P3-D. 视图系统（只读视图）
 
-- [ ] P3-VIEW-001 `CREATE VIEW` / `DROP VIEW` 语法与 catalog 元数据
+- [x] P3-VIEW-001 `CREATE VIEW` / `DROP VIEW` 语法与 catalog 元数据
 - [ ] P3-VIEW-002 视图展开（query rewrite）与列映射一致性
 - [ ] P3-VIEW-003 对视图执行 `SELECT`（含过滤、排序、聚合、连接）
 - [ ] P3-VIEW-004 视图依赖分析与失效检测（底表/列变更）

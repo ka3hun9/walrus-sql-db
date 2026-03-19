@@ -43,7 +43,9 @@ import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import type {
   CreateIndexStatementAst,
+  CreateViewStatementAst,
   DropIndexStatementAst,
+  DropViewStatementAst,
   ExprAst,
   SelectStatementAst,
   SqlTransactionAction,
@@ -60,6 +62,7 @@ import {
   type IndexCatalogEntry,
   type SqlTypeName,
   type TableSchema,
+  type ViewCatalogEntry,
 } from "./sql-catalog.js";
 
 type CompareOp =
@@ -546,6 +549,7 @@ export class WalrusSqlClient {
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
+  private readonly viewCatalog = new Map<string, ViewCatalogEntry>();
   private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
   private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly btreeIndexes = new Map<string, BtreeRuntimeIndexMap>();
@@ -2518,6 +2522,14 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getViewCatalog(viewName?: string): ViewCatalogEntry[] {
+    const out = [...this.viewCatalog.values()]
+      .filter((entry) => (viewName ? entry.name.toUpperCase() === viewName.toUpperCase() : true))
+      .map((entry) => ({ ...entry }));
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }
+
   getStorageWriteLog(table?: string): StorageWriteEvent[] {
     const events = table ? this.storageWriteLog.filter((evt) => evt.table === table) : this.storageWriteLog;
     return events.map((evt) => ({ ...evt }));
@@ -2925,6 +2937,18 @@ export class WalrusSqlClient {
       };
     }
 
+    if (upper.startsWith("CREATE VIEW")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_view") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      this.executeCreateViewStatement(ast);
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
     if (upper.startsWith("DROP INDEX")) {
       const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
       if (ast.kind !== "drop_index") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
@@ -2937,6 +2961,18 @@ export class WalrusSqlClient {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
         affectedRows: table ? 1 : 0,
+      };
+    }
+
+    if (upper.startsWith("DROP VIEW")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_view") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const viewName = this.executeDropViewStatement(ast);
+      if (viewName) this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: viewName ? 1 : 0,
       };
     }
 
@@ -6400,6 +6436,10 @@ export class WalrusSqlClient {
     return name.trim().toUpperCase();
   }
 
+  private normalizeViewName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
   private pruneInvalidIndexesForTable(table: string): void {
     const schema = this.schemas.get(table);
     if (!schema) return;
@@ -6445,6 +6485,20 @@ export class WalrusSqlClient {
     return table;
   }
 
+  private executeCreateViewStatement(ast: CreateViewStatementAst): string {
+    const viewName = this.normalizeViewName(ast.viewName);
+    if (this.viewCatalog.has(viewName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `view already exists: ${ast.viewName}`);
+    }
+
+    this.viewCatalog.set(viewName, {
+      name: viewName,
+      querySql: ast.querySql,
+      status: "ACTIVE",
+    });
+    return viewName;
+  }
+
   private executeDropIndexStatement(ast: DropIndexStatementAst): string | null {
     const indexName = this.normalizeIndexName(ast.indexName);
     const entry = this.indexCatalog.get(indexName);
@@ -6461,6 +6515,18 @@ export class WalrusSqlClient {
     this.indexCatalog.delete(indexName);
     this.rebuildSecondaryIndexesForTable(entry.table);
     return entry.table;
+  }
+
+  private executeDropViewStatement(ast: DropViewStatementAst): string | null {
+    const viewName = this.normalizeViewName(ast.viewName);
+    const entry = this.viewCatalog.get(viewName);
+    if (!entry) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `view not found: ${ast.viewName}`);
+    }
+
+    this.viewCatalog.delete(viewName);
+    return entry.name;
   }
 
   private rebuildSecondaryIndexesForTable(table: string): void {

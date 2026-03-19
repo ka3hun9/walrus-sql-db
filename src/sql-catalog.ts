@@ -37,6 +37,7 @@ export type TableSchema = {
 
 export type IndexCatalogType = "HASH" | "BTREE";
 export type IndexCatalogStatus = "ACTIVE" | "BUILDING" | "DROPPED";
+export type ViewCatalogStatus = "ACTIVE";
 
 export type IndexCatalogEntry = {
   name: string;
@@ -45,6 +46,12 @@ export type IndexCatalogEntry = {
   type: IndexCatalogType;
   unique: boolean;
   status: IndexCatalogStatus;
+};
+
+export type ViewCatalogEntry = {
+  name: string;
+  querySql: string;
+  status: ViewCatalogStatus;
 };
 
 export type ConstraintIndexCostStats = {
