@@ -19,3 +19,4 @@ Validated index consistency after durability recovery paths that combine version
 ## Validation
 
 - Unit: `test/unit-p3-idx-007-index-replay-recovery-consistency.ts`
+- Validation log (2026-03-19): `reports/p3-idx-007-validation.log`
