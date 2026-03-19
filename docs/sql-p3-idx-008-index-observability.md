@@ -30,3 +30,5 @@ Added index observability metrics for lookup hit/miss, maintenance cost, and fai
 ## Validation
 
 - Unit: `test/unit-p3-idx-008-index-observability-metrics.ts`
+- Regression: `test/unit-p3-idx-007-index-replay-recovery-consistency.ts`
+- Validation log (2026-03-19): `reports/p3-idx-008-validation.log`
