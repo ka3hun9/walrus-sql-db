@@ -503,6 +503,10 @@ const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
 const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
 const BAD_PLAN_FALLBACK_COOLDOWN = 3;
 const OPTIMIZER_HISTOGRAM_MAX_BUCKETS = 8;
+const DEFAULT_PREDICATE_SELECTIVITY = 0.25;
+const DEFAULT_EQUALITY_SELECTIVITY = 0.1;
+const DEFAULT_RANGE_SELECTIVITY = 1 / 3;
+const DEFAULT_LIKE_SELECTIVITY = 0.2;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
@@ -3271,21 +3275,22 @@ export class WalrusSqlClient {
     parsed: ParsedSelect,
     tableRows: number,
     method: PhysicalAccessPathMethod,
+    scannedRows: number,
     estimatedRows: number,
     orderSatisfied: boolean,
   ): number {
-    let cost = estimatedRows;
+    let cost = Math.max(1, scannedRows);
     const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
     const hasOrder = Boolean(parsed.orderByList?.length);
 
     if (hasPredicate) {
-      cost += Math.max(1, Math.ceil(estimatedRows * 0.35));
+      cost += Math.max(1, Math.ceil(scannedRows * 0.15));
     }
     if (!orderSatisfied) {
-      cost += this.estimateSortWork(estimatedRows, parsed.orderByList?.length ?? 0);
+      cost += this.estimateSortWork(Math.max(1, estimatedRows), parsed.orderByList?.length ?? 0);
     }
     if (parsed.groupBy?.length || parsed.aggregate || parsed.having || parsed.rowNumberAlias) {
-      cost += Math.max(1, Math.ceil(estimatedRows * 0.5));
+      cost += Math.max(1, Math.ceil(Math.max(1, estimatedRows) * 0.5));
     }
 
     switch (method) {
@@ -3409,6 +3414,7 @@ export class WalrusSqlClient {
   private shouldTriggerBadPlanFallback(
     parsed: ParsedSelect,
     chosen: PhysicalSelectAccessPath,
+    scannedRows: number,
     tableRows: number,
     resultRows: number,
   ): boolean {
@@ -3419,11 +3425,11 @@ export class WalrusSqlClient {
     const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
     if (!hasPredicate) return false;
 
-    const scannedRows = Math.max(1, chosen.estimatedRows);
-    const scanRatio = scannedRows / Math.max(1, tableRows);
+    const normalizedScannedRows = Math.max(1, scannedRows);
+    const scanRatio = normalizedScannedRows / Math.max(1, tableRows);
     if (scanRatio < BAD_PLAN_FALLBACK_SCAN_RATIO) return false;
 
-    const rowRetention = resultRows / scannedRows;
+    const rowRetention = resultRows / normalizedScannedRows;
     if (rowRetention < BAD_PLAN_FALLBACK_RESULT_RATIO) return false;
     return true;
   }
@@ -3456,7 +3462,7 @@ export class WalrusSqlClient {
       state.badPlanFallbackRemaining = Math.max(0, state.badPlanFallbackRemaining - 1);
     }
 
-    if (this.shouldTriggerBadPlanFallback(parsed, chosen, tableRows, resultRows)) {
+    if (this.shouldTriggerBadPlanFallback(parsed, chosen, plan.scannedRows.length, tableRows, resultRows)) {
       state.badPlanFallbackCount += 1;
       state.badPlanFallbackRemaining = Math.max(state.badPlanFallbackRemaining, BAD_PLAN_FALLBACK_COOLDOWN);
       state.preferredMethod = "TABLE_SCAN";
@@ -3591,6 +3597,354 @@ export class WalrusSqlClient {
       if (hit) return hit;
     }
     return undefined;
+  }
+
+  private clampSelectivity(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    if (value <= 0) return 0;
+    if (value >= 1) return 1;
+    return value;
+  }
+
+  private parseSelectivityLiteral(
+    rawExpr: string,
+  ): { parsed: false; value: undefined } | { parsed: true; value: SqlPrimitive } {
+    const trimmed = rawExpr.trim();
+    if (!trimmed) return { parsed: false, value: undefined };
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return { parsed: false, value: undefined };
+
+    const isQuoted = (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      || (trimmed.startsWith("\"") && trimmed.endsWith("\""));
+    const isSimpleNumber = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed);
+    const isSimpleBooleanOrNull = /^(TRUE|FALSE|NULL)$/i.test(trimmed);
+    if (!isQuoted && !isSimpleNumber && !isSimpleBooleanOrNull) {
+      return { parsed: false, value: undefined };
+    }
+
+    return { parsed: true, value: this.castValue(trimmed) as SqlPrimitive };
+  }
+
+  private resolveSelectivityColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    clause: WhereClause,
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats) return undefined;
+
+    if (clause.valueExpr && !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(clause.valueExpr.trim())) {
+      return undefined;
+    }
+
+    const rawField = clause.field?.trim();
+    if (!rawField || !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(rawField)) return undefined;
+    const normalized = rawField.includes(".") ? rawField.split(".").at(-1) ?? rawField : rawField;
+    return stats.columns.find((columnStats) => columnStats.column.toUpperCase() === normalized.toUpperCase());
+  }
+
+  private estimateEqualitySelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literal: SqlPrimitive,
+  ): number {
+    if (literal === null || literal === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (!columnStats) return this.clampSelectivity(nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY);
+
+    if (tableRowCount > 0 && columnStats.histogram.length > 0) {
+      for (const bucket of columnStats.histogram) {
+        const geLower = this.compareByOp(literal, bucket.lowerBound, ">=");
+        const leUpper = this.compareByOp(literal, bucket.upperBound, "<=");
+        if (geLower !== "TRUE" || leUpper !== "TRUE") continue;
+
+        const bucketRatio = this.clampSelectivity(bucket.rowCount / tableRowCount);
+        if (bucket.ndv > 0) return this.clampSelectivity(bucketRatio / bucket.ndv);
+        break;
+      }
+    }
+
+    if (columnStats.ndv > 0) return this.clampSelectivity(nonNullRatio / columnStats.ndv);
+    return this.clampSelectivity(nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY);
+  }
+
+  private estimateLessThanSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literal: SqlPrimitive,
+    inclusive: boolean,
+  ): number {
+    if (literal === null || literal === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (!columnStats) return this.clampSelectivity(nonNullRatio * DEFAULT_RANGE_SELECTIVITY);
+    if (tableRowCount <= 0 || columnStats.histogram.length === 0) {
+      return this.clampSelectivity(nonNullRatio * DEFAULT_RANGE_SELECTIVITY);
+    }
+
+    let matchedRatio = 0;
+    for (const bucket of columnStats.histogram) {
+      const bucketRatio = this.clampSelectivity(bucket.rowCount / tableRowCount);
+      const fullyMatched = this.compareByOp(bucket.upperBound, literal, inclusive ? "<=" : "<");
+      if (fullyMatched === "TRUE") {
+        matchedRatio += bucketRatio;
+        continue;
+      }
+
+      const noMatch = this.compareByOp(bucket.lowerBound, literal, inclusive ? ">" : ">=");
+      if (noMatch === "TRUE") continue;
+
+      matchedRatio += bucketRatio * 0.5;
+    }
+    return this.clampSelectivity(Math.min(nonNullRatio, matchedRatio));
+  }
+
+  private estimateComparisonSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    op: ComparePredicate,
+    literal: SqlPrimitive,
+  ): number {
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+
+    if (literal === null || literal === undefined) return 0;
+
+    switch (op) {
+      case "=":
+        return this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+      case "!=":
+      case "<>": {
+        const eq = this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+        return this.clampSelectivity(nonNullRatio - eq);
+      }
+      case "<":
+        return this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, false);
+      case "<=":
+        return this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, true);
+      case ">": {
+        const le = this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, true);
+        return this.clampSelectivity(nonNullRatio - le);
+      }
+      case ">=": {
+        const lt = this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, false);
+        return this.clampSelectivity(nonNullRatio - lt);
+      }
+      default:
+        return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+    }
+  }
+
+  private estimateInListSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literals: SqlPrimitive[],
+    unresolvedValueCount = 0,
+  ): number {
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (literals.length === 0 && unresolvedValueCount <= 0) return 0;
+
+    const unique = new Set<string>();
+    let matched = 0;
+    for (const literal of literals) {
+      if (literal === null || literal === undefined) continue;
+      const key = this.encodeTypedKey(literal, "optimizer.selectivity.in");
+      if (unique.has(key)) continue;
+      unique.add(key);
+      matched += this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+    }
+    if (unresolvedValueCount > 0) {
+      matched += nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY * unresolvedValueCount;
+    }
+    return this.clampSelectivity(Math.min(nonNullRatio, matched));
+  }
+
+  private estimateLikeSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    rawPattern: SqlPrimitive,
+  ): number {
+    if (rawPattern === null || rawPattern === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    const pattern = String(rawPattern);
+
+    if (!pattern.includes("%") && !pattern.includes("_")) {
+      return this.estimateEqualitySelectivity(tableRowCount, columnStats, pattern);
+    }
+
+    if (/^[^%_]+%$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.1);
+    if (/^%[^%_]+$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.12);
+    if (/^%[^%_]+%$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.25);
+    if (pattern.includes("_")) return this.clampSelectivity(nonNullRatio * 0.2);
+    return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+  }
+
+  private estimateClauseSelectivity(
+    clause: WhereClause,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    const columnStats = this.resolveSelectivityColumnStats(stats, clause);
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+
+    switch (clause.op) {
+      case "IS_NULL":
+        return columnStats ? this.clampSelectivity(columnStats.nullRatio) : 0.1;
+      case "IS_NOT_NULL":
+        return columnStats ? nonNullRatio : 0.9;
+      case "=":
+      case "!=":
+      case "<>":
+      case ">":
+      case "<":
+      case ">=":
+      case "<=": {
+        const raw = clause.valueExprs?.[0];
+        if (!raw) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        const parsedLiteral = this.parseSelectivityLiteral(raw);
+        if (!parsedLiteral.parsed) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        return this.estimateComparisonSelectivity(
+          tableRowCount,
+          columnStats,
+          clause.op as ComparePredicate,
+          parsedLiteral.value as SqlPrimitive,
+        );
+      }
+      case "BETWEEN":
+      case "NOT_BETWEEN": {
+        const lowerRaw = clause.valueExprs?.[0];
+        const upperRaw = clause.valueExprs?.[1];
+        if (!lowerRaw || !upperRaw) return this.clampSelectivity(DEFAULT_RANGE_SELECTIVITY * nonNullRatio);
+
+        const lower = this.parseSelectivityLiteral(lowerRaw);
+        const upper = this.parseSelectivityLiteral(upperRaw);
+        if (!lower.parsed || !upper.parsed) return this.clampSelectivity(DEFAULT_RANGE_SELECTIVITY * nonNullRatio);
+        if (lower.value === null || upper.value === null) return 0;
+        const lowerValue = lower.value;
+        const upperValue = upper.value;
+
+        const invalidRange = this.compareByOp(lowerValue, upperValue, ">") === "TRUE";
+        const between = invalidRange
+          ? 0
+          : this.clampSelectivity(
+            this.estimateLessThanSelectivity(tableRowCount, columnStats, upperValue, true)
+            - this.estimateLessThanSelectivity(tableRowCount, columnStats, lowerValue, false),
+          );
+
+        if (clause.op === "BETWEEN") return between;
+        return this.clampSelectivity(nonNullRatio - between);
+      }
+      case "IN":
+      case "NOT_IN": {
+        const literals: SqlPrimitive[] = [];
+        let unresolvedValueCount = 0;
+        let hasNullLiteral = false;
+
+        if (clause.valueExprs?.length) {
+          for (const expr of clause.valueExprs) {
+            const parsedLiteral = this.parseSelectivityLiteral(expr);
+            if (!parsedLiteral.parsed) {
+              unresolvedValueCount += 1;
+              continue;
+            }
+            const literal = parsedLiteral.value as SqlPrimitive;
+            literals.push(literal);
+            if (literal === null) hasNullLiteral = true;
+          }
+        } else if (clause.values?.length) {
+          for (const literal of clause.values) {
+            const v = literal as SqlPrimitive;
+            literals.push(v);
+            if (v === null) hasNullLiteral = true;
+          }
+        }
+
+        const inSelectivity = this.estimateInListSelectivity(tableRowCount, columnStats, literals, unresolvedValueCount);
+        if (clause.op === "IN") return inSelectivity;
+        if (hasNullLiteral) return 0;
+        const base = this.clampSelectivity(nonNullRatio - inSelectivity);
+        return unresolvedValueCount > 0 ? this.clampSelectivity(base * 0.5) : base;
+      }
+      case "LIKE":
+      case "NOT_LIKE": {
+        const patternRaw = clause.valueExprs?.[0];
+        if (!patternRaw) return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+        const parsedPattern = this.parseSelectivityLiteral(patternRaw);
+        if (!parsedPattern.parsed) return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+        const like = this.estimateLikeSelectivity(tableRowCount, columnStats, parsedPattern.value as SqlPrimitive);
+        if (clause.op === "LIKE") return like;
+        return this.clampSelectivity(nonNullRatio - like);
+      }
+      case "IS_DISTINCT_FROM":
+      case "IS_NOT_DISTINCT_FROM": {
+        const rightRaw = clause.valueExprs?.[0];
+        if (!rightRaw) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        const parsedLiteral = this.parseSelectivityLiteral(rightRaw);
+        if (!parsedLiteral.parsed) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+
+        let isNotDistinct = 0;
+        if (parsedLiteral.value === null || parsedLiteral.value === undefined) {
+          isNotDistinct = columnStats ? this.clampSelectivity(columnStats.nullRatio) : 0.1;
+        } else {
+          isNotDistinct = this.estimateEqualitySelectivity(tableRowCount, columnStats, parsedLiteral.value as SqlPrimitive);
+        }
+        if (clause.op === "IS_NOT_DISTINCT_FROM") return isNotDistinct;
+        return this.clampSelectivity(1 - isNotDistinct);
+      }
+      default:
+        return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+    }
+  }
+
+  private estimateWhereTreeSelectivity(
+    node: WhereExprNode,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    if (node.type === "clause") return this.estimateClauseSelectivity(node.clause, tableRowCount, stats);
+    if (node.type === "not") return this.clampSelectivity(1 - this.estimateWhereTreeSelectivity(node.node, tableRowCount, stats));
+
+    const left = this.estimateWhereTreeSelectivity(node.left, tableRowCount, stats);
+    const right = this.estimateWhereTreeSelectivity(node.right, tableRowCount, stats);
+    if (node.type === "and") return this.clampSelectivity(left * right);
+    return this.clampSelectivity(left + right - left * right);
+  }
+
+  private estimateWhereClausesSelectivity(
+    whereClauses: WhereClause[],
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    let acc: number | null = null;
+    for (const clause of whereClauses) {
+      const clauseSelectivity = this.estimateClauseSelectivity(clause, tableRowCount, stats);
+      if (acc === null) {
+        acc = clauseSelectivity;
+        continue;
+      }
+      if (clause.logic === "OR") {
+        acc = this.clampSelectivity(acc + clauseSelectivity - acc * clauseSelectivity);
+      } else {
+        acc = this.clampSelectivity(acc * clauseSelectivity);
+      }
+    }
+    return this.clampSelectivity(acc ?? 1);
+  }
+
+  private estimatePredicateSelectivity(
+    parsed: Pick<ParsedSelect, "whereAst" | "whereTree" | "whereClauses">,
+    stats: OptimizerTableStatistics | undefined,
+    tableRowCount: number,
+  ): number {
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    if (!hasPredicate) return 1;
+    if (parsed.whereTree) return this.estimateWhereTreeSelectivity(parsed.whereTree, tableRowCount, stats);
+    if (parsed.whereClauses.length > 0) return this.estimateWhereClausesSelectivity(parsed.whereClauses, tableRowCount, stats);
+    return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
   }
 
   private getPersistedOptimizerStatistics(table?: string, options?: OptimizerStatisticsReadOptions): OptimizerTableStatistics[] {
@@ -3819,6 +4173,11 @@ export class WalrusSqlClient {
     const canUseSingleTableIndexes = logicalPlan.joins.length === 0;
     const optimizerStats = this.getOptimizerStatistics(parsed.table)[0];
     const tableRowCount = optimizerStats?.rowCount ?? bucket.length;
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    const predicateSelectivity = this.estimatePredicateSelectivity(parsed, optimizerStats, tableRowCount);
+    const estimatedFilteredRows = hasPredicate
+      ? Math.max(0, Math.min(tableRowCount, Math.ceil(tableRowCount * predicateSelectivity)))
+      : tableRowCount;
 
     if (canUseSingleTableIndexes && (opts?.refreshIndexes ?? true)) {
       this.rebuildSecondaryIndexesForTable(parsed.table);
@@ -3832,11 +4191,13 @@ export class WalrusSqlClient {
       indexName?: string,
       indexColumn?: string,
     ): void => {
-      const estimatedRows = rows.length;
+      const scannedRows = method === "TABLE_SCAN" ? tableRowCount : rows.length;
+      const estimatedRows = hasPredicate ? Math.min(scannedRows, estimatedFilteredRows) : scannedRows;
       const estimatedCost = this.estimatePhysicalAccessPathCost(
         parsed,
         tableRowCount,
         method,
+        scannedRows,
         estimatedRows,
         orderSatisfied,
       );
@@ -4010,6 +4371,11 @@ export class WalrusSqlClient {
       const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
       const explainStats = this.getOptimizerStatistics(parsed.table)[0];
       const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
+      const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+      const explainTableRows = explainStats?.rowCount ?? explainBucket.length;
+      const predicateSelectivity = hasPredicate
+        ? this.estimatePredicateSelectivity(parsed, explainStats, explainTableRows)
+        : 1;
       return this.buildQueryResult(normalizedSql, [
         {
           type: "EXPLAIN",
@@ -4044,12 +4410,14 @@ export class WalrusSqlClient {
           physicalPlanExecutions: explainStability?.executions ?? 0,
           physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
           statsAnalyzedAt: explainStats?.analyzedAt ?? null,
-          statsTableRowCount: explainStats?.rowCount ?? explainBucket.length,
+          statsTableRowCount: explainTableRows,
           statsColumnCount: explainStats?.columns.length ?? 0,
           statsPredicateColumn: predicateStats?.column ?? null,
           statsPredicateNdv: predicateStats?.ndv ?? null,
           statsPredicateNullRatio: predicateStats?.nullRatio ?? null,
           statsPredicateHistogramBuckets: predicateStats?.histogram.length ?? null,
+          statsPredicateSelectivity: hasPredicate ? predicateSelectivity : null,
+          statsPredicateEstimatedRows: hasPredicate ? Math.ceil(explainTableRows * predicateSelectivity) : null,
         },
       ]);
     }
