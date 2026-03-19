@@ -1587,6 +1587,56 @@ export class WalrusSqlClient {
     }
   }
 
+  private cloneIndexCatalogEntry(entry: IndexCatalogEntry): IndexCatalogEntry {
+    return {
+      name: entry.name,
+      table: entry.table,
+      columns: [...entry.columns],
+      type: entry.type,
+      unique: entry.unique,
+      status: entry.status,
+    };
+  }
+
+  private pickIndexVersionObject(
+    indexName: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): IndexVersionedStorageObject | undefined {
+    const normalized = this.normalizeIndexName(indexName);
+    const history = this.indexVersionObjects.get(normalized) ?? [];
+    if (history.length === 0) return undefined;
+
+    if (options?.version !== undefined) {
+      return history.find((object) => object.currentVersion === options.version);
+    }
+
+    const visibility = options?.visibility ?? "pending";
+    if (visibility === "pending") return history[history.length - 1];
+    return [...history].reverse().find((object) => object.confirmationStatus === "confirmed");
+  }
+
+  private buildSnapshotIndexCatalog(visibility: "pending" | "confirmed"): Map<string, IndexCatalogEntry> {
+    const snapshot = new Map<string, IndexCatalogEntry>();
+    for (const [indexName, entry] of this.indexCatalog.entries()) {
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+      if (entry.type !== "HASH" && entry.type !== "BTREE") continue;
+
+      const history = this.indexVersionObjects.get(indexName) ?? [];
+      const selected = this.pickIndexVersionObject(indexName, { visibility });
+
+      if (history.length > 0 && !selected) continue;
+      if (selected) {
+        if (selected.table.toUpperCase() !== entry.table.toUpperCase()) continue;
+        if (selected.indexType !== entry.type) continue;
+        if (selected.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) continue;
+      }
+
+      snapshot.set(indexName, this.cloneIndexCatalogEntry(entry));
+    }
+    return snapshot;
+  }
+
   private buildLatestCommittedSnapshotTables(visibility: "pending" | "confirmed"): Map<string, SqlRow[]> {
     const snapshot = new Map<string, SqlRow[]>();
     const allTables = new Set<string>([...this.tables.keys(), ...this.tableVersionObjects.keys()]);
@@ -1608,7 +1658,23 @@ export class WalrusSqlClient {
     return snapshot;
   }
 
-  private async queryAgainstSnapshotTables(sql: string, tables: Map<string, SqlRow[]>): Promise<QueryResult> {
+  private buildQueryByConfirmationSnapshot(visibility: "pending" | "confirmed"): {
+    tables: Map<string, SqlRow[]>;
+    indexCatalog: Map<string, IndexCatalogEntry>;
+  } {
+    return {
+      tables: this.buildLatestCommittedSnapshotTables(visibility),
+      indexCatalog: this.buildSnapshotIndexCatalog(visibility),
+    };
+  }
+
+  private async queryAgainstSnapshotTables(
+    sql: string,
+    snapshot: {
+      tables: Map<string, SqlRow[]>;
+      indexCatalog: Map<string, IndexCatalogEntry>;
+    },
+  ): Promise<QueryResult> {
     const snapshotClient = new WalrusSqlClient({
       ...this.opts,
       mode: "simulator",
@@ -1622,6 +1688,11 @@ export class WalrusSqlClient {
     const internals = snapshotClient as unknown as {
       tables: Map<string, SqlRow[]>;
       schemas: Map<string, TableSchema>;
+      indexCatalog: Map<string, IndexCatalogEntry>;
+      hashIndexes: Map<string, Map<string, Map<string, Set<SqlRow>>>>;
+      hashIndexStats: Map<string, { keys: number; rowsIndexed: number }>;
+      btreeIndexes: Map<string, BtreeRuntimeIndexMap>;
+      btreeIndexStats: Map<string, { keys: number; rowsIndexed: number }>;
       uniqueIndexes: Map<string, Map<string, Map<string, SqlRow>>>;
       uniqueGroupsCache: Map<string, string[][]>;
       constraintCost: Map<string, ConstraintIndexCostStats>;
@@ -1632,12 +1703,20 @@ export class WalrusSqlClient {
     };
 
     internals.tables.clear();
-    for (const [table, rows] of tables.entries()) {
+    for (const [table, rows] of snapshot.tables.entries()) {
       internals.tables.set(table, rows);
     }
 
     internals.schemas.clear();
     for (const [table, schema] of this.schemas.entries()) internals.schemas.set(table, schema);
+    internals.indexCatalog.clear();
+    for (const [indexName, entry] of snapshot.indexCatalog.entries()) {
+      internals.indexCatalog.set(indexName, this.cloneIndexCatalogEntry(entry));
+    }
+    internals.hashIndexes.clear();
+    internals.hashIndexStats.clear();
+    internals.btreeIndexes.clear();
+    internals.btreeIndexStats.clear();
     internals.uniqueIndexes.clear();
     internals.uniqueGroupsCache.clear();
     internals.constraintCost.clear();
@@ -1645,6 +1724,13 @@ export class WalrusSqlClient {
     internals.tableVersionObjects.clear();
     internals.indexVersionObjects.clear();
     internals.optimizerStatsVersionObjects.clear();
+
+    const indexedTables = new Set<string>();
+    for (const entry of snapshot.indexCatalog.values()) indexedTables.add(entry.table);
+    const snapshotRuntime = snapshotClient as unknown as {
+      rebuildSecondaryIndexesForTable: (table: string) => void;
+    };
+    for (const table of indexedTables.values()) snapshotRuntime.rebuildSecondaryIndexesForTable(table);
 
     return snapshotClient.query(sql);
   }
@@ -1654,7 +1740,7 @@ export class WalrusSqlClient {
   }
 
   async queryByConfirmation(sql: string, visibility: "pending" | "confirmed" = "confirmed"): Promise<QueryResult> {
-    const snapshot = this.buildLatestCommittedSnapshotTables(visibility);
+    const snapshot = this.buildQueryByConfirmationSnapshot(visibility);
     return this.queryAgainstSnapshotTables(sql, snapshot);
   }
 

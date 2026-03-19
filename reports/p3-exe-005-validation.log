@@ -1,0 +1,42 @@
+﻿[P3-EXE-005 validation] 2026-03-20 06:16:53 +08:00
+
+
+$ npm run build
+
+
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+
+
+$ npx tsx test/unit-p3-exe-005-onchain-replay-index-consistent-read-strategy.ts
+
+
+ok: P3-EXE-005 onchain/replay read path index-consistent visibility strategy
+
+
+$ npx tsx test/unit-p3-exe-001-index-scan-executor.ts
+
+
+ok: P3-EXE-001 index scan executor (equality/range/prefix)
+
+
+$ npx tsx test/unit-g-stor-015-pending-confirmed-read-strategy.ts
+
+
+ok: G-STOR-015 pending/confirmed read strategy
+
+
+Validation finished successfully.
+
+$ npx tsx test/unit-g-stor-014-query-latest-committed-version.ts
+
+
+ok: G-STOR-014 query latest committed version
+
+Validation finished successfully.
