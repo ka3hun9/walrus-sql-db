@@ -41,7 +41,7 @@
 ## P3-D. 视图系统（只读视图）
 
 - [x] P3-VIEW-001 `CREATE VIEW` / `DROP VIEW` 语法与 catalog 元数据
-- [ ] P3-VIEW-002 视图展开（query rewrite）与列映射一致性
+- [x] P3-VIEW-002 视图展开（query rewrite）与列映射一致性 [validated: 2026-03-20]
 - [x] P3-VIEW-003 对视图执行 `SELECT`（含过滤、排序、聚合、连接）
 - [x] P3-VIEW-004 视图依赖分析与失效检测（底表/列变更）
 - [x] P3-VIEW-005 视图权限/命名冲突基础策略（最小可控）

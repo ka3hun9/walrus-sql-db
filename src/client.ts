@@ -2769,10 +2769,46 @@ export class WalrusSqlClient {
     this.activeViewResolutionStack.push(viewName);
     try {
       const result = await this.query(viewEntry.querySql);
-      return this.deepCloneRows(result.rows);
+      return this.normalizeMaterializedViewRows(result.rows);
     } finally {
       this.activeViewResolutionStack.pop();
     }
+  }
+
+  private normalizeMaterializedViewRows(rows: SqlRow[]): SqlRow[] {
+    return rows.map((row) => {
+      const out: SqlRow = {};
+      const usedKeys = new Set<string>();
+      for (const [column, value] of Object.entries(row)) {
+        const mapped = this.normalizeMaterializedViewColumnName(column, usedKeys);
+        out[mapped] = value as SqlPrimitive;
+      }
+      return out;
+    });
+  }
+
+  private normalizeMaterializedViewColumnName(column: string, usedKeys: Set<string>): string {
+    const trimmed = column.trim();
+    const leaf = trimmed.includes(".") ? (trimmed.split(".").at(-1) ?? trimmed).trim() : trimmed;
+    const base = leaf || trimmed || "col";
+    const normalizedBase = base.toUpperCase();
+    if (!usedKeys.has(normalizedBase)) {
+      usedKeys.add(normalizedBase);
+      return base;
+    }
+
+    const fallback = trimmed || base;
+    const normalizedFallback = fallback.toUpperCase();
+    if (!usedKeys.has(normalizedFallback)) {
+      usedKeys.add(normalizedFallback);
+      return fallback;
+    }
+
+    let suffix = 2;
+    while (usedKeys.has(`${normalizedFallback}_${suffix}`)) suffix += 1;
+    const deduped = `${fallback}_${suffix}`;
+    usedKeys.add(deduped.toUpperCase());
+    return deduped;
   }
 
   private async materializeSelectViewSources(parsed: ParsedSelect): Promise<string[]> {
@@ -10583,10 +10619,15 @@ export class WalrusSqlClient {
     for (const f of fields) {
       const parsed = this.parseFieldExpr(f);
       const key = parsed.field;
-      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : row[key];
+      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : this.resolveProjectionFieldValue(row, key);
       out[key] = val ?? null;
     }
     return out;
+  }
+
+  private resolveProjectionFieldValue(row: SqlRow, field: string): SqlPrimitive | undefined {
+    if (Object.prototype.hasOwnProperty.call(row, field)) return row[field] as SqlPrimitive;
+    return this.resolveRowValue(row, field);
   }
 
   private makeRowKey(row: SqlRow): string {
