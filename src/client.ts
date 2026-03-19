@@ -583,6 +583,7 @@ export class WalrusSqlClient {
   };
   private writeVersion = 0;
   private subqueryRuntime: SubqueryRuntimeState | null = null;
+  private readonly activeViewResolutionStack: string[] = [];
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -2528,6 +2529,66 @@ export class WalrusSqlClient {
       .map((entry) => ({ ...entry }));
     out.sort((a, b) => a.name.localeCompare(b.name));
     return out;
+  }
+
+  private getSelectJoinSteps(parsed: ParsedSelect): SelectJoinStep[] {
+    if (parsed.joins?.length) return parsed.joins;
+    return parsed.join ? [parsed.join] : [];
+  }
+
+  private collectSelectSourceTables(parsed: ParsedSelect): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (tableName: string): void => {
+      const normalized = tableName.trim();
+      if (!normalized) return;
+      const key = normalized.toUpperCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(normalized);
+    };
+
+    push(parsed.table);
+    for (const join of this.getSelectJoinSteps(parsed)) {
+      push(join.table);
+    }
+    return out;
+  }
+
+  private async materializeViewRows(viewEntry: ViewCatalogEntry): Promise<SqlRow[]> {
+    const viewName = this.normalizeViewName(viewEntry.name);
+    const cycleStart = this.activeViewResolutionStack.indexOf(viewName);
+    if (cycleStart >= 0) {
+      const cyclePath = [...this.activeViewResolutionStack.slice(cycleStart), viewName].join(" -> ");
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `cyclic view reference detected: ${cyclePath}`);
+    }
+
+    this.activeViewResolutionStack.push(viewName);
+    try {
+      const result = await this.query(viewEntry.querySql);
+      return this.deepCloneRows(result.rows);
+    } finally {
+      this.activeViewResolutionStack.pop();
+    }
+  }
+
+  private async materializeSelectViewSources(parsed: ParsedSelect): Promise<string[]> {
+    const materialized: string[] = [];
+    for (const sourceTable of this.collectSelectSourceTables(parsed)) {
+      if (this.tables.has(sourceTable)) continue;
+      const viewEntry = this.viewCatalog.get(this.normalizeViewName(sourceTable));
+      if (!viewEntry) continue;
+      const rows = await this.materializeViewRows(viewEntry);
+      this.tables.set(sourceTable, rows);
+      materialized.push(sourceTable);
+    }
+    return materialized;
+  }
+
+  private cleanupMaterializedSelectViewSources(materializedTableNames: string[]): void {
+    for (let i = materializedTableNames.length - 1; i >= 0; i--) {
+      this.tables.delete(materializedTableNames[i]!);
+    }
   }
 
   getStorageWriteLog(table?: string): StorageWriteEvent[] {
@@ -4858,171 +4919,172 @@ export class WalrusSqlClient {
 
     const parsed = this.parseSelect(normalizedSql, sql);
     const planStabilityKey = parsed.explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "").trim() : normalizedSql;
+    const materializedViewSources = await this.materializeSelectViewSources(parsed);
+    try {
+      if (parsed.explain) {
+        const explainBucket = this.tables.get(parsed.table) ?? [];
+        const explainPlan = this.buildSelectExecutionPlan(parsed, explainBucket, {
+          refreshIndexes: false,
+          trackLookupStats: false,
+          stabilityKey: planStabilityKey,
+        });
+        const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
+        const explainStats = this.getOptimizerStatistics(parsed.table)[0];
+        const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
+        const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+        const explainTableRows = explainStats?.rowCount ?? explainBucket.length;
+        const predicateSelectivity = hasPredicate
+          ? this.estimatePredicateSelectivity(parsed, explainStats, explainTableRows)
+          : 1;
+        return this.buildQueryResult(normalizedSql, [
+          {
+            type: "EXPLAIN",
+            table: parsed.table,
+            where: parsed.where ?? null,
+            groupBy: parsed.groupBy?.join(",") ?? null,
+            aggregate: parsed.aggregate ?? null,
+            orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
+            limit: parsed.limit ?? null,
+            offset: parsed.offset ?? null,
+            mode: this.opts.mode ?? "simulator",
+            join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
+            joins: parsed.joins?.length
+              ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
+              : null,
+            logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
+            logicalPredicateSource: explainPlan.logical.predicateSource,
+            logicalJoinCount: explainPlan.logical.joins.length,
+            logicalJoinReorderApplied: explainPlan.logical.joinReorder.applied,
+            logicalJoinReorderAlgorithm: explainPlan.logical.joinReorder.algorithm,
+            logicalJoinReorderCost: explainPlan.logical.joinReorder.estimatedCost,
+            logicalJoinOrderOriginal: explainPlan.logical.joinReorder.originalJoinOrder.length
+              ? explainPlan.logical.joinReorder.originalJoinOrder.join(" -> ")
+              : null,
+            logicalJoinOrderFinal: explainPlan.logical.joinReorder.finalJoinOrder.length
+              ? explainPlan.logical.joinReorder.finalJoinOrder.join(" -> ")
+              : null,
+            physicalJoinCount: explainPlan.physical.joinAlgorithms.length,
+            physicalJoinAlgorithms: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms.map((step) => step.algorithm).join(" -> ")
+              : null,
+            physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms
+                .map((step, idx) =>
+                  `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost}]`)
+                .join(" ; ")
+              : null,
+            physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
+            physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
+            physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
+            physicalOptimizerEstimatedRows: explainPlan.physical.optimizerChosen.estimatedRows,
+            physicalAccessPath: explainPlan.physical.chosen.method,
+            physicalIndexStrategy: explainPlan.physical.chosen.indexStrategy,
+            physicalCost: explainPlan.physical.chosen.estimatedCost,
+            physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
+            physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
+            physicalStabilityReason: explainPlan.physical.stabilityReason,
+            physicalStabilityPinned: explainPlan.physical.stabilityPinned,
+            physicalBadPlanFallbackRemaining: explainStability?.badPlanFallbackRemaining ?? 0,
+            physicalBadPlanFallbackCount: explainStability?.badPlanFallbackCount ?? 0,
+            physicalStablePinCount: explainStability?.stablePinCount ?? 0,
+            physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
+            physicalPlanExecutions: explainStability?.executions ?? 0,
+            physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
+            statsAnalyzedAt: explainStats?.analyzedAt ?? null,
+            statsTableRowCount: explainTableRows,
+            statsColumnCount: explainStats?.columns.length ?? 0,
+            statsPredicateColumn: predicateStats?.column ?? null,
+            statsPredicateNdv: predicateStats?.ndv ?? null,
+            statsPredicateNullRatio: predicateStats?.nullRatio ?? null,
+            statsPredicateHistogramBuckets: predicateStats?.histogram.length ?? null,
+            statsPredicateSelectivity: hasPredicate ? predicateSelectivity : null,
+            statsPredicateEstimatedRows: hasPredicate ? Math.ceil(explainTableRows * predicateSelectivity) : null,
+          },
+        ]);
+      }
 
-    if (parsed.explain) {
-      const explainBucket = this.tables.get(parsed.table) ?? [];
-      const explainPlan = this.buildSelectExecutionPlan(parsed, explainBucket, {
-        refreshIndexes: false,
-        trackLookupStats: false,
+      if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor && materializedViewSources.length === 0) {
+        const onchain = await this.withWalrusRetry(async () =>
+          this.opts.onchainQueryExecutor!({
+            sql,
+            table: parsed.table,
+            fields: parsed.fields,
+            where: parsed.where,
+            limit: parsed.limit,
+            offset: parsed.offset,
+            orderBy: parsed.orderBy,
+            orderDirection: parsed.orderDirection,
+            orderByList: parsed.orderByList,
+            aggregate: parsed.aggregate,
+            aggregateField: parsed.aggregateField,
+            groupBy: parsed.groupBy,
+            having: parsed.having,
+            explain: parsed.explain,
+            join: parsed.join,
+            joins: parsed.joins,
+          }),
+        );
+        return this.buildQueryResult(normalizedSql, onchain.rows);
+      }
+
+      const bucket = this.requireTable(parsed.table);
+      const selectPlan = this.buildSelectExecutionPlan(parsed, bucket, {
+        refreshIndexes: true,
+        trackLookupStats: true,
         stabilityKey: planStabilityKey,
       });
-      const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
-      const explainStats = this.getOptimizerStatistics(parsed.table)[0];
-      const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
-      const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
-      const explainTableRows = explainStats?.rowCount ?? explainBucket.length;
-      const predicateSelectivity = hasPredicate
-        ? this.estimatePredicateSelectivity(parsed, explainStats, explainTableRows)
-        : 1;
-      return this.buildQueryResult(normalizedSql, [
-        {
-          type: "EXPLAIN",
-          table: parsed.table,
-          where: parsed.where ?? null,
-          groupBy: parsed.groupBy?.join(",") ?? null,
-          aggregate: parsed.aggregate ?? null,
-          orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
-          limit: parsed.limit ?? null,
-          offset: parsed.offset ?? null,
-          mode: this.opts.mode ?? "simulator",
-          join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
-          joins: parsed.joins?.length
-            ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
-            : null,
-          logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
-          logicalPredicateSource: explainPlan.logical.predicateSource,
-          logicalJoinCount: explainPlan.logical.joins.length,
-          logicalJoinReorderApplied: explainPlan.logical.joinReorder.applied,
-          logicalJoinReorderAlgorithm: explainPlan.logical.joinReorder.algorithm,
-          logicalJoinReorderCost: explainPlan.logical.joinReorder.estimatedCost,
-          logicalJoinOrderOriginal: explainPlan.logical.joinReorder.originalJoinOrder.length
-            ? explainPlan.logical.joinReorder.originalJoinOrder.join(" -> ")
-            : null,
-          logicalJoinOrderFinal: explainPlan.logical.joinReorder.finalJoinOrder.length
-            ? explainPlan.logical.joinReorder.finalJoinOrder.join(" -> ")
-            : null,
-          physicalJoinCount: explainPlan.physical.joinAlgorithms.length,
-          physicalJoinAlgorithms: explainPlan.physical.joinAlgorithms.length
-            ? explainPlan.physical.joinAlgorithms.map((step) => step.algorithm).join(" -> ")
-            : null,
-          physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
-            ? explainPlan.physical.joinAlgorithms
-              .map((step, idx) =>
-                `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost}]`)
-              .join(" ; ")
-            : null,
-          physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
-          physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
-          physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
-          physicalOptimizerEstimatedRows: explainPlan.physical.optimizerChosen.estimatedRows,
-          physicalAccessPath: explainPlan.physical.chosen.method,
-          physicalIndexStrategy: explainPlan.physical.chosen.indexStrategy,
-          physicalCost: explainPlan.physical.chosen.estimatedCost,
-          physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
-          physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
-          physicalStabilityReason: explainPlan.physical.stabilityReason,
-          physicalStabilityPinned: explainPlan.physical.stabilityPinned,
-          physicalBadPlanFallbackRemaining: explainStability?.badPlanFallbackRemaining ?? 0,
-          physicalBadPlanFallbackCount: explainStability?.badPlanFallbackCount ?? 0,
-          physicalStablePinCount: explainStability?.stablePinCount ?? 0,
-          physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
-          physicalPlanExecutions: explainStability?.executions ?? 0,
-          physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
-          statsAnalyzedAt: explainStats?.analyzedAt ?? null,
-          statsTableRowCount: explainTableRows,
-          statsColumnCount: explainStats?.columns.length ?? 0,
-          statsPredicateColumn: predicateStats?.column ?? null,
-          statsPredicateNdv: predicateStats?.ndv ?? null,
-          statsPredicateNullRatio: predicateStats?.nullRatio ?? null,
-          statsPredicateHistogramBuckets: predicateStats?.histogram.length ?? null,
-          statsPredicateSelectivity: hasPredicate ? predicateSelectivity : null,
-          statsPredicateEstimatedRows: hasPredicate ? Math.ceil(explainTableRows * predicateSelectivity) : null,
-        },
-      ]);
-    }
 
-    if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor) {
-      const onchain = await this.withWalrusRetry(async () =>
-        this.opts.onchainQueryExecutor!({
-          sql,
-          table: parsed.table,
-          fields: parsed.fields,
-          where: parsed.where,
-          limit: parsed.limit,
-          offset: parsed.offset,
-          orderBy: parsed.orderBy,
-          orderDirection: parsed.orderDirection,
-          orderByList: parsed.orderByList,
-          aggregate: parsed.aggregate,
-          aggregateField: parsed.aggregateField,
-          groupBy: parsed.groupBy,
-          having: parsed.having,
-          explain: parsed.explain,
-          join: parsed.join,
-          joins: parsed.joins,
-        }),
-      );
-      return this.buildQueryResult(normalizedSql, onchain.rows);
-    }
+      const logicalPlan = selectPlan.logical;
+      const baseRows = logicalPlan.joins.length
+        ? logicalPlan.joins.reduce(
+            (acc, joinStep, idx) => this.applyJoin(
+              idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table,
+              acc,
+              joinStep,
+              selectPlan.physical.joinAlgorithms[idx]?.algorithm ?? "NESTED_LOOP",
+            ),
+            selectPlan.scannedRows,
+          )
+        : selectPlan.scannedRows;
 
-    const bucket = this.requireTable(parsed.table);
-    const selectPlan = this.buildSelectExecutionPlan(parsed, bucket, {
-      refreshIndexes: true,
-      trackLookupStats: true,
-      stabilityKey: planStabilityKey,
-    });
+      const filtered = logicalPlan.predicateSource === "AST" && parsed.whereAst
+        ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
+        : logicalPlan.predicateSource === "TREE" && parsed.whereTree
+        ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
+        : logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length
+        ? this.applyWhereClauses(baseRows, parsed.whereClauses)
+        : baseRows;
 
-    const logicalPlan = selectPlan.logical;
-    const baseRows = logicalPlan.joins.length
-      ? logicalPlan.joins.reduce(
-          (acc, joinStep, idx) => this.applyJoin(
-            idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table,
-            acc,
-            joinStep,
-            selectPlan.physical.joinAlgorithms[idx]?.algorithm ?? "NESTED_LOOP",
-          ),
-          selectPlan.scannedRows,
-        )
-      : selectPlan.scannedRows;
+      if (logicalPlan.groupBy?.length) {
+        const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField);
+        const havingRows = parsed.havingAst
+          ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
+          : logicalPlan.having
+          ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(logicalPlan.having!)) === "TRUE")
+          : grouped;
+        const orderedGrouped = this.applyOrder(havingRows, logicalPlan.orderByList);
+        const pagedGrouped = this.applyPage(orderedGrouped, logicalPlan.offset, logicalPlan.limit);
+        const groupedResult = this.buildQueryResult(
+          normalizedSql,
+          pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
+        );
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, groupedResult.rows.length, bucket.length);
+        return groupedResult;
+      }
 
-    const filtered = logicalPlan.predicateSource === "AST" && parsed.whereAst
-      ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
-      : logicalPlan.predicateSource === "TREE" && parsed.whereTree
-      ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
-      : logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length
-      ? this.applyWhereClauses(baseRows, parsed.whereClauses)
-      : baseRows;
+      if (logicalPlan.aggregate) {
+        const aggregateResult = this.buildQueryResult(normalizedSql, [
+          this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField),
+        ]);
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
+        return aggregateResult;
+      }
 
-    if (logicalPlan.groupBy?.length) {
-      const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField);
-      const havingRows = parsed.havingAst
-        ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
-        : logicalPlan.having
-        ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(logicalPlan.having!)) === "TRUE")
-        : grouped;
-      const orderedGrouped = this.applyOrder(havingRows, logicalPlan.orderByList);
-      const pagedGrouped = this.applyPage(orderedGrouped, logicalPlan.offset, logicalPlan.limit);
-      const groupedResult = this.buildQueryResult(
-        normalizedSql,
-        pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
-      );
-      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, groupedResult.rows.length, bucket.length);
-      return groupedResult;
-    }
-
-    if (logicalPlan.aggregate) {
-      const aggregateResult = this.buildQueryResult(normalizedSql, [
-        this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField),
-      ]);
-      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
-      return aggregateResult;
-    }
-
-    const withWindow = logicalPlan.rowNumberAlias
-      ? this.applyRowNumber(filtered, logicalPlan.rowNumberAlias, logicalPlan.rowNumberSpec)
-      : filtered;
-    const ordered = selectPlan.orderSatisfied ? withWindow : this.applyOrder(withWindow, logicalPlan.orderByList);
-    const paged = this.applyPage(ordered, logicalPlan.offset, logicalPlan.limit);
+      const withWindow = logicalPlan.rowNumberAlias
+        ? this.applyRowNumber(filtered, logicalPlan.rowNumberAlias, logicalPlan.rowNumberSpec)
+        : filtered;
+      const ordered = selectPlan.orderSatisfied ? withWindow : this.applyOrder(withWindow, logicalPlan.orderByList);
+      const paged = this.applyPage(ordered, logicalPlan.offset, logicalPlan.limit);
 
       const result = this.buildQueryResult(
         normalizedSql,
@@ -5036,8 +5098,11 @@ export class WalrusSqlClient {
       if (this.logger.level === "debug" && result.rows[0]) {
         successMeta.firstRowTyped = this.toTypedLogRow(result.rows[0], "debug.query.firstRow");
       }
-        this.logger.debug("query success", successMeta);
-        return result;
+      this.logger.debug("query success", successMeta);
+      return result;
+    } finally {
+      this.cleanupMaterializedSelectViewSources(materializedViewSources);
+    }
       } finally {
         this.leaveSubqueryRuntimeScope();
       }
