@@ -1,0 +1,23 @@
+﻿# P3-VIEW-005 validation run 2026-03-20T04:50:17.8171330+08:00
+
+## npm run build
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+
+## npx tsx test/unit-p3-view-001-create-drop-view-catalog-metadata.ts
+ok: P3-VIEW-001 create/drop view parser + catalog metadata
+
+## npx tsx test/unit-p3-view-003-select-on-view.ts
+ok: P3-VIEW-003 select on view with filter/order/aggregate/join
+
+## npx tsx test/unit-p3-view-004-view-dependency-invalidation.ts
+ok: P3-VIEW-004 view dependency analysis and invalidation detection
+
+## npx tsx test/unit-p3-view-005-view-permission-naming-conflict-policy.ts
+ok: P3-VIEW-005 view permission and naming conflict baseline policy

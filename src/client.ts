@@ -160,6 +160,7 @@ const VIEW_DEPENDENCY_KEYWORDS = new Set<string>([
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 
 type ComparePredicate = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=";
+type ViewPolicyAction = "CREATE" | "DROP" | "SELECT";
 
 type WhereClause = {
   logic?: LogicOp;
@@ -2617,6 +2618,7 @@ export class WalrusSqlClient {
 
   private async materializeViewRows(viewEntry: ViewCatalogEntry): Promise<SqlRow[]> {
     const viewName = this.normalizeViewName(viewEntry.name);
+    this.assertViewPermission("SELECT", viewName);
     if (viewEntry.status !== "ACTIVE") {
       const detail = viewEntry.invalidReason
         ? `view is invalid: ${viewEntry.name} (${viewEntry.invalidReason})`
@@ -3019,6 +3021,9 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("CREATE TABLE")) {
       const schema = this.parseCreateTableSchema(normalized);
+      if (this.viewCatalog.has(this.normalizeViewName(schema.name))) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `name conflict with existing view: ${schema.name}`);
+      }
       if (this.tables.has(schema.name) || this.schemas.has(schema.name)) {
         throw sqlError("ERR_UNSUPPORTED_DDL", `table already exists: ${schema.name}`);
       }
@@ -6573,6 +6578,45 @@ export class WalrusSqlClient {
     return name.trim().toUpperCase();
   }
 
+  private hasTableNameConflict(name: string): boolean {
+    const key = name.trim().toUpperCase();
+    if (!key) return false;
+    for (const tableName of this.tables.keys()) {
+      if (tableName.toUpperCase() === key) return true;
+    }
+    for (const schemaName of this.schemas.keys()) {
+      if (schemaName.toUpperCase() === key) return true;
+    }
+    return false;
+  }
+
+  private isViewAllowedByNameList(viewName: string): boolean {
+    const allowed = this.opts.viewPolicy?.allowedViewNames;
+    if (!allowed?.length) return true;
+    const key = this.normalizeViewName(viewName);
+    return allowed.some((candidate) => this.normalizeViewName(candidate) === key);
+  }
+
+  private assertViewPermission(action: ViewPolicyAction, viewName: string): void {
+    const policy = this.opts.viewPolicy;
+    if (!policy) return;
+
+    const allowedByAction = action === "CREATE"
+      ? policy.allowCreate !== false
+      : action === "DROP"
+        ? policy.allowDrop !== false
+        : policy.allowSelect !== false;
+    const viewKey = this.normalizeViewName(viewName);
+    if (!allowedByAction) {
+      const code = action === "SELECT" ? "ERR_UNSUPPORTED_SELECT" : "ERR_UNSUPPORTED_DDL";
+      throw sqlError(code, `${action} VIEW denied by view policy: ${viewKey}`);
+    }
+    if (!this.isViewAllowedByNameList(viewKey)) {
+      const code = action === "SELECT" ? "ERR_UNSUPPORTED_SELECT" : "ERR_UNSUPPORTED_DDL";
+      throw sqlError(code, `${action} VIEW denied by allowed view list: ${viewKey}`);
+    }
+  }
+
   private resolveViewDependencySource(
     sourceToken: string,
     sourceNames: Set<string>,
@@ -6916,6 +6960,10 @@ export class WalrusSqlClient {
 
   private executeCreateViewStatement(ast: CreateViewStatementAst): string {
     const viewName = this.normalizeViewName(ast.viewName);
+    this.assertViewPermission("CREATE", viewName);
+    if (this.hasTableNameConflict(viewName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `name conflict with existing table: ${ast.viewName}`);
+    }
     if (this.viewCatalog.has(viewName)) {
       throw sqlError("ERR_UNSUPPORTED_DDL", `view already exists: ${ast.viewName}`);
     }
@@ -6956,6 +7004,7 @@ export class WalrusSqlClient {
       throw sqlError("ERR_UNSUPPORTED_DDL", `view not found: ${ast.viewName}`);
     }
 
+    this.assertViewPermission("DROP", viewName);
     this.viewCatalog.delete(viewName);
     return entry.name;
   }

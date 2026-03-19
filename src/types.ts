@@ -1338,6 +1338,13 @@ export interface OnchainQueryRequest {
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;
 
+export interface WalrusSqlViewPolicyOptions {
+  allowCreate?: boolean;
+  allowDrop?: boolean;
+  allowSelect?: boolean;
+  allowedViewNames?: string[];
+}
+
 export interface WalrusSqlClientOptions {
   packageId: string;
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
@@ -1371,4 +1378,5 @@ export interface WalrusSqlClientOptions {
     level?: import("./logger.js").LogLevel;
     sink?: import("./logger.js").LogSink;
   };
+  viewPolicy?: WalrusSqlViewPolicyOptions;
 }
