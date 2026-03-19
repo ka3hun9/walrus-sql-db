@@ -324,6 +324,7 @@ type TransactionCommitRuntimeSnapshot = {
   rowVersions: Map<string, Map<string, number>>;
   tableVersionObjects: Map<string, VersionedStorageObject[]>;
   indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
+  optimizerStatsVersionObjects: Map<string, OptimizerStatsVersionedStorageObject[]>;
   indexObservability: Map<string, IndexObservabilityStats>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
@@ -432,6 +433,48 @@ type OptimizerTableStatistics = {
   columns: OptimizerColumnStatistics[];
 };
 
+type OptimizerStatsVersionedStorageObject = {
+  table: string;
+  objectId: string;
+  version: number;
+  prevVersion: number | null;
+  currentVersion: number;
+  commitDigest: string;
+  createdAt: number;
+  analyzedAt: number;
+  confirmationStatus: "pending" | "confirmed";
+  immutable: true;
+  statistics: OptimizerTableStatistics;
+};
+
+type OptimizerStatisticsReadOptions = {
+  source?: "live" | "versioned";
+  visibility?: "pending" | "confirmed";
+  version?: number;
+};
+
+type OptimizerStatisticsVersionDiffColumn = {
+  column: string;
+  rowCountDelta: number;
+  ndvDelta: number;
+  nullCountDelta: number;
+  nullRatioDelta: number;
+  histogramBucketDelta: number;
+  histogramRowCountDelta: number;
+  histogramNdvDelta: number;
+};
+
+type OptimizerStatisticsVersionDiff = {
+  table: string;
+  fromVersion: number;
+  toVersion: number;
+  rowCountDelta: number;
+  analyzedAtDeltaMs: number;
+  addedColumns: string[];
+  removedColumns: string[];
+  changedColumns: OptimizerStatisticsVersionDiffColumn[];
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -482,6 +525,7 @@ export class WalrusSqlClient {
   private readonly rowVersions = new Map<string, Map<string, number>>();
   private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
   private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
+  private readonly optimizerStatsVersionObjects = new Map<string, OptimizerStatsVersionedStorageObject[]>();
   private readonly indexObservability = new Map<string, IndexObservabilityStats>();
   private readonly selectPlanStability = new Map<string, SelectPlanStabilityState>();
   private readonly subqueryExecutionStats = new Map<string, SubqueryExecutionStats>();
@@ -1210,6 +1254,183 @@ export class WalrusSqlClient {
     return this.cloneIndexVersionObject(confirmed);
   }
 
+  private cloneOptimizerHistogramBucket(bucket: OptimizerHistogramBucket): OptimizerHistogramBucket {
+    return {
+      lowerBound: bucket.lowerBound,
+      upperBound: bucket.upperBound,
+      rowCount: bucket.rowCount,
+      ndv: bucket.ndv,
+    };
+  }
+
+  private cloneOptimizerColumnStatistics(column: OptimizerColumnStatistics): OptimizerColumnStatistics {
+    return {
+      column: column.column,
+      rowCount: column.rowCount,
+      ndv: column.ndv,
+      nullCount: column.nullCount,
+      nullRatio: column.nullRatio,
+      histogram: column.histogram.map((bucket) => this.cloneOptimizerHistogramBucket(bucket)),
+    };
+  }
+
+  private cloneOptimizerTableStatistics(stats: OptimizerTableStatistics): OptimizerTableStatistics {
+    return {
+      table: stats.table,
+      rowCount: stats.rowCount,
+      analyzedAt: stats.analyzedAt,
+      columns: stats.columns.map((column) => this.cloneOptimizerColumnStatistics(column)),
+    };
+  }
+
+  private toImmutableOptimizerTableStatistics(stats: OptimizerTableStatistics): OptimizerTableStatistics {
+    const cloned = this.cloneOptimizerTableStatistics(stats);
+    return Object.freeze({
+      table: cloned.table,
+      rowCount: cloned.rowCount,
+      analyzedAt: cloned.analyzedAt,
+      columns: Object.freeze(
+        cloned.columns.map((column) =>
+          Object.freeze({
+            column: column.column,
+            rowCount: column.rowCount,
+            ndv: column.ndv,
+            nullCount: column.nullCount,
+            nullRatio: column.nullRatio,
+            histogram: Object.freeze(
+              column.histogram.map((bucket) =>
+                Object.freeze({
+                  lowerBound: bucket.lowerBound,
+                  upperBound: bucket.upperBound,
+                  rowCount: bucket.rowCount,
+                  ndv: bucket.ndv,
+                }),
+              ),
+            ),
+          }),
+        ),
+      ),
+    }) as OptimizerTableStatistics;
+  }
+
+  private cloneOptimizerStatsVersionObject(
+    object: OptimizerStatsVersionedStorageObject,
+  ): OptimizerStatsVersionedStorageObject {
+    return {
+      ...object,
+      statistics: this.cloneOptimizerTableStatistics(object.statistics),
+    };
+  }
+
+  private recordImmutableOptimizerStatsVersionObject(table: string, options?: { confirmationStatus?: "pending" | "confirmed" }): void {
+    const stats = this.collectOptimizerStatisticsForTable(table);
+    if (!stats) return;
+
+    const history = this.optimizerStatsVersionObjects.get(table) ?? [];
+    const prevVersion = history[history.length - 1]?.currentVersion ?? null;
+    const currentVersion = (prevVersion ?? 0) + 1;
+    const version = currentVersion;
+    const createdAt = Date.now();
+    const statistics = this.toImmutableOptimizerTableStatistics(stats);
+    const commitDigest = createHash("sha256")
+      .update(JSON.stringify({
+        table,
+        prevVersion,
+        currentVersion,
+        createdAt,
+        statistics,
+      }))
+      .digest("hex");
+    const objectId = `0x${commitDigest.slice(0, 40)}`;
+
+    const confirmationStatus = options?.confirmationStatus
+      ?? (this.opts.transactionCommitExecutor ? "pending" as const : "confirmed" as const);
+
+    const object = Object.freeze({
+      table,
+      objectId,
+      version,
+      prevVersion,
+      currentVersion,
+      commitDigest,
+      createdAt,
+      analyzedAt: statistics.analyzedAt,
+      confirmationStatus,
+      immutable: true as const,
+      statistics,
+    }) as OptimizerStatsVersionedStorageObject;
+
+    history.push(object);
+    this.optimizerStatsVersionObjects.set(table, history);
+  }
+
+  private resolveCanonicalOptimizerStatsTableName(table: string): string | null {
+    const canonicalSchemaTable = this.resolveCanonicalTableName(table);
+    if (canonicalSchemaTable) return canonicalSchemaTable;
+
+    const target = table.trim().toUpperCase();
+    if (!target) return null;
+    for (const tableName of this.optimizerStatsVersionObjects.keys()) {
+      if (tableName.toUpperCase() === target) return tableName;
+    }
+    return null;
+  }
+
+  private pickOptimizerStatsVersionObject(
+    table: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): OptimizerStatsVersionedStorageObject | undefined {
+    const history = this.optimizerStatsVersionObjects.get(table) ?? [];
+    if (history.length === 0) return undefined;
+
+    if (options?.version !== undefined) {
+      return history.find((object) => object.currentVersion === options.version);
+    }
+
+    const visibility = options?.visibility ?? "pending";
+    if (visibility === "pending") return history[history.length - 1];
+    return [...history].reverse().find((object) => object.confirmationStatus === "confirmed");
+  }
+
+  getOptimizerStatsVersionObjects(
+    table?: string,
+  ): OptimizerStatsVersionedStorageObject[] | Record<string, OptimizerStatsVersionedStorageObject[]> {
+    if (table) {
+      const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+      if (!canonical) return [];
+      return (this.optimizerStatsVersionObjects.get(canonical) ?? [])
+        .map((object) => this.cloneOptimizerStatsVersionObject(object));
+    }
+
+    const out: Record<string, OptimizerStatsVersionedStorageObject[]> = {};
+    for (const [name, history] of this.optimizerStatsVersionObjects.entries()) {
+      out[name] = history.map((object) => this.cloneOptimizerStatsVersionObject(object));
+    }
+    return out;
+  }
+
+  confirmOptimizerStatsVersionObject(table: string, version?: number): OptimizerStatsVersionedStorageObject | null {
+    const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+    if (!canonical) return null;
+
+    const history = this.optimizerStatsVersionObjects.get(canonical);
+    if (!history || history.length === 0) return null;
+
+    const targetVersion = version ?? history[history.length - 1]!.currentVersion;
+    const idx = history.findIndex((object) => object.currentVersion === targetVersion);
+    if (idx < 0) return null;
+
+    const current = history[idx]!;
+    if (current.confirmationStatus === "confirmed") return this.cloneOptimizerStatsVersionObject(current);
+
+    const confirmed = Object.freeze({
+      ...current,
+      confirmationStatus: "confirmed" as const,
+    }) as OptimizerStatsVersionedStorageObject;
+    history[idx] = confirmed;
+    return this.cloneOptimizerStatsVersionObject(confirmed);
+  }
+
   private pruneIndexVersionObjectsForTable(table: string): void {
     const upper = table.toUpperCase();
     const activeNames = new Set(
@@ -1264,6 +1485,7 @@ export class WalrusSqlClient {
       rowVersions: Map<string, Map<string, number>>;
       tableVersionObjects: Map<string, VersionedStorageObject[]>;
       indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
+      optimizerStatsVersionObjects: Map<string, OptimizerStatsVersionedStorageObject[]>;
     };
 
     internals.tables.clear();
@@ -1279,6 +1501,7 @@ export class WalrusSqlClient {
     internals.rowVersions.clear();
     internals.tableVersionObjects.clear();
     internals.indexVersionObjects.clear();
+    internals.optimizerStatsVersionObjects.clear();
 
     return snapshotClient.query(sql);
   }
@@ -1727,6 +1950,9 @@ export class WalrusSqlClient {
       indexVersionObjects: new Map(
         [...this.indexVersionObjects.entries()].map(([indexName, history]) => [indexName, [...history]] as const),
       ),
+      optimizerStatsVersionObjects: new Map(
+        [...this.optimizerStatsVersionObjects.entries()].map(([table, history]) => [table, [...history]] as const),
+      ),
       indexObservability: new Map(
         [...this.indexObservability.entries()].map(([table, stats]) => [table, { ...stats }] as const),
       ),
@@ -1788,6 +2014,11 @@ export class WalrusSqlClient {
     this.indexVersionObjects.clear();
     for (const [indexName, history] of snapshot.indexVersionObjects.entries()) {
       this.indexVersionObjects.set(indexName, [...history]);
+    }
+
+    this.optimizerStatsVersionObjects.clear();
+    for (const [table, history] of snapshot.optimizerStatsVersionObjects.entries()) {
+      this.optimizerStatsVersionObjects.set(table, [...history]);
     }
 
     this.indexObservability.clear();
@@ -1964,6 +2195,7 @@ export class WalrusSqlClient {
         const committedRowsForTable = this.tables.get(table) ?? [];
         this.recordImmutableVersionObject(table, committedRowsForTable);
         this.recordImmutableIndexVersionObjectsForTable(table);
+        this.recordImmutableOptimizerStatsVersionObject(table);
         this.dirtyTables.add(table);
         if (stats.insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", stats.insertRows, "simulator");
         if (stats.updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", stats.updateRows, "simulator");
@@ -2634,6 +2866,7 @@ export class WalrusSqlClient {
       this.constraintCost.set(schema.name, emptyConstraintCostStats());
       this.rowVersions.delete(schema.name);
       this.tableVersionObjects.delete(schema.name);
+      this.optimizerStatsVersionObjects.delete(schema.name);
       this.dirtyTables.add(schema.name);
       this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -2701,6 +2934,7 @@ export class WalrusSqlClient {
       this.indexObservability.delete(table);
       this.rowVersions.delete(table);
       this.tableVersionObjects.delete(table);
+      this.optimizerStatsVersionObjects.delete(table);
       for (const [indexName, history] of [...this.indexVersionObjects.entries()]) {
         if (!history.length) continue;
         if (history[0]!.table.toUpperCase() !== table.toUpperCase()) continue;
@@ -2719,6 +2953,7 @@ export class WalrusSqlClient {
     if (upper.startsWith("ALTER TABLE")) {
       const table = this.extractTableName(normalized, /ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.applyAlterTable(normalized);
+      this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
       this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
       return {
@@ -2743,6 +2978,7 @@ export class WalrusSqlClient {
         this.bumpIndexMaintenanceStats(table, "INSERT", 1);
         this.dirtyTables.add(table);
         this.applyImmediateRowVersion(table, "INSERT", coerced);
+        this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
         this.invalidateReadCacheOnWrite();
       }
@@ -2855,6 +3091,7 @@ export class WalrusSqlClient {
       } else {
         for (const [table, count] of updateCounts.entries()) {
           if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
           if (count > 0) this.recordStorageWrite(table, "UPDATE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
@@ -2942,6 +3179,7 @@ export class WalrusSqlClient {
       } else {
         for (const [table, count] of deleteCounts.entries()) {
           if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
           if (count > 0) this.recordStorageWrite(table, "DELETE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
@@ -3355,7 +3593,31 @@ export class WalrusSqlClient {
     return undefined;
   }
 
-  getOptimizerStatistics(table?: string): OptimizerTableStatistics[] {
+  private getPersistedOptimizerStatistics(table?: string, options?: OptimizerStatisticsReadOptions): OptimizerTableStatistics[] {
+    const out: OptimizerTableStatistics[] = [];
+    const resolvedTable = table ? this.resolveCanonicalOptimizerStatsTableName(table) : null;
+    if (table && !resolvedTable) return out;
+    if (options?.version !== undefined && !resolvedTable) return out;
+
+    const tables = resolvedTable
+      ? [resolvedTable]
+      : [...this.optimizerStatsVersionObjects.keys()].sort((a, b) => a.localeCompare(b));
+
+    for (const tableName of tables) {
+      const picked = this.pickOptimizerStatsVersionObject(tableName, {
+        visibility: options?.visibility,
+        version: options?.version,
+      });
+      if (!picked) continue;
+      out.push(this.cloneOptimizerTableStatistics(picked.statistics));
+    }
+    return out;
+  }
+
+  getOptimizerStatistics(table?: string, options?: OptimizerStatisticsReadOptions): OptimizerTableStatistics[] {
+    const source = options?.source ?? "live";
+    if (source === "versioned") return this.getPersistedOptimizerStatistics(table, options);
+
     const out: OptimizerTableStatistics[] = [];
     const resolvedTable = table ? this.resolveCanonicalTableName(table) : null;
     if (table && !resolvedTable) return out;
@@ -3366,6 +3628,102 @@ export class WalrusSqlClient {
       if (stats) out.push(stats);
     }
     return out;
+  }
+
+  replayOptimizerStatistics(
+    table: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): OptimizerTableStatistics | null {
+    return this.getOptimizerStatistics(table, {
+      source: "versioned",
+      visibility: options?.visibility,
+      version: options?.version,
+    })[0] ?? null;
+  }
+
+  compareOptimizerStatisticsVersions(
+    table: string,
+    fromVersion: number,
+    toVersion: number,
+  ): OptimizerStatisticsVersionDiff | null {
+    if (!Number.isInteger(fromVersion) || !Number.isInteger(toVersion)) return null;
+    if (fromVersion <= 0 || toVersion <= 0) return null;
+
+    const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+    if (!canonical) return null;
+
+    const history = this.optimizerStatsVersionObjects.get(canonical) ?? [];
+    const from = history.find((object) => object.currentVersion === fromVersion);
+    const to = history.find((object) => object.currentVersion === toVersion);
+    if (!from || !to) return null;
+
+    const fromColumns = new Map<string, OptimizerColumnStatistics>();
+    const toColumns = new Map<string, OptimizerColumnStatistics>();
+    for (const column of from.statistics.columns) fromColumns.set(column.column.toUpperCase(), column);
+    for (const column of to.statistics.columns) toColumns.set(column.column.toUpperCase(), column);
+
+    const allColumnNames = [...new Set([...fromColumns.keys(), ...toColumns.keys()])].sort((a, b) => a.localeCompare(b));
+    const addedColumns: string[] = [];
+    const removedColumns: string[] = [];
+    const changedColumns: OptimizerStatisticsVersionDiffColumn[] = [];
+
+    for (const name of allColumnNames) {
+      const fromColumn = fromColumns.get(name);
+      const toColumn = toColumns.get(name);
+
+      if (!fromColumn && toColumn) {
+        addedColumns.push(toColumn.column);
+        continue;
+      }
+      if (fromColumn && !toColumn) {
+        removedColumns.push(fromColumn.column);
+        continue;
+      }
+      if (!fromColumn || !toColumn) continue;
+
+      const fromHistogramRowCount = fromColumn.histogram.reduce((sum, bucket) => sum + bucket.rowCount, 0);
+      const toHistogramRowCount = toColumn.histogram.reduce((sum, bucket) => sum + bucket.rowCount, 0);
+      const fromHistogramNdv = fromColumn.histogram.reduce((sum, bucket) => sum + bucket.ndv, 0);
+      const toHistogramNdv = toColumn.histogram.reduce((sum, bucket) => sum + bucket.ndv, 0);
+
+      const change: OptimizerStatisticsVersionDiffColumn = {
+        column: toColumn.column,
+        rowCountDelta: toColumn.rowCount - fromColumn.rowCount,
+        ndvDelta: toColumn.ndv - fromColumn.ndv,
+        nullCountDelta: toColumn.nullCount - fromColumn.nullCount,
+        nullRatioDelta: toColumn.nullRatio - fromColumn.nullRatio,
+        histogramBucketDelta: toColumn.histogram.length - fromColumn.histogram.length,
+        histogramRowCountDelta: toHistogramRowCount - fromHistogramRowCount,
+        histogramNdvDelta: toHistogramNdv - fromHistogramNdv,
+      };
+
+      if (
+        change.rowCountDelta !== 0
+        || change.ndvDelta !== 0
+        || change.nullCountDelta !== 0
+        || change.nullRatioDelta !== 0
+        || change.histogramBucketDelta !== 0
+        || change.histogramRowCountDelta !== 0
+        || change.histogramNdvDelta !== 0
+      ) {
+        changedColumns.push(change);
+      }
+    }
+
+    addedColumns.sort((a, b) => a.localeCompare(b));
+    removedColumns.sort((a, b) => a.localeCompare(b));
+    changedColumns.sort((a, b) => a.column.localeCompare(b.column));
+
+    return {
+      table: canonical,
+      fromVersion,
+      toVersion,
+      rowCountDelta: to.statistics.rowCount - from.statistics.rowCount,
+      analyzedAtDeltaMs: to.analyzedAt - from.analyzedAt,
+      addedColumns,
+      removedColumns,
+      changedColumns,
+    };
   }
 
   getSelectPlanStability(sql?: string): Array<{

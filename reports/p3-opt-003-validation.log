@@ -1,0 +1,18 @@
+﻿# P3-OPT-003 validation
+
+[2026-03-20T02:00:55+08:00] npm run build
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+[2026-03-20T02:01:08+08:00] npx tsx test/unit-p3-opt-003-statistics-persistence-version-management.ts
+ok: P3-OPT-003 statistics persistence/version replay/compare
+
+[2026-03-20T02:01:11+08:00] npx tsx test/unit-p3-opt-002-statistics-collection-framework.ts
+ok: P3-OPT-002 optimizer statistics collection framework
+
+[2026-03-20T02:01:12+08:00] npx tsx test/unit-p3-idx-005-index-object-storage-version-chain.ts
+ok: P3-IDX-005 separated index object persistence + version chain
