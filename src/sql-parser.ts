@@ -541,6 +541,7 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
       "FULL",
       "JOIN",
       "UNION",
+      "INTERSECT",
     ]);
     if (!clauseKeywords.has(token)) {
       alias = aliasCandidate[1]!;
@@ -554,12 +555,17 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
   };
 }
 
-function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; all: boolean } | null {
+type TopLevelSetOperator = "UNION" | "INTERSECT";
+
+function splitSetOpTopLevel(
+  sql: string,
+): { operator: TopLevelSetOperator; leftSql: string; rightSql: string; all: boolean } | null {
   let depth = 0;
   let quote = "";
-  let lastUnionIndex: number | null = null;
-  let lastUnionLength = 0;
-  let lastUnionAll = false;
+  let lastSetOpIndex: number | null = null;
+  let lastSetOpLength = 0;
+  let lastSetOpAll = false;
+  let lastOperator: TopLevelSetOperator = "UNION";
 
   for (let i = 0; i < sql.length; i++) {
     const ch = sql[i]!;
@@ -590,23 +596,43 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
 
     const rest = sql.slice(i).toUpperCase();
     if (rest.startsWith("UNION ALL") && (rest.length === "UNION ALL".length || /\s/.test(rest["UNION ALL".length]!))) {
-      lastUnionIndex = i;
-      lastUnionLength = "UNION ALL".length;
-      lastUnionAll = true;
+      lastSetOpIndex = i;
+      lastSetOpLength = "UNION ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "UNION";
+      continue;
+    }
+    if (
+      rest.startsWith("INTERSECT ALL")
+      && (rest.length === "INTERSECT ALL".length || /\s/.test(rest["INTERSECT ALL".length]!))
+    ) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "INTERSECT ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "INTERSECT";
       continue;
     }
     if (rest.startsWith("UNION") && (rest.length === "UNION".length || /\s/.test(rest["UNION".length]!))) {
-      lastUnionIndex = i;
-      lastUnionLength = "UNION".length;
-      lastUnionAll = false;
+      lastSetOpIndex = i;
+      lastSetOpLength = "UNION".length;
+      lastSetOpAll = false;
+      lastOperator = "UNION";
+      continue;
+    }
+    if (rest.startsWith("INTERSECT") && (rest.length === "INTERSECT".length || /\s/.test(rest["INTERSECT".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "INTERSECT".length;
+      lastSetOpAll = false;
+      lastOperator = "INTERSECT";
     }
   }
 
-  if (lastUnionIndex === null) return null;
+  if (lastSetOpIndex === null) return null;
   return {
-    leftSql: sql.slice(0, lastUnionIndex).trim(),
-    rightSql: sql.slice(lastUnionIndex + lastUnionLength).trim(),
-    all: lastUnionAll,
+    operator: lastOperator,
+    leftSql: sql.slice(0, lastSetOpIndex).trim(),
+    rightSql: sql.slice(lastSetOpIndex + lastSetOpLength).trim(),
+    all: lastSetOpAll,
   };
 }
 
@@ -797,27 +823,27 @@ export function parseSqlToAst(
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
 
-  const union = splitUnionTopLevel(base);
-  if (union) {
-    if (!union.leftSql || !union.rightSql) {
+  const setOp = splitSetOpTopLevel(base);
+  if (setOp) {
+    if (!setOp.leftSql || !setOp.rightSql) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "UNION requires both left and right SELECT statements",
-        token: "UNION",
+        message: `${setOp.operator} requires both left and right SELECT statements`,
+        token: setOp.operator,
       });
     }
 
-    if (/^(ORDER|LIMIT|OFFSET|GROUP\s+BY|HAVING|WHERE|UNION)\b/i.test(union.rightSql)) {
+    if (/^(ORDER|LIMIT|OFFSET|GROUP\s+BY|HAVING|WHERE|UNION|INTERSECT|EXCEPT)\b/i.test(setOp.rightSql)) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "UNION right branch is missing SELECT statement",
-        token: "UNION",
+        message: `${setOp.operator} right branch is missing SELECT statement`,
+        token: setOp.operator,
       });
     }
 
     return {
-      kind: "union",
-      all: union.all,
-      leftSql: union.leftSql,
-      rightSql: union.rightSql,
+      kind: setOp.operator === "UNION" ? "union" : "intersect",
+      all: setOp.all,
+      leftSql: setOp.leftSql,
+      rightSql: setOp.rightSql,
       rawSql: sql,
     };
   }
@@ -834,7 +860,8 @@ export function parseSqlToAst(
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-      message: "Only SELECT/UNION/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
+      message:
+        "Only SELECT/UNION/INTERSECT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }

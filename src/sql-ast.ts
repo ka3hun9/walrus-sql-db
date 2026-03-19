@@ -6,6 +6,7 @@ export type SqlNestedTransactionPolicy = "error_on_nested_begin";
 export type SqlAstStatement =
   | SelectStatementAst
   | UnionStatementAst
+  | IntersectStatementAst
   | TransactionStatementAst
   | CreateIndexStatementAst
   | DropIndexStatementAst
@@ -18,6 +19,14 @@ export type UnknownStatementAst = {
 
 export type UnionStatementAst = {
   kind: "union";
+  all: boolean;
+  leftSql: string;
+  rightSql: string;
+  rawSql: string;
+};
+
+export type IntersectStatementAst = {
+  kind: "intersect";
   all: boolean;
   leftSql: string;
   rightSql: string;

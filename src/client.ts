@@ -3435,38 +3435,35 @@ export class WalrusSqlClient {
       try {
         const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
-        if (ast.kind === "union") {
-          const rightPlan = this.splitSelectTail(ast.rightSql);
+        if (ast.kind === "union" || ast.kind === "intersect") {
+          const setOpToken = ast.kind === "union" ? "UNION" : "INTERSECT";
+          const rightPlan = this.splitSelectTail(ast.rightSql, setOpToken);
 
           const left = await this.query(ast.leftSql);
           const right = await this.query(rightPlan.baseSql);
 
-          const leftStaticArity = this.inferUnionArity(ast.leftSql);
-          const rightStaticArity = this.inferUnionArity(rightPlan.baseSql);
+          const leftStaticArity = this.inferSetOpArity(ast.leftSql);
+          const rightStaticArity = this.inferSetOpArity(rightPlan.baseSql);
           const leftRuntimeColumns = this.inferRuntimeProjectionColumns(left.rows);
           const rightRuntimeColumns = this.inferRuntimeProjectionColumns(right.rows);
           const leftArity = leftRuntimeColumns?.length ?? leftStaticArity;
           const rightArity = rightRuntimeColumns?.length ?? rightStaticArity;
-          this.assertUnionArityCompatible(leftArity, rightArity);
+          this.assertSetOpArityCompatible(leftArity, rightArity, setOpToken);
 
           const leftColumns =
             leftRuntimeColumns
-            ?? this.inferUnionColumns(ast.leftSql)
+            ?? this.inferSetOpColumns(ast.leftSql)
             ?? rightRuntimeColumns
-            ?? this.inferUnionColumns(rightPlan.baseSql);
+            ?? this.inferSetOpColumns(rightPlan.baseSql);
 
-          const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
-          const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
+          const normalizedLeft =
+            leftColumns ? left.rows.map((row) => this.normalizeSetOpRow(row, leftColumns, setOpToken)) : left.rows;
+          const normalizedRight =
+            leftColumns ? right.rows.map((row) => this.normalizeSetOpRow(row, leftColumns, setOpToken)) : right.rows;
 
-          const merged = ast.all
-            ? [...normalizedLeft, ...normalizedRight]
-            : (() => {
-                const dedup = new Map<string, SqlRow>();
-                for (const row of [...normalizedLeft, ...normalizedRight]) {
-                  dedup.set(this.makeRowKey(row), row);
-                }
-                return [...dedup.values()];
-              })();
+          const merged = ast.kind === "union"
+            ? this.combineUnionRows(normalizedLeft, normalizedRight, ast.all)
+            : this.combineIntersectRows(normalizedLeft, normalizedRight, ast.all);
 
           const ordered = this.applyOrder(merged, rightPlan.orderByList);
           const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
@@ -5994,9 +5991,9 @@ export class WalrusSqlClient {
     };
   }
 
-  private inferUnionColumns(selectSql: string): string[] | undefined {
+  private inferSetOpColumns(selectSql: string): string[] | undefined {
     const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
-    if (ast.kind === "union") return this.inferUnionColumns(ast.leftSql);
+    if (ast.kind === "union" || ast.kind === "intersect") return this.inferSetOpColumns(ast.leftSql);
     if (ast.kind !== "select") return undefined;
 
     return ast.selectItems.map((it, idx) => {
@@ -6013,14 +6010,15 @@ export class WalrusSqlClient {
     });
   }
 
-  private inferUnionArity(selectSql: string): number | undefined {
+  private inferSetOpArity(selectSql: string): number | undefined {
     const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
     if (ast.kind === "select") return ast.selectItems.length;
-    if (ast.kind !== "union") return undefined;
+    if (ast.kind !== "union" && ast.kind !== "intersect") return undefined;
 
-    const left = this.inferUnionArity(ast.leftSql);
-    const right = this.inferUnionArity(ast.rightSql);
-    this.assertUnionArityCompatible(left, right);
+    const setOpToken = ast.kind === "union" ? "UNION" : "INTERSECT";
+    const left = this.inferSetOpArity(ast.leftSql);
+    const right = this.inferSetOpArity(ast.rightSql);
+    this.assertSetOpArityCompatible(left, right, setOpToken);
     return left ?? right;
   }
 
@@ -6031,21 +6029,21 @@ export class WalrusSqlClient {
     return Object.keys(first);
   }
 
-  private assertUnionArityCompatible(left?: number, right?: number): void {
+  private assertSetOpArityCompatible(left?: number, right?: number, setOpToken: "UNION" | "INTERSECT" = "UNION"): void {
     if (left === undefined || right === undefined) return;
     if (left === right) return;
     throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
-      message: `UNION branches must project the same number of columns (left=${left}, right=${right})`,
-      token: "UNION",
+      message: `${setOpToken} branches must project the same number of columns (left=${left}, right=${right})`,
+      token: setOpToken,
     });
   }
 
-  private normalizeUnionRow(row: SqlRow, columns: string[]): SqlRow {
+  private normalizeSetOpRow(row: SqlRow, columns: string[], setOpToken: "UNION" | "INTERSECT" = "UNION"): SqlRow {
     const values = Object.values(row);
     if (values.length !== columns.length) {
       throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
-        message: `UNION branch row width mismatch: expected ${columns.length} columns but got ${values.length}`,
-        token: "UNION",
+        message: `${setOpToken} branch row width mismatch: expected ${columns.length} columns but got ${values.length}`,
+        token: setOpToken,
       });
     }
 
@@ -6056,7 +6054,49 @@ export class WalrusSqlClient {
     return out;
   }
 
-  private splitSelectTail(sql: string): {
+  private combineUnionRows(leftRows: SqlRow[], rightRows: SqlRow[], all: boolean): SqlRow[] {
+    if (all) return [...leftRows, ...rightRows];
+
+    const dedup = new Map<string, SqlRow>();
+    for (const row of [...leftRows, ...rightRows]) {
+      dedup.set(this.makeRowKey(row), row);
+    }
+    return [...dedup.values()];
+  }
+
+  private combineIntersectRows(leftRows: SqlRow[], rightRows: SqlRow[], all: boolean): SqlRow[] {
+    if (all) {
+      const rightCounts = new Map<string, number>();
+      for (const row of rightRows) {
+        const key = this.makeRowKey(row);
+        rightCounts.set(key, (rightCounts.get(key) ?? 0) + 1);
+      }
+
+      const out: SqlRow[] = [];
+      for (const row of leftRows) {
+        const key = this.makeRowKey(row);
+        const remaining = rightCounts.get(key) ?? 0;
+        if (remaining <= 0) continue;
+        out.push(row);
+        if (remaining === 1) rightCounts.delete(key);
+        else rightCounts.set(key, remaining - 1);
+      }
+      return out;
+    }
+
+    const rightKeys = new Set(rightRows.map((row) => this.makeRowKey(row)));
+    const out: SqlRow[] = [];
+    const emitted = new Set<string>();
+    for (const row of leftRows) {
+      const key = this.makeRowKey(row);
+      if (!rightKeys.has(key) || emitted.has(key)) continue;
+      emitted.add(key);
+      out.push(row);
+    }
+    return out;
+  }
+
+  private splitSelectTail(sql: string, setOpToken: "UNION" | "INTERSECT" = "UNION"): {
     baseSql: string;
     orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
     limit?: number;
@@ -6065,8 +6105,8 @@ export class WalrusSqlClient {
     const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
     if (ast.kind !== "select") {
       throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-        message: "UNION right branch must be a SELECT statement for tail planning",
-        token: "UNION",
+        message: `${setOpToken} right branch must be a SELECT statement for tail planning`,
+        token: setOpToken,
         dialect: this.opts.dialect ?? "ansi",
       });
     }
@@ -6080,7 +6120,7 @@ export class WalrusSqlClient {
             const rendered = exprAstToSql(o.expr);
             if (!rendered) {
               throw createSqlError("SQL_SEMANTIC_UNKNOWN_IDENTIFIER", {
-                message: "Unable to render ORDER BY expression in UNION tail",
+                message: `Unable to render ORDER BY expression in ${setOpToken} tail`,
                 token: "ORDER BY",
               });
             }

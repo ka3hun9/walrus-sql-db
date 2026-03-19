@@ -34,7 +34,7 @@
 - [x] P3-SUB-003 `EXISTS` / `NOT EXISTS` 语义与短路优化 [validated: 2026-03-20]
 - [x] P3-SUB-004 `IN` / `NOT IN` 子查询语义（含 NULL 三值逻辑） [validated: 2026-03-20]
 - [x] P3-SET-001 `UNION` / `UNION ALL` [validated: 2026-03-20]
-- [ ] P3-SET-002 `INTERSECT` / `INTERSECT ALL`
+- [x] P3-SET-002 `INTERSECT` / `INTERSECT ALL` [validated: 2026-03-20]
 - [ ] P3-SET-003 `EXCEPT` / `EXCEPT ALL`
 - [ ] P3-SET-004 集合操作与排序/分页/投影兼容性
 
