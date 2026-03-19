@@ -409,6 +409,29 @@ type SubqueryRuntimeState = {
   resultCache: Map<string, SqlRow[]>;
 };
 
+type OptimizerHistogramBucket = {
+  lowerBound: SqlPrimitive;
+  upperBound: SqlPrimitive;
+  rowCount: number;
+  ndv: number;
+};
+
+type OptimizerColumnStatistics = {
+  column: string;
+  rowCount: number;
+  ndv: number;
+  nullCount: number;
+  nullRatio: number;
+  histogram: OptimizerHistogramBucket[];
+};
+
+type OptimizerTableStatistics = {
+  table: string;
+  rowCount: number;
+  analyzedAt: number;
+  columns: OptimizerColumnStatistics[];
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -436,6 +459,7 @@ const BAD_PLAN_FALLBACK_SCAN_RATIO = 0.85;
 const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
 const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
 const BAD_PLAN_FALLBACK_COOLDOWN = 3;
+const OPTIMIZER_HISTOGRAM_MAX_BUCKETS = 8;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
@@ -3220,6 +3244,130 @@ export class WalrusSqlClient {
     this.selectPlanStability.set(stabilityKey, state);
   }
 
+  private resolveCanonicalTableName(table: string): string | null {
+    const target = table.trim().toUpperCase();
+    if (!target) return null;
+    for (const tableName of this.schemas.keys()) {
+      if (tableName.toUpperCase() === target) return tableName;
+    }
+    return null;
+  }
+
+  private buildOptimizerHistogram(values: SqlPrimitive[]): OptimizerHistogramBucket[] {
+    if (values.length === 0) return [];
+
+    const frequencies = new Map<string, { value: SqlPrimitive; rowCount: number }>();
+    for (const value of values) {
+      const key = this.encodeTypedKey(value, "optimizer.stats.histogram");
+      const existing = frequencies.get(key);
+      if (existing) existing.rowCount += 1;
+      else frequencies.set(key, { value, rowCount: 1 });
+    }
+
+    const sorted = [...frequencies.values()].sort((a, b) => this.compareForOrder(a.value, b.value, "ASC"));
+    if (sorted.length === 0) return [];
+
+    const bucketCap = Math.min(OPTIMIZER_HISTOGRAM_MAX_BUCKETS, sorted.length);
+    const targetRowsPerBucket = Math.max(1, Math.ceil(values.length / bucketCap));
+    const out: OptimizerHistogramBucket[] = [];
+
+    let lowerBound = sorted[0]!.value;
+    let upperBound = sorted[0]!.value;
+    let rowCount = 0;
+    let ndv = 0;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const entry = sorted[i]!;
+      if (ndv === 0) lowerBound = entry.value;
+      upperBound = entry.value;
+      rowCount += entry.rowCount;
+      ndv += 1;
+
+      const isLastEntry = i === sorted.length - 1;
+      const remainingEntries = sorted.length - i - 1;
+      const remainingBuckets = bucketCap - out.length - 1;
+      const reachedTarget = rowCount >= targetRowsPerBucket;
+      const atBucketCapacity = out.length + 1 >= bucketCap;
+      const shouldClose = isLastEntry || (!atBucketCapacity && reachedTarget && remainingEntries >= remainingBuckets);
+
+      if (!shouldClose) continue;
+      out.push({ lowerBound, upperBound, rowCount, ndv });
+      rowCount = 0;
+      ndv = 0;
+    }
+
+    return out;
+  }
+
+  private collectOptimizerStatisticsForTable(table: string): OptimizerTableStatistics | null {
+    const schema = this.schemas.get(table);
+    const rows = this.tables.get(table);
+    if (!schema || !rows) return null;
+
+    const rowCount = rows.length;
+    const columns: OptimizerColumnStatistics[] = schema.columns.map((column) => {
+      let nullCount = 0;
+      const distinct = new Set<string>();
+      const nonNullValues: SqlPrimitive[] = [];
+
+      for (const row of rows) {
+        const rawValue = this.resolveRowValue(row, column.name);
+        if (rawValue === null || rawValue === undefined) {
+          nullCount += 1;
+          continue;
+        }
+
+        const value = rawValue as SqlPrimitive;
+        distinct.add(this.encodeTypedKey(value, `optimizer.stats.ndv:${table}.${column.name}`));
+        nonNullValues.push(value);
+      }
+
+      return {
+        column: column.name,
+        rowCount,
+        ndv: distinct.size,
+        nullCount,
+        nullRatio: rowCount > 0 ? nullCount / rowCount : 0,
+        histogram: this.buildOptimizerHistogram(nonNullValues),
+      };
+    });
+
+    return {
+      table,
+      rowCount,
+      analyzedAt: Date.now(),
+      columns,
+    };
+  }
+
+  private pickPredicateColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    whereClauses: WhereClause[],
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats || whereClauses.length === 0) return undefined;
+    for (const clause of whereClauses) {
+      const field = clause.field?.trim();
+      if (!field) continue;
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(field)) continue;
+      const hit = stats.columns.find((columnStats) => columnStats.column.toUpperCase() === field.toUpperCase());
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  getOptimizerStatistics(table?: string): OptimizerTableStatistics[] {
+    const out: OptimizerTableStatistics[] = [];
+    const resolvedTable = table ? this.resolveCanonicalTableName(table) : null;
+    if (table && !resolvedTable) return out;
+
+    const tables = resolvedTable ? [resolvedTable] : [...this.schemas.keys()].sort((a, b) => a.localeCompare(b));
+    for (const tableName of tables) {
+      const stats = this.collectOptimizerStatisticsForTable(tableName);
+      if (stats) out.push(stats);
+    }
+    return out;
+  }
+
   getSelectPlanStability(sql?: string): Array<{
     key: string;
     preferredMethod: PhysicalAccessPathMethod;
@@ -3311,6 +3459,8 @@ export class WalrusSqlClient {
   ): SelectExecutionPlan {
     const logicalPlan = this.buildLogicalSelectPlan(parsed);
     const canUseSingleTableIndexes = logicalPlan.joins.length === 0;
+    const optimizerStats = this.getOptimizerStatistics(parsed.table)[0];
+    const tableRowCount = optimizerStats?.rowCount ?? bucket.length;
 
     if (canUseSingleTableIndexes && (opts?.refreshIndexes ?? true)) {
       this.rebuildSecondaryIndexesForTable(parsed.table);
@@ -3327,7 +3477,7 @@ export class WalrusSqlClient {
       const estimatedRows = rows.length;
       const estimatedCost = this.estimatePhysicalAccessPathCost(
         parsed,
-        bucket.length,
+        tableRowCount,
         method,
         estimatedRows,
         orderSatisfied,
@@ -3500,6 +3650,8 @@ export class WalrusSqlClient {
         stabilityKey: planStabilityKey,
       });
       const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
+      const explainStats = this.getOptimizerStatistics(parsed.table)[0];
+      const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
       return this.buildQueryResult(normalizedSql, [
         {
           type: "EXPLAIN",
@@ -3533,6 +3685,13 @@ export class WalrusSqlClient {
           physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
           physicalPlanExecutions: explainStability?.executions ?? 0,
           physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
+          statsAnalyzedAt: explainStats?.analyzedAt ?? null,
+          statsTableRowCount: explainStats?.rowCount ?? explainBucket.length,
+          statsColumnCount: explainStats?.columns.length ?? 0,
+          statsPredicateColumn: predicateStats?.column ?? null,
+          statsPredicateNdv: predicateStats?.ndv ?? null,
+          statsPredicateNullRatio: predicateStats?.nullRatio ?? null,
+          statsPredicateHistogramBuckets: predicateStats?.histogram.length ?? null,
         },
       ]);
     }
