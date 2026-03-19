@@ -36,7 +36,7 @@
 - [x] P3-SET-001 `UNION` / `UNION ALL` [validated: 2026-03-20]
 - [x] P3-SET-002 `INTERSECT` / `INTERSECT ALL` [validated: 2026-03-20]
 - [x] P3-SET-003 `EXCEPT` / `EXCEPT ALL` [validated: 2026-03-20]
-- [ ] P3-SET-004 集合操作与排序/分页/投影兼容性
+- [x] P3-SET-004 集合操作与排序/分页/投影兼容性 [validated: 2026-03-20]
 
 ## P3-D. 视图系统（只读视图）
 
