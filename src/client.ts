@@ -47,6 +47,7 @@ import type {
   DropIndexStatementAst,
   DropViewStatementAst,
   ExprAst,
+  SqlAstStatement,
   SelectStatementAst,
   SqlTransactionAction,
 } from "./sql-ast.js";
@@ -62,6 +63,7 @@ import {
   type IndexCatalogEntry,
   type SqlTypeName,
   type TableSchema,
+  type ViewDependencyEntry,
   type ViewCatalogEntry,
 } from "./sql-catalog.js";
 
@@ -102,6 +104,58 @@ const BIGINT_MAX_BOUND = 9223372036854775807n;
 const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MAX_FK_CASCADE_DEPTH = 16;
+const VIEW_DEPENDENCY_WILDCARD = "*";
+const VIEW_DEPENDENCY_KEYWORDS = new Set<string>([
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "GROUP",
+  "BY",
+  "HAVING",
+  "ORDER",
+  "LIMIT",
+  "OFFSET",
+  "FETCH",
+  "FIRST",
+  "NEXT",
+  "ROWS",
+  "ROW",
+  "ONLY",
+  "AS",
+  "AND",
+  "OR",
+  "NOT",
+  "ON",
+  "INNER",
+  "LEFT",
+  "RIGHT",
+  "FULL",
+  "OUTER",
+  "JOIN",
+  "UNION",
+  "INTERSECT",
+  "EXCEPT",
+  "ALL",
+  "DISTINCT",
+  "CASE",
+  "WHEN",
+  "THEN",
+  "ELSE",
+  "END",
+  "IN",
+  "IS",
+  "NULL",
+  "TRUE",
+  "FALSE",
+  "EXISTS",
+  "ANY",
+  "SOME",
+  "BETWEEN",
+  "LIKE",
+  "ESCAPE",
+  "CAST",
+  "TOP",
+]);
 
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 
@@ -2526,7 +2580,13 @@ export class WalrusSqlClient {
   getViewCatalog(viewName?: string): ViewCatalogEntry[] {
     const out = [...this.viewCatalog.values()]
       .filter((entry) => (viewName ? entry.name.toUpperCase() === viewName.toUpperCase() : true))
-      .map((entry) => ({ ...entry }));
+      .map((entry) => ({
+        ...entry,
+        dependencies: entry.dependencies.map((dependency) => ({
+          source: dependency.source,
+          columns: [...dependency.columns],
+        })),
+      }));
     out.sort((a, b) => a.name.localeCompare(b.name));
     return out;
   }
@@ -2557,6 +2617,12 @@ export class WalrusSqlClient {
 
   private async materializeViewRows(viewEntry: ViewCatalogEntry): Promise<SqlRow[]> {
     const viewName = this.normalizeViewName(viewEntry.name);
+    if (viewEntry.status !== "ACTIVE") {
+      const detail = viewEntry.invalidReason
+        ? `view is invalid: ${viewEntry.name} (${viewEntry.invalidReason})`
+        : `view is invalid: ${viewEntry.name}`;
+      throw sqlError("ERR_UNSUPPORTED_SELECT", detail);
+    }
     const cycleStart = this.activeViewResolutionStack.indexOf(viewName);
     if (cycleStart >= 0) {
       const cyclePath = [...this.activeViewResolutionStack.slice(cycleStart), viewName].join(" -> ");
@@ -3050,6 +3116,7 @@ export class WalrusSqlClient {
           { token: table, clause: "DROP TABLE" },
         );
       }
+      this.invalidateViewsForDroppedTable(table);
       this.tables.delete(table);
       this.schemas.delete(table);
       this.indexCatalog.forEach((entry, indexName) => {
@@ -5682,6 +5749,7 @@ export class WalrusSqlClient {
         });
       }
 
+      this.invalidateViewsForDroppedColumn(table, column);
       schema.columns.splice(idx, 1);
       schema.foreignKeys = (schema.foreignKeys ?? []).filter(
         (fk) => !fk.columns.some((c) => c.toUpperCase() === column.toUpperCase()),
@@ -6505,6 +6573,302 @@ export class WalrusSqlClient {
     return name.trim().toUpperCase();
   }
 
+  private resolveViewDependencySource(
+    sourceToken: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+  ): string | null {
+    const key = sourceToken.trim().toUpperCase();
+    if (!key) return null;
+    const fromAlias = sourceAliases.get(key);
+    if (fromAlias) return fromAlias;
+    if (sourceNames.has(key)) return key;
+    return null;
+  }
+
+  private markViewDependencyColumn(
+    dependencyMap: Map<string, Set<string>>,
+    source: string,
+    column: string,
+  ): void {
+    const sourceKey = source.trim().toUpperCase();
+    if (!sourceKey) return;
+    const columnKey = column.trim().toUpperCase();
+    if (!columnKey) return;
+
+    const bucket = dependencyMap.get(sourceKey) ?? new Set<string>();
+    bucket.add(columnKey);
+    dependencyMap.set(sourceKey, bucket);
+  }
+
+  private collectViewDependencyColumnsFromIdentifier(
+    identifier: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    const trimmed = identifier.trim();
+    if (!trimmed || sourceNames.size === 0) return;
+
+    if (trimmed === VIEW_DEPENDENCY_WILDCARD) {
+      for (const source of sourceNames) {
+        this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+      }
+      return;
+    }
+
+    const parts = trimmed.split(".").map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) return;
+
+    if (parts.length >= 2) {
+      const sourceToken = parts[parts.length - 2]!;
+      const columnToken = parts[parts.length - 1]!;
+      const resolvedSource = this.resolveViewDependencySource(sourceToken, sourceNames, sourceAliases);
+      if (resolvedSource) {
+        this.markViewDependencyColumn(dependencyMap, resolvedSource, columnToken);
+        return;
+      }
+    }
+
+    const columnToken = parts[parts.length - 1]!;
+    for (const source of sourceNames) {
+      this.markViewDependencyColumn(dependencyMap, source, columnToken);
+    }
+  }
+
+  private collectViewDependencyColumnsFromRawExpr(
+    rawExpr: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (sourceNames.size === 0) return;
+
+    const scrubbed = rawExpr.replace(/'[^']*'/g, " ").replace(/\"[^\"]*\"/g, " ");
+    for (const qualified of scrubbed.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*|\*)/g)) {
+      this.collectViewDependencyColumnsFromIdentifier(
+        `${qualified[1]}.${qualified[2]}`,
+        sourceNames,
+        sourceAliases,
+        dependencyMap,
+      );
+    }
+
+    for (const match of scrubbed.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g)) {
+      const token = match[1]!;
+      const upper = token.toUpperCase();
+      if (VIEW_DEPENDENCY_KEYWORDS.has(upper)) continue;
+
+      const nextChunk = scrubbed.slice((match.index ?? 0) + token.length);
+      if (/^\s*\(/.test(nextChunk)) continue;
+      this.collectViewDependencyColumnsFromIdentifier(token, sourceNames, sourceAliases, dependencyMap);
+    }
+  }
+
+  private collectViewDependencyColumnsFromExpr(
+    expr: ExprAst | undefined,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (!expr || sourceNames.size === 0) return;
+
+    switch (expr.kind) {
+      case "identifier":
+        this.collectViewDependencyColumnsFromIdentifier(expr.name, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "binary":
+        this.collectViewDependencyColumnsFromExpr(expr.left, sourceNames, sourceAliases, dependencyMap);
+        this.collectViewDependencyColumnsFromExpr(expr.right, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "unary":
+        this.collectViewDependencyColumnsFromExpr(expr.expr, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "function":
+        for (const arg of expr.args) {
+          this.collectViewDependencyColumnsFromExpr(arg, sourceNames, sourceAliases, dependencyMap);
+        }
+        return;
+      case "raw":
+        this.collectViewDependencyColumnsFromRawExpr(expr.text, sourceNames, sourceAliases, dependencyMap);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private collectViewDependencyFromSelectAst(
+    ast: SelectStatementAst,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    const sourceNames = new Set<string>();
+    const sourceAliases = new Map<string, string>();
+
+    const trackSource = (tableName: string, alias?: string): void => {
+      const source = tableName.trim().toUpperCase();
+      if (!source) return;
+      sourceNames.add(source);
+      if (!dependencyMap.has(source)) dependencyMap.set(source, new Set<string>());
+      sourceAliases.set(source, source);
+      if (alias) sourceAliases.set(alias.trim().toUpperCase(), source);
+    };
+
+    if (ast.from.kind === "table") {
+      trackSource(ast.from.name, ast.from.alias);
+    } else {
+      const nestedAst = parseSqlToAst(ast.from.subquerySql, { dialect: this.opts.dialect ?? "ansi" });
+      this.collectViewDependencyFromStatement(nestedAst, dependencyMap);
+    }
+
+    const joins = ast.joins?.length ? ast.joins : ast.join ? [ast.join] : [];
+    for (const join of joins) {
+      trackSource(join.table);
+      this.collectViewDependencyColumnsFromIdentifier(join.onLeft, sourceNames, sourceAliases, dependencyMap);
+      this.collectViewDependencyColumnsFromIdentifier(join.onRight, sourceNames, sourceAliases, dependencyMap);
+    }
+
+    for (const item of ast.selectItems) {
+      if (item.expr.kind === "identifier" && item.expr.name.trim() === VIEW_DEPENDENCY_WILDCARD) {
+        for (const source of sourceNames) {
+          this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+        }
+        continue;
+      }
+      if (item.expr.kind === "raw") {
+        const rawExpr = item.expr.text.trim();
+        if (rawExpr === VIEW_DEPENDENCY_WILDCARD) {
+          for (const source of sourceNames) {
+            this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+          }
+          continue;
+        }
+        const qualifiedWildcard = rawExpr.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\.\*$/);
+        if (qualifiedWildcard) {
+          this.collectViewDependencyColumnsFromIdentifier(
+            `${qualifiedWildcard[1]}.${VIEW_DEPENDENCY_WILDCARD}`,
+            sourceNames,
+            sourceAliases,
+            dependencyMap,
+          );
+          continue;
+        }
+      }
+      this.collectViewDependencyColumnsFromExpr(item.expr, sourceNames, sourceAliases, dependencyMap);
+    }
+    this.collectViewDependencyColumnsFromExpr(ast.where, sourceNames, sourceAliases, dependencyMap);
+    this.collectViewDependencyColumnsFromExpr(ast.having, sourceNames, sourceAliases, dependencyMap);
+    for (const orderItem of ast.orderBy ?? []) {
+      this.collectViewDependencyColumnsFromExpr(orderItem.expr, sourceNames, sourceAliases, dependencyMap);
+    }
+    for (const groupItem of ast.groupBy ?? []) {
+      this.collectViewDependencyColumnsFromExpr(groupItem, sourceNames, sourceAliases, dependencyMap);
+    }
+  }
+
+  private collectViewDependencyFromStatement(
+    ast: SqlAstStatement,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (ast.kind === "select") {
+      this.collectViewDependencyFromSelectAst(ast, dependencyMap);
+      return;
+    }
+
+    if (ast.kind === "union" || ast.kind === "intersect" || ast.kind === "except") {
+      const left = parseSqlToAst(ast.leftSql, { dialect: this.opts.dialect ?? "ansi" });
+      const right = parseSqlToAst(ast.rightSql, { dialect: this.opts.dialect ?? "ansi" });
+      this.collectViewDependencyFromStatement(left, dependencyMap);
+      this.collectViewDependencyFromStatement(right, dependencyMap);
+    }
+  }
+
+  private extractViewDependencies(querySql: string): ViewDependencyEntry[] {
+    const ast = parseSqlToAst(querySql, { dialect: this.opts.dialect ?? "ansi" });
+    const dependencyMap = new Map<string, Set<string>>();
+    this.collectViewDependencyFromStatement(ast, dependencyMap);
+
+    const out: ViewDependencyEntry[] = [];
+    for (const [source, columns] of dependencyMap.entries()) {
+      out.push({
+        source,
+        columns: [...columns.values()].sort(),
+      });
+    }
+    out.sort((a, b) => a.source.localeCompare(b.source));
+    return out;
+  }
+
+  private markViewInvalid(viewName: string, reason: string): void {
+    const normalizedViewName = this.normalizeViewName(viewName);
+    const entry = this.viewCatalog.get(normalizedViewName);
+    if (!entry) return;
+    entry.status = "INVALID";
+    entry.invalidReason = reason;
+    entry.invalidatedAt = Date.now();
+  }
+
+  private collectTransitiveDependentViews(seedViews: Set<string>): Set<string> {
+    const impacted = new Set<string>(seedViews);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const entry of this.viewCatalog.values()) {
+        const viewName = this.normalizeViewName(entry.name);
+        if (impacted.has(viewName)) continue;
+        const dependsOnImpactedView = entry.dependencies.some((dependency) =>
+          impacted.has(this.normalizeViewName(dependency.source)));
+        if (!dependsOnImpactedView) continue;
+        impacted.add(viewName);
+        changed = true;
+      }
+    }
+    return impacted;
+  }
+
+  private invalidateViewsForDroppedTable(table: string): void {
+    const tableKey = table.trim().toUpperCase();
+    const directlyImpacted = new Set<string>();
+    for (const entry of this.viewCatalog.values()) {
+      if (!entry.dependencies.some((dependency) => dependency.source.toUpperCase() === tableKey)) continue;
+      directlyImpacted.add(this.normalizeViewName(entry.name));
+    }
+
+    if (!directlyImpacted.size) return;
+    const impacted = this.collectTransitiveDependentViews(directlyImpacted);
+    for (const viewName of impacted) {
+      const reason = directlyImpacted.has(viewName)
+        ? `base table dropped: ${table}`
+        : `dependent view invalidated after table drop: ${table}`;
+      this.markViewInvalid(viewName, reason);
+    }
+  }
+
+  private invalidateViewsForDroppedColumn(table: string, column: string): void {
+    const tableKey = table.trim().toUpperCase();
+    const columnKey = column.trim().toUpperCase();
+    const directlyImpacted = new Set<string>();
+
+    for (const entry of this.viewCatalog.values()) {
+      const hasDependency = entry.dependencies.some((dependency) => {
+        if (dependency.source.toUpperCase() !== tableKey) return false;
+        const columns = dependency.columns.map((it) => it.toUpperCase());
+        if (columns.includes(VIEW_DEPENDENCY_WILDCARD)) return true;
+        return columns.includes(columnKey);
+      });
+      if (!hasDependency) continue;
+      directlyImpacted.add(this.normalizeViewName(entry.name));
+    }
+
+    if (!directlyImpacted.size) return;
+    const impacted = this.collectTransitiveDependentViews(directlyImpacted);
+    for (const viewName of impacted) {
+      const reason = directlyImpacted.has(viewName)
+        ? `base column dropped: ${table}.${column}`
+        : `dependent view invalidated after column drop: ${table}.${column}`;
+      this.markViewInvalid(viewName, reason);
+    }
+  }
+
   private pruneInvalidIndexesForTable(table: string): void {
     const schema = this.schemas.get(table);
     if (!schema) return;
@@ -6556,10 +6920,12 @@ export class WalrusSqlClient {
       throw sqlError("ERR_UNSUPPORTED_DDL", `view already exists: ${ast.viewName}`);
     }
 
+    const dependencies = this.extractViewDependencies(ast.querySql);
     this.viewCatalog.set(viewName, {
       name: viewName,
       querySql: ast.querySql,
       status: "ACTIVE",
+      dependencies,
     });
     return viewName;
   }
