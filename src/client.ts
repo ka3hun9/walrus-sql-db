@@ -192,10 +192,13 @@ type PhysicalAccessPathMethod =
   | "BTREE_INDEX_LOOKUP"
   | "BTREE_ORDERED_SCAN";
 
+type PhysicalIndexAccessStrategy = "FULL_TABLE_SCAN" | "INDEX_SCAN" | "INDEX_BACK_TABLE";
+
 type PlanStabilityReason = "NONE" | "PLAN_STABILITY_PIN" | "BAD_PLAN_FALLBACK_PIN";
 
 type PhysicalSelectAccessPath = {
   method: PhysicalAccessPathMethod;
+  indexStrategy: PhysicalIndexAccessStrategy;
   estimatedCost: number;
   estimatedRows: number;
   orderSatisfied: boolean;
@@ -503,6 +506,7 @@ const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
 const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
 const BAD_PLAN_FALLBACK_COOLDOWN = 3;
 const OPTIMIZER_HISTOGRAM_MAX_BUCKETS = 8;
+const INDEX_BACK_TABLE_FETCH_RATIO = 1.1;
 const DEFAULT_PREDICATE_SELECTIVITY = 0.25;
 const DEFAULT_EQUALITY_SELECTIVITY = 0.1;
 const DEFAULT_RANGE_SELECTIVITY = 1 / 3;
@@ -3271,6 +3275,58 @@ export class WalrusSqlClient {
     return rows * logFactor * orderByCount;
   }
 
+  private toUnqualifiedColumnName(field: string): string | null {
+    const trimmed = field.trim();
+    if (!trimmed) return null;
+    if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+    return trimmed.includes(".") ? (trimmed.split(".").at(-1) ?? null) : trimmed;
+  }
+
+  private isCoveringIndexAccess(parsed: ParsedSelect, indexColumn: string): boolean {
+    if (parsed.joins?.length) return false;
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias || parsed.rowNumberSpec) {
+      return false;
+    }
+    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return false;
+
+    const requiredColumns = new Set<string>();
+    for (const field of parsed.fields) {
+      const column = this.toUnqualifiedColumnName(field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    for (const clause of parsed.whereClauses) {
+      if (!clause.field) continue;
+      const column = this.toUnqualifiedColumnName(clause.field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    for (const order of parsed.orderByList ?? []) {
+      const column = this.toUnqualifiedColumnName(order.field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    if (requiredColumns.size === 0) return false;
+    const targetColumn = indexColumn.toUpperCase();
+    for (const column of requiredColumns) {
+      if (column !== targetColumn) return false;
+    }
+    return true;
+  }
+
+  private resolvePhysicalIndexAccessStrategy(
+    parsed: ParsedSelect,
+    method: PhysicalAccessPathMethod,
+    indexColumn?: string,
+  ): PhysicalIndexAccessStrategy {
+    if (method === "TABLE_SCAN") return "FULL_TABLE_SCAN";
+    if (!indexColumn) return "INDEX_BACK_TABLE";
+    return this.isCoveringIndexAccess(parsed, indexColumn) ? "INDEX_SCAN" : "INDEX_BACK_TABLE";
+  }
+
   private estimatePhysicalAccessPathCost(
     parsed: ParsedSelect,
     tableRows: number,
@@ -3278,6 +3334,7 @@ export class WalrusSqlClient {
     scannedRows: number,
     estimatedRows: number,
     orderSatisfied: boolean,
+    indexStrategy: PhysicalIndexAccessStrategy,
   ): number {
     let cost = Math.max(1, scannedRows);
     const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
@@ -3301,12 +3358,21 @@ export class WalrusSqlClient {
         break;
       case "HASH_INDEX_LOOKUP":
         cost += 3;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
         break;
       case "BTREE_INDEX_LOOKUP":
         cost += 4;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
         break;
       case "BTREE_ORDERED_SCAN":
         cost += 2;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
         break;
       default:
         break;
@@ -3419,6 +3485,7 @@ export class WalrusSqlClient {
     resultRows: number,
   ): boolean {
     if (chosen.method !== "HASH_INDEX_LOOKUP" && chosen.method !== "BTREE_INDEX_LOOKUP") return false;
+    if (chosen.indexStrategy !== "INDEX_BACK_TABLE") return false;
     if (tableRows < BAD_PLAN_FALLBACK_MIN_TABLE_ROWS) return false;
     if (chosen.orderSatisfied) return false;
 
@@ -4190,7 +4257,9 @@ export class WalrusSqlClient {
       orderSatisfied: boolean,
       indexName?: string,
       indexColumn?: string,
+      indexStrategy?: PhysicalIndexAccessStrategy,
     ): void => {
+      const resolvedIndexStrategy = indexStrategy ?? this.resolvePhysicalIndexAccessStrategy(parsed, method, indexColumn);
       const scannedRows = method === "TABLE_SCAN" ? tableRowCount : rows.length;
       const estimatedRows = hasPredicate ? Math.min(scannedRows, estimatedFilteredRows) : scannedRows;
       const estimatedCost = this.estimatePhysicalAccessPathCost(
@@ -4200,9 +4269,11 @@ export class WalrusSqlClient {
         scannedRows,
         estimatedRows,
         orderSatisfied,
+        resolvedIndexStrategy,
       );
       candidates.push({
         method,
+        indexStrategy: resolvedIndexStrategy,
         rows,
         orderSatisfied,
         indexName,
@@ -4212,7 +4283,7 @@ export class WalrusSqlClient {
       });
     };
 
-    addCandidate("TABLE_SCAN", bucket, false);
+    addCandidate("TABLE_SCAN", bucket, false, undefined, undefined, "FULL_TABLE_SCAN");
 
     if (canUseSingleTableIndexes) {
       const ordered = this.getBtreeOrderedScanCandidates(
@@ -4250,6 +4321,7 @@ export class WalrusSqlClient {
 
     const toPhysicalPath = (candidate: PhysicalSelectRuntimePath): PhysicalSelectAccessPath => ({
       method: candidate.method,
+      indexStrategy: candidate.indexStrategy,
       estimatedCost: candidate.estimatedCost,
       estimatedRows: candidate.estimatedRows,
       orderSatisfied: candidate.orderSatisfied,
@@ -4278,6 +4350,7 @@ export class WalrusSqlClient {
           `cost=${candidate.estimatedCost}`,
           `rows=${candidate.estimatedRows}`,
           `order=${candidate.orderSatisfied ? "Y" : "N"}`,
+          `access=${candidate.indexStrategy}`,
         ];
         if (candidate.indexName) parts.push(`index=${candidate.indexName}`);
         if (candidate.indexColumn) parts.push(`column=${candidate.indexColumn}`);
@@ -4395,9 +4468,11 @@ export class WalrusSqlClient {
           logicalPredicateSource: explainPlan.logical.predicateSource,
           logicalJoinCount: explainPlan.logical.joins.length,
           physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
+          physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
           physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
           physicalOptimizerEstimatedRows: explainPlan.physical.optimizerChosen.estimatedRows,
           physicalAccessPath: explainPlan.physical.chosen.method,
+          physicalIndexStrategy: explainPlan.physical.chosen.indexStrategy,
           physicalCost: explainPlan.physical.chosen.estimatedCost,
           physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
           physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
@@ -6090,6 +6165,7 @@ export class WalrusSqlClient {
     const tableIndexes = this.hashIndexes.get(table);
     if (!tableIndexes) return null;
 
+    let best: { rows: SqlRow[]; indexName: string; column: string } | null = null;
     for (const clause of whereClauses) {
       if (clause.logic === "OR") continue;
       if (clause.op !== "=") continue;
@@ -6109,16 +6185,23 @@ export class WalrusSqlClient {
 
         const key = this.encodeTypedKey(eqValue as SqlPrimitive, `hash.index.lookup:${table}.${indexName}.${column}`);
         const hit = buckets.get(key);
-        if (!hit) {
-          if (trackLookupStats) this.bumpIndexLookupStats(table, false);
-          return { rows: [], indexName, column };
+        const candidateRows = hit ? [...hit] : [];
+        const candidate = { rows: candidateRows, indexName, column };
+        if (!best) {
+          best = candidate;
+          continue;
         }
-        if (trackLookupStats) this.bumpIndexLookupStats(table, true);
-        return { rows: [...hit], indexName, column };
+        if (candidate.rows.length < best.rows.length) {
+          best = candidate;
+          continue;
+        }
+        if (candidate.rows.length > best.rows.length) continue;
+        if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
       }
     }
 
-    return null;
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
   }
 
   private compareBtreeKey(a: SqlPrimitive, b: SqlPrimitive): number {
@@ -6281,6 +6364,7 @@ export class WalrusSqlClient {
     const tableIndexes = this.btreeIndexes.get(table);
     if (!tableIndexes) return null;
 
+    let best: { rows: SqlRow[]; indexName: string; column: string } | null = null;
     for (const [indexName, runtime] of tableIndexes.entries()) {
       const entry = this.indexCatalog.get(indexName);
       if (!entry || entry.columns.length !== 1) continue;
@@ -6288,11 +6372,21 @@ export class WalrusSqlClient {
       const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
       if (!predicate) continue;
       const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
-      if (trackLookupStats) this.bumpIndexLookupStats(table, rows.length > 0);
-      return { rows, indexName, column: runtime.column };
+      const candidate = { rows, indexName, column: runtime.column };
+      if (!best) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length < best.rows.length) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length > best.rows.length) continue;
+      if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
     }
 
-    return null;
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
   }
 
   private getBtreeOrderedScanCandidates(
@@ -6313,6 +6407,7 @@ export class WalrusSqlClient {
     const tableIndexes = this.btreeIndexes.get(table);
     if (!tableIndexes) return null;
 
+    let best: { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null = null;
     for (const [indexName, runtime] of tableIndexes.entries()) {
       if (runtime.column.toUpperCase() !== orderField.toUpperCase()) continue;
       const predicate = this.extractBtreeRangePredicate(runtime.column, parsed.whereClauses);
@@ -6327,16 +6422,26 @@ export class WalrusSqlClient {
         orderedRows.push(...nullTail);
       }
 
-      if (trackLookupStats) this.bumpIndexLookupStats(table, orderedRows.length > 0);
-      return {
+      const candidate = {
         rows: orderedRows,
         indexName,
         column: runtime.column,
         orderSatisfied: true,
       };
+      if (!best) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length < best.rows.length) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length > best.rows.length) continue;
+      if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
     }
 
-    return null;
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
   }
 
   getHashIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {

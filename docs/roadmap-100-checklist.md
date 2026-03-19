@@ -22,7 +22,7 @@
 - [x] P3-OPT-002 统计信息收集框架（行数、NDV、NULL 比例、直方图） [validated: 2026-03-20]
 - [x] P3-OPT-003 统计信息持久化与版本管理（可回放、可比对） [validated: 2026-03-20]
 - [x] P3-OPT-004 选择率估算模型（谓词/组合谓词） [validated: 2026-03-20]
-- [ ] P3-OPT-005 索引选择策略（全表扫 vs 索引扫 vs 索引回表）
+- [x] P3-OPT-005 索引选择策略（全表扫 vs 索引扫 vs 索引回表） [validated: 2026-03-20]
 - [ ] P3-OPT-006 连接顺序搜索（基于代价的 join reorder）
 - [ ] P3-OPT-007 连接算法实现：Nested Loop / Hash Join / Sort-Merge Join
 - [x] P3-OPT-008 计划稳定性与回退策略（bad plan fallback） [validated: 2026-03-19]

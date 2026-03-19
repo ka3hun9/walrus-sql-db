@@ -1,0 +1,19 @@
+[start] 2026-03-20T02:38:02.7900773+08:00 P3-OPT-005 validation
+[cmd] npm run build
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+[cmd] npx tsx test/unit-p3-opt-005-index-selection-strategy.ts
+ok: P3-OPT-005 index selection strategy (table scan vs index scan vs index back-table)
+[cmd] npx tsx test/unit-p3-opt-001-logical-physical-plan-layering.ts
+ok: P3-OPT-001 logical/physical plan layering (rewrite + cost evaluation)
+[cmd] npx tsx test/unit-p3-opt-004-predicate-selectivity-estimation-model.ts
+ok: P3-OPT-004 predicate/composite predicate selectivity estimation model
+[cmd] npx tsx test/unit-p3-opt-008-plan-stability-bad-plan-fallback.ts
+ok: P3-OPT-008 plan stability and bad-plan fallback
+[end] 2026-03-20T02:39:26.7759220+08:00 P3-OPT-005 validation
