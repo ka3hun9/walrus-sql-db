@@ -1378,5 +1378,8 @@ export interface WalrusSqlClientOptions {
     level?: import("./logger.js").LogLevel;
     sink?: import("./logger.js").LogSink;
   };
+  joinExecution?: {
+    memoryBudgetRows?: number;
+  };
   viewPolicy?: WalrusSqlViewPolicyOptions;
 }

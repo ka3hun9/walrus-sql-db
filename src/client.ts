@@ -285,6 +285,9 @@ type PhysicalJoinPlanStep = {
   estimatedOutputRows: number;
   leftRows: number;
   rightRows: number;
+  estimatedMemoryRows: number;
+  memoryBudgetRows: number;
+  memoryBudgetConstrained: boolean;
 };
 
 type PhysicalSelectPlan = {
@@ -602,6 +605,7 @@ const HASH_JOIN_BUILD_ROW_THRESHOLD = 64;
 const HASH_JOIN_SPILL_PENALTY_FACTOR = 4;
 const SORT_MERGE_SORT_WORK_FACTOR = 0.2;
 const SORT_MERGE_JOIN_STARTUP_COST = 12;
+const DEFAULT_JOIN_MEMORY_BUDGET_ROWS = 4096;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
@@ -3740,6 +3744,30 @@ export class WalrusSqlClient {
     return Math.max(1, Math.ceil(this.estimateSortWork(rows, 1) * SORT_MERGE_SORT_WORK_FACTOR));
   }
 
+  private getJoinMemoryBudgetRows(): number {
+    const configured = this.opts.joinExecution?.memoryBudgetRows;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.max(1, Math.floor(configured));
+    }
+    return DEFAULT_JOIN_MEMORY_BUDGET_ROWS;
+  }
+
+  private estimateJoinAlgorithmMemoryRows(
+    algorithm: JoinExecutionAlgorithm,
+    leftRows: number,
+    rightRows: number,
+  ): number {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    if (algorithm === "HASH_JOIN") {
+      return Math.max(1, Math.min(left, right));
+    }
+    if (algorithm === "SORT_MERGE_JOIN") {
+      return Math.max(1, left + right);
+    }
+    return 1;
+  }
+
   private estimateJoinStepSelectivity(join: SelectJoinStep): number {
     const parseRef = (field: string): { table: string; column: string } | null => {
       const trimmed = field.trim();
@@ -3779,9 +3807,13 @@ export class WalrusSqlClient {
   private chooseJoinExecutionAlgorithm(leftRows: number, rightRows: number): {
     algorithm: JoinExecutionAlgorithm;
     estimatedCost: number;
+    estimatedMemoryRows: number;
+    memoryBudgetRows: number;
+    memoryBudgetConstrained: boolean;
   } {
     const left = Math.max(0, leftRows);
     const right = Math.max(0, rightRows);
+    const memoryBudgetRows = this.getJoinMemoryBudgetRows();
     const buildRows = Math.min(left, right);
     const probeRows = Math.max(left, right);
     const hashSpillPenalty = buildRows > HASH_JOIN_BUILD_ROW_THRESHOLD
@@ -3796,6 +3828,16 @@ export class WalrusSqlClient {
         this.estimateJoinSortWork(left) + this.estimateJoinSortWork(right) + left + right + SORT_MERGE_JOIN_STARTUP_COST,
       ),
     };
+    const memoryRows: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: this.estimateJoinAlgorithmMemoryRows("NESTED_LOOP", left, right),
+      HASH_JOIN: this.estimateJoinAlgorithmMemoryRows("HASH_JOIN", left, right),
+      SORT_MERGE_JOIN: this.estimateJoinAlgorithmMemoryRows("SORT_MERGE_JOIN", left, right),
+    };
+    const availableCandidates = (["NESTED_LOOP", "HASH_JOIN", "SORT_MERGE_JOIN"] as JoinExecutionAlgorithm[])
+      .filter((algorithm) => memoryRows[algorithm] <= memoryBudgetRows);
+    const candidates = availableCandidates.length
+      ? availableCandidates
+      : (["NESTED_LOOP"] as JoinExecutionAlgorithm[]);
 
     const rank: Record<JoinExecutionAlgorithm, number> = {
       NESTED_LOOP: 0,
@@ -3803,8 +3845,8 @@ export class WalrusSqlClient {
       SORT_MERGE_JOIN: 2,
     };
 
-    let bestAlgorithm: JoinExecutionAlgorithm = "NESTED_LOOP";
-    for (const candidate of (["HASH_JOIN", "SORT_MERGE_JOIN"] as JoinExecutionAlgorithm[])) {
+    let bestAlgorithm = candidates[0]!;
+    for (const candidate of candidates.slice(1)) {
       const candidateCost = costs[candidate];
       const bestCost = costs[bestAlgorithm];
       if (candidateCost < bestCost || (candidateCost === bestCost && rank[candidate] < rank[bestAlgorithm])) {
@@ -3815,6 +3857,9 @@ export class WalrusSqlClient {
     return {
       algorithm: bestAlgorithm,
       estimatedCost: costs[bestAlgorithm],
+      estimatedMemoryRows: memoryRows[bestAlgorithm],
+      memoryBudgetRows,
+      memoryBudgetConstrained: candidates.length < 3,
     };
   }
 
@@ -3833,6 +3878,9 @@ export class WalrusSqlClient {
         estimatedOutputRows,
         leftRows: runningRows,
         rightRows,
+        estimatedMemoryRows: chosen.estimatedMemoryRows,
+        memoryBudgetRows: chosen.memoryBudgetRows,
+        memoryBudgetConstrained: chosen.memoryBudgetConstrained,
       });
       runningRows = estimatedOutputRows;
     }
@@ -5051,10 +5099,13 @@ export class WalrusSqlClient {
             physicalJoinAlgorithms: explainPlan.physical.joinAlgorithms.length
               ? explainPlan.physical.joinAlgorithms.map((step) => step.algorithm).join(" -> ")
               : null,
+            physicalJoinMemoryBudgetRows: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms[0]!.memoryBudgetRows
+              : this.getJoinMemoryBudgetRows(),
             physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
               ? explainPlan.physical.joinAlgorithms
                 .map((step, idx) =>
-                  `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost}]`)
+                  `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost},mem=${step.estimatedMemoryRows}/${step.memoryBudgetRows},budgetConstrained=${step.memoryBudgetConstrained}]`)
                 .join(" ; ")
               : null,
             physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
@@ -8450,8 +8501,8 @@ export class WalrusSqlClient {
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
   ): SqlRow[] {
-    const rightRows = this.requireTable(join.table);
     const out: SqlRow[] = [];
     const matchedRightIndexes = new Set<number>();
 
@@ -8486,8 +8537,8 @@ export class WalrusSqlClient {
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
   ): SqlRow[] {
-    const rightRows = this.requireTable(join.table);
     const rightIndex = new Map<string, number[]>();
 
     for (let ri = 0; ri < rightRows.length; ri++) {
@@ -8538,8 +8589,8 @@ export class WalrusSqlClient {
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
   ): SqlRow[] {
-    const rightRows = this.requireTable(join.table);
     type JoinEntry = { key: string; rowIndex: number };
 
     const leftEntries: JoinEntry[] = [];
@@ -8627,6 +8678,17 @@ export class WalrusSqlClient {
     return out;
   }
 
+  private resolveJoinAlgorithmByMemoryBudget(
+    algorithm: JoinExecutionAlgorithm,
+    leftRows: number,
+    rightRows: number,
+  ): JoinExecutionAlgorithm {
+    if (algorithm === "NESTED_LOOP") return algorithm;
+    const budgetRows = this.getJoinMemoryBudgetRows();
+    const estimatedMemoryRows = this.estimateJoinAlgorithmMemoryRows(algorithm, leftRows, rightRows);
+    return estimatedMemoryRows <= budgetRows ? algorithm : "NESTED_LOOP";
+  }
+
   private applyJoin(
     leftTable: string,
     leftRows: SqlRow[],
@@ -8644,9 +8706,11 @@ export class WalrusSqlClient {
       return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin, algorithm);
     }
 
-    if (algorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join);
-    if (algorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join);
-    return this.applyNestedLoopJoin(leftTable, leftRows, join);
+    const rightRows = this.requireTable(join.table);
+    const effectiveAlgorithm = this.resolveJoinAlgorithmByMemoryBudget(algorithm, leftRows.length, rightRows.length);
+    if (effectiveAlgorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join, rightRows);
+    if (effectiveAlgorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join, rightRows);
+    return this.applyNestedLoopJoin(leftTable, leftRows, join, rightRows);
   }
 
   private parseWhereTree(whereExpr: string): WhereExprNode {

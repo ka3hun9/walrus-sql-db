@@ -118,6 +118,13 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
     LOG_LEVEL_VALUES,
     "error",
   ) as LogLevel;
+  const joinMemoryBudgetRows = pick(
+    overrides.joinExecution?.memoryBudgetRows,
+    env.WALRUS_SQL_JOIN_MEMORY_BUDGET_ROWS !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_JOIN_MEMORY_BUDGET_ROWS, 4096)))
+      : undefined,
+    4096,
+  );
 
   return {
     packageId,
@@ -141,6 +148,9 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
     logging: {
       level: logLevel,
       sink: overrides.logging?.sink,
+    },
+    joinExecution: {
+      memoryBudgetRows: joinMemoryBudgetRows,
     },
   };
 }
