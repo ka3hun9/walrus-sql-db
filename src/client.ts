@@ -159,6 +159,64 @@ type ParsedSelect = {
   };
 };
 
+type LogicalPredicateSource = "AST" | "TREE" | "CLAUSES" | "NONE";
+
+type LogicalRewriteRule =
+  | "RULE_CANONICALIZE_JOIN_CHAIN"
+  | "RULE_PREFER_AST_PREDICATE"
+  | "RULE_NORMALIZE_ORDER_BY_DIRECTION";
+
+type SelectJoinStep = NonNullable<ParsedSelect["joins"]>[number];
+
+type LogicalSelectPlan = {
+  table: string;
+  fields: string[] | ["*"];
+  joins: SelectJoinStep[];
+  predicateSource: LogicalPredicateSource;
+  where?: string;
+  having?: string;
+  groupBy?: string[];
+  aggregate?: ParsedSelect["aggregate"];
+  aggregateField?: string;
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  limit?: number;
+  offset?: number;
+  rowNumberAlias?: string;
+  rowNumberSpec?: ParsedSelect["rowNumberSpec"];
+  rewriteRules: LogicalRewriteRule[];
+};
+
+type PhysicalAccessPathMethod =
+  | "TABLE_SCAN"
+  | "HASH_INDEX_LOOKUP"
+  | "BTREE_INDEX_LOOKUP"
+  | "BTREE_ORDERED_SCAN";
+
+type PhysicalSelectAccessPath = {
+  method: PhysicalAccessPathMethod;
+  estimatedCost: number;
+  estimatedRows: number;
+  orderSatisfied: boolean;
+  indexName?: string;
+  indexColumn?: string;
+};
+
+type PhysicalSelectRuntimePath = PhysicalSelectAccessPath & {
+  rows: SqlRow[];
+};
+
+type PhysicalSelectPlan = {
+  chosen: PhysicalSelectAccessPath;
+  candidates: PhysicalSelectAccessPath[];
+};
+
+type SelectExecutionPlan = {
+  logical: LogicalSelectPlan;
+  physical: PhysicalSelectPlan;
+  scannedRows: SqlRow[];
+  orderSatisfied: boolean;
+};
+
 type DmlPlan = {
   table: string;
   whereExpr: string;
@@ -2686,6 +2744,269 @@ export class WalrusSqlClient {
     };
   }
 
+  private buildLogicalSelectPlan(parsed: ParsedSelect): LogicalSelectPlan {
+    const rewriteRules: LogicalRewriteRule[] = [];
+
+    const joins = parsed.joins?.length
+      ? parsed.joins.map((j) => ({
+          type: j.type,
+          table: j.table,
+          leftField: j.leftField,
+          rightField: j.rightField,
+        }))
+      : parsed.join
+      ? [{
+          type: parsed.join.type,
+          table: parsed.join.table,
+          leftField: parsed.join.leftField,
+          rightField: parsed.join.rightField,
+        }]
+      : [];
+    if (joins.length > 0) rewriteRules.push("RULE_CANONICALIZE_JOIN_CHAIN");
+
+    const orderByList = parsed.orderByList?.map((order) => ({
+      field: order.field.trim(),
+      direction: (order.direction === "DESC" ? "DESC" : "ASC") as "ASC" | "DESC",
+    }));
+    const orderChanged = Boolean(
+      orderByList?.some((order, idx) => {
+        const source = parsed.orderByList?.[idx];
+        if (!source) return false;
+        return source.field !== order.field || source.direction !== order.direction;
+      }),
+    );
+    if (orderChanged) rewriteRules.push("RULE_NORMALIZE_ORDER_BY_DIRECTION");
+
+    const predicateSource: LogicalPredicateSource = parsed.whereAst
+      ? "AST"
+      : parsed.whereTree
+      ? "TREE"
+      : parsed.whereClauses.length
+      ? "CLAUSES"
+      : "NONE";
+    if (predicateSource === "AST" && (parsed.whereTree || parsed.whereClauses.length > 0)) {
+      rewriteRules.push("RULE_PREFER_AST_PREDICATE");
+    }
+
+    return {
+      table: parsed.table,
+      fields: parsed.fields,
+      joins,
+      predicateSource,
+      where: parsed.where,
+      having: parsed.having,
+      groupBy: parsed.groupBy,
+      aggregate: parsed.aggregate,
+      aggregateField: parsed.aggregateField,
+      orderByList,
+      limit: parsed.limit,
+      offset: parsed.offset,
+      rowNumberAlias: parsed.rowNumberAlias,
+      rowNumberSpec: parsed.rowNumberSpec,
+      rewriteRules,
+    };
+  }
+
+  private estimateSortWork(rows: number, orderByCount: number): number {
+    if (rows <= 1 || orderByCount <= 0) return 0;
+    const logFactor = Math.max(1, Math.ceil(Math.log2(rows + 1)));
+    return rows * logFactor * orderByCount;
+  }
+
+  private estimatePhysicalAccessPathCost(
+    parsed: ParsedSelect,
+    tableRows: number,
+    method: PhysicalAccessPathMethod,
+    estimatedRows: number,
+    orderSatisfied: boolean,
+  ): number {
+    let cost = estimatedRows;
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    const hasOrder = Boolean(parsed.orderByList?.length);
+
+    if (hasPredicate) {
+      cost += Math.max(1, Math.ceil(estimatedRows * 0.35));
+    }
+    if (!orderSatisfied) {
+      cost += this.estimateSortWork(estimatedRows, parsed.orderByList?.length ?? 0);
+    }
+    if (parsed.groupBy?.length || parsed.aggregate || parsed.having || parsed.rowNumberAlias) {
+      cost += Math.max(1, Math.ceil(estimatedRows * 0.5));
+    }
+
+    switch (method) {
+      case "TABLE_SCAN":
+        cost += Math.max(1, Math.ceil(tableRows * 0.25));
+        if (hasPredicate) cost += Math.max(2, Math.ceil(tableRows * 0.75));
+        if (hasOrder) cost += Math.max(1, Math.ceil(tableRows * 0.25));
+        break;
+      case "HASH_INDEX_LOOKUP":
+        cost += 3;
+        break;
+      case "BTREE_INDEX_LOOKUP":
+        cost += 4;
+        break;
+      case "BTREE_ORDERED_SCAN":
+        cost += 2;
+        break;
+      default:
+        break;
+    }
+
+    return cost;
+  }
+
+  private physicalMethodRank(method: PhysicalAccessPathMethod): number {
+    switch (method) {
+      case "BTREE_ORDERED_SCAN":
+        return 0;
+      case "HASH_INDEX_LOOKUP":
+        return 1;
+      case "BTREE_INDEX_LOOKUP":
+        return 2;
+      case "TABLE_SCAN":
+      default:
+        return 3;
+    }
+  }
+
+  private pickBestPhysicalAccessPath(candidates: PhysicalSelectRuntimePath[]): PhysicalSelectRuntimePath {
+    let best = candidates[0]!;
+    for (let i = 1; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      if (candidate.estimatedCost < best.estimatedCost) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.estimatedCost > best.estimatedCost) continue;
+
+      if (candidate.orderSatisfied && !best.orderSatisfied) {
+        best = candidate;
+        continue;
+      }
+      if (!candidate.orderSatisfied && best.orderSatisfied) continue;
+
+      if (candidate.estimatedRows < best.estimatedRows) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.estimatedRows > best.estimatedRows) continue;
+
+      if (this.physicalMethodRank(candidate.method) < this.physicalMethodRank(best.method)) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  private buildSelectExecutionPlan(
+    parsed: ParsedSelect,
+    bucket: SqlRow[],
+    opts?: { refreshIndexes?: boolean; trackLookupStats?: boolean },
+  ): SelectExecutionPlan {
+    const logicalPlan = this.buildLogicalSelectPlan(parsed);
+    const canUseSingleTableIndexes = logicalPlan.joins.length === 0;
+
+    if (canUseSingleTableIndexes && (opts?.refreshIndexes ?? true)) {
+      this.rebuildSecondaryIndexesForTable(parsed.table);
+    }
+
+    const candidates: PhysicalSelectRuntimePath[] = [];
+    const addCandidate = (
+      method: PhysicalAccessPathMethod,
+      rows: SqlRow[],
+      orderSatisfied: boolean,
+      indexName?: string,
+      indexColumn?: string,
+    ): void => {
+      const estimatedRows = rows.length;
+      const estimatedCost = this.estimatePhysicalAccessPathCost(
+        parsed,
+        bucket.length,
+        method,
+        estimatedRows,
+        orderSatisfied,
+      );
+      candidates.push({
+        method,
+        rows,
+        orderSatisfied,
+        indexName,
+        indexColumn,
+        estimatedRows,
+        estimatedCost,
+      });
+    };
+
+    addCandidate("TABLE_SCAN", bucket, false);
+
+    if (canUseSingleTableIndexes) {
+      const ordered = this.getBtreeOrderedScanCandidates(
+        parsed.table,
+        bucket,
+        {
+          orderByList: logicalPlan.orderByList,
+          whereClauses: parsed.whereClauses,
+          groupBy: logicalPlan.groupBy,
+          aggregate: logicalPlan.aggregate,
+          rowNumberAlias: logicalPlan.rowNumberAlias,
+          having: logicalPlan.having,
+        },
+        false,
+      );
+      if (ordered) {
+        addCandidate("BTREE_ORDERED_SCAN", ordered.rows, ordered.orderSatisfied, ordered.indexName, ordered.column);
+      }
+
+      if (parsed.whereClauses.length > 0) {
+        const hash = this.getHashIndexedCandidates(parsed.table, parsed.whereClauses, false);
+        if (hash) addCandidate("HASH_INDEX_LOOKUP", hash.rows, false, hash.indexName, hash.column);
+
+        const btree = this.getBtreeIndexedCandidates(parsed.table, parsed.whereClauses, false);
+        if (btree) addCandidate("BTREE_INDEX_LOOKUP", btree.rows, false, btree.indexName, btree.column);
+      }
+    }
+
+    const chosenRuntime = this.pickBestPhysicalAccessPath(candidates);
+    if ((opts?.trackLookupStats ?? true) && chosenRuntime.method !== "TABLE_SCAN") {
+      this.bumpIndexLookupStats(parsed.table, chosenRuntime.rows.length > 0);
+    }
+
+    const toPhysicalPath = (candidate: PhysicalSelectRuntimePath): PhysicalSelectAccessPath => ({
+      method: candidate.method,
+      estimatedCost: candidate.estimatedCost,
+      estimatedRows: candidate.estimatedRows,
+      orderSatisfied: candidate.orderSatisfied,
+      indexName: candidate.indexName,
+      indexColumn: candidate.indexColumn,
+    });
+
+    return {
+      logical: logicalPlan,
+      physical: {
+        chosen: toPhysicalPath(chosenRuntime),
+        candidates: candidates.map((candidate) => toPhysicalPath(candidate)),
+      },
+      scannedRows: chosenRuntime.rows,
+      orderSatisfied: chosenRuntime.orderSatisfied,
+    };
+  }
+
+  private formatPhysicalCandidates(candidates: PhysicalSelectAccessPath[]): string {
+    return candidates
+      .map((candidate) => {
+        const parts = [
+          `cost=${candidate.estimatedCost}`,
+          `rows=${candidate.estimatedRows}`,
+          `order=${candidate.orderSatisfied ? "Y" : "N"}`,
+        ];
+        if (candidate.indexName) parts.push(`index=${candidate.indexName}`);
+        if (candidate.indexColumn) parts.push(`column=${candidate.indexColumn}`);
+        return `${candidate.method}[${parts.join(",")}]`;
+      })
+      .join(" ; ");
+  }
+
   async query(sql: string): Promise<QueryResult> {
     const normalized = normalizeSql(sql);
     this.logger.debug("query start", {
@@ -2753,6 +3074,11 @@ export class WalrusSqlClient {
     const parsed = this.parseSelect(normalizedSql, sql);
 
     if (parsed.explain) {
+      const explainBucket = this.tables.get(parsed.table) ?? [];
+      const explainPlan = this.buildSelectExecutionPlan(parsed, explainBucket, {
+        refreshIndexes: false,
+        trackLookupStats: false,
+      });
       return this.buildQueryResult(normalizedSql, [
         {
           type: "EXPLAIN",
@@ -2768,6 +3094,14 @@ export class WalrusSqlClient {
           joins: parsed.joins?.length
             ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
             : null,
+          logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
+          logicalPredicateSource: explainPlan.logical.predicateSource,
+          logicalJoinCount: explainPlan.logical.joins.length,
+          physicalAccessPath: explainPlan.physical.chosen.method,
+          physicalCost: explainPlan.physical.chosen.estimatedCost,
+          physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
+          physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
+          physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
         },
       ]);
     }
@@ -2797,67 +3131,55 @@ export class WalrusSqlClient {
     }
 
     const bucket = this.requireTable(parsed.table);
-    const canUseSingleTableIndexes = !parsed.join && !(parsed.joins?.length);
-    if (canUseSingleTableIndexes) this.rebuildSecondaryIndexesForTable(parsed.table);
+    const selectPlan = this.buildSelectExecutionPlan(parsed, bucket, {
+      refreshIndexes: true,
+      trackLookupStats: true,
+    });
 
-    const btreeOrderedScan = canUseSingleTableIndexes
-      ? this.getBtreeOrderedScanCandidates(parsed.table, bucket, {
-          orderByList: parsed.orderByList,
-          whereClauses: parsed.whereClauses,
-          groupBy: parsed.groupBy,
-          aggregate: parsed.aggregate,
-          rowNumberAlias: parsed.rowNumberAlias,
-          having: parsed.having,
-        })
-      : null;
-    const whereHashCandidates = (canUseSingleTableIndexes && !btreeOrderedScan && parsed.whereClauses.length)
-      ? this.getHashIndexedCandidates(parsed.table, parsed.whereClauses)
-      : null;
-    const whereBtreeCandidates = (canUseSingleTableIndexes && !btreeOrderedScan && !whereHashCandidates && parsed.whereClauses.length)
-      ? this.getBtreeIndexedCandidates(parsed.table, parsed.whereClauses)
-      : null;
-    const scannedRows = btreeOrderedScan?.rows ?? whereHashCandidates?.rows ?? whereBtreeCandidates?.rows ?? bucket;
-    const baseRows = parsed.joins?.length
-      ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), scannedRows)
-      : parsed.join
-      ? this.applyJoin(parsed.table, scannedRows, parsed.join)
-      : scannedRows;
-    const filtered = parsed.whereAst
+    const logicalPlan = selectPlan.logical;
+    const baseRows = logicalPlan.joins.length
+      ? logicalPlan.joins.reduce(
+          (acc, joinStep, idx) => this.applyJoin(idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table, acc, joinStep),
+          selectPlan.scannedRows,
+        )
+      : selectPlan.scannedRows;
+
+    const filtered = logicalPlan.predicateSource === "AST" && parsed.whereAst
       ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
-      : parsed.whereTree
+      : logicalPlan.predicateSource === "TREE" && parsed.whereTree
       ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
-      : parsed.whereClauses.length
-        ? this.applyWhereClauses(baseRows, parsed.whereClauses)
-        : baseRows;
+      : logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length
+      ? this.applyWhereClauses(baseRows, parsed.whereClauses)
+      : baseRows;
 
-    if (parsed.groupBy?.length) {
-      const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
+    if (logicalPlan.groupBy?.length) {
+      const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField);
       const havingRows = parsed.havingAst
         ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
-        : parsed.having
-        ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(parsed.having!)) === "TRUE")
+        : logicalPlan.having
+        ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(logicalPlan.having!)) === "TRUE")
         : grouped;
-      const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
-      const pagedGrouped = this.applyPage(orderedGrouped, parsed.offset, parsed.limit);
+      const orderedGrouped = this.applyOrder(havingRows, logicalPlan.orderByList);
+      const pagedGrouped = this.applyPage(orderedGrouped, logicalPlan.offset, logicalPlan.limit);
       return this.buildQueryResult(
         normalizedSql,
-        pagedGrouped.map((row) => this.pickFields(row, parsed.fields)),
+        pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
       );
     }
 
-    if (parsed.aggregate) {
-      return this.buildQueryResult(normalizedSql, [this.computeAggregateRow(filtered, parsed.aggregate, parsed.aggregateField)]);
+    if (logicalPlan.aggregate) {
+      return this.buildQueryResult(normalizedSql, [this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField)]);
     }
 
-    const withWindow = parsed.rowNumberAlias
-      ? this.applyRowNumber(filtered, parsed.rowNumberAlias, parsed.rowNumberSpec)
+    const withWindow = logicalPlan.rowNumberAlias
+      ? this.applyRowNumber(filtered, logicalPlan.rowNumberAlias, logicalPlan.rowNumberSpec)
       : filtered;
-    const ordered = btreeOrderedScan?.orderSatisfied ? withWindow : this.applyOrder(withWindow, parsed.orderByList);
-    const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
+    const ordered = selectPlan.orderSatisfied ? withWindow : this.applyOrder(withWindow, logicalPlan.orderByList);
+    const paged = this.applyPage(ordered, logicalPlan.offset, logicalPlan.limit);
 
       const result = this.buildQueryResult(
         normalizedSql,
-        paged.map((row) => this.pickFields(row, parsed.fields)),
+        paged.map((row) => this.pickFields(row, logicalPlan.fields)),
       );
       const successMeta: Record<string, unknown> = {
         sql: normalized,
@@ -4436,6 +4758,7 @@ export class WalrusSqlClient {
   private getHashIndexedCandidates(
     table: string,
     whereClauses: WhereClause[],
+    trackLookupStats = true,
   ): { rows: SqlRow[]; indexName: string; column: string } | null {
     const tableIndexes = this.hashIndexes.get(table);
     if (!tableIndexes) return null;
@@ -4460,10 +4783,10 @@ export class WalrusSqlClient {
         const key = this.encodeTypedKey(eqValue as SqlPrimitive, `hash.index.lookup:${table}.${indexName}.${column}`);
         const hit = buckets.get(key);
         if (!hit) {
-          this.bumpIndexLookupStats(table, false);
+          if (trackLookupStats) this.bumpIndexLookupStats(table, false);
           return { rows: [], indexName, column };
         }
-        this.bumpIndexLookupStats(table, true);
+        if (trackLookupStats) this.bumpIndexLookupStats(table, true);
         return { rows: [...hit], indexName, column };
       }
     }
@@ -4626,6 +4949,7 @@ export class WalrusSqlClient {
   private getBtreeIndexedCandidates(
     table: string,
     whereClauses: WhereClause[],
+    trackLookupStats = true,
   ): { rows: SqlRow[]; indexName: string; column: string } | null {
     const tableIndexes = this.btreeIndexes.get(table);
     if (!tableIndexes) return null;
@@ -4637,7 +4961,7 @@ export class WalrusSqlClient {
       const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
       if (!predicate) continue;
       const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
-      this.bumpIndexLookupStats(table, rows.length > 0);
+      if (trackLookupStats) this.bumpIndexLookupStats(table, rows.length > 0);
       return { rows, indexName, column: runtime.column };
     }
 
@@ -4648,6 +4972,7 @@ export class WalrusSqlClient {
     table: string,
     rows: SqlRow[],
     parsed: Pick<ParsedSelect, "orderByList" | "whereClauses" | "groupBy" | "aggregate" | "rowNumberAlias" | "having">,
+    trackLookupStats = true,
   ): { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null {
     if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias) return null;
     if (!parsed.orderByList || parsed.orderByList.length !== 1) return null;
@@ -4675,7 +5000,7 @@ export class WalrusSqlClient {
         orderedRows.push(...nullTail);
       }
 
-      this.bumpIndexLookupStats(table, orderedRows.length > 0);
+      if (trackLookupStats) this.bumpIndexLookupStats(table, orderedRows.length > 0);
       return {
         rows: orderedRows,
         indexName,
