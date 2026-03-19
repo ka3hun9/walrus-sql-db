@@ -261,6 +261,7 @@ type TransactionCommitRuntimeSnapshot = {
   rowVersions: Map<string, Map<string, number>>;
   tableVersionObjects: Map<string, VersionedStorageObject[]>;
   indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
+  indexObservability: Map<string, IndexObservabilityStats>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
 };
@@ -292,6 +293,17 @@ type TransactionObservabilityAccumulator = {
   maxTxnLatencyMs: number;
   totalLockWaitMs: number;
   lockWaitEvents: number;
+};
+
+type IndexObservabilityStats = {
+  lookupCount: number;
+  lookupHits: number;
+  lookupMisses: number;
+  maintenanceInsertOps: number;
+  maintenanceUpdateOps: number;
+  maintenanceDeleteOps: number;
+  maintenanceRebuildOps: number;
+  maintenanceRows: number;
 };
 
 const SESSION_TRANSACTION_TRANSITIONS: Record<
@@ -335,6 +347,7 @@ export class WalrusSqlClient {
   private readonly rowVersions = new Map<string, Map<string, number>>();
   private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
   private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
+  private readonly indexObservability = new Map<string, IndexObservabilityStats>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -1521,6 +1534,7 @@ export class WalrusSqlClient {
 
       if (entry.op === "DELETE") {
         if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
+        this.bumpIndexMaintenanceStats(table, "DELETE", 1);
         touchedTables.add(table);
         continue;
       }
@@ -1528,6 +1542,7 @@ export class WalrusSqlClient {
       if (entry.op === "INSERT") {
         const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
         if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
         touchedTables.add(table);
         continue;
       }
@@ -1535,6 +1550,7 @@ export class WalrusSqlClient {
       if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
       const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
       if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+      this.bumpIndexMaintenanceStats(table, "UPDATE", 1);
       touchedTables.add(table);
     }
 
@@ -1572,6 +1588,9 @@ export class WalrusSqlClient {
       ),
       indexVersionObjects: new Map(
         [...this.indexVersionObjects.entries()].map(([indexName, history]) => [indexName, [...history]] as const),
+      ),
+      indexObservability: new Map(
+        [...this.indexObservability.entries()].map(([table, stats]) => [table, { ...stats }] as const),
       ),
       writeVersion: this.writeVersion,
       queryCache: new Map(this.queryCache),
@@ -1631,6 +1650,11 @@ export class WalrusSqlClient {
     this.indexVersionObjects.clear();
     for (const [indexName, history] of snapshot.indexVersionObjects.entries()) {
       this.indexVersionObjects.set(indexName, [...history]);
+    }
+
+    this.indexObservability.clear();
+    for (const [table, stats] of snapshot.indexObservability.entries()) {
+      this.indexObservability.set(table, { ...stats });
     }
 
     this.writeVersion = snapshot.writeVersion;
@@ -1998,6 +2022,93 @@ export class WalrusSqlClient {
     this.constraintCost.clear();
   }
 
+  private emptyIndexObservabilityStats(): IndexObservabilityStats {
+    return {
+      lookupCount: 0,
+      lookupHits: 0,
+      lookupMisses: 0,
+      maintenanceInsertOps: 0,
+      maintenanceUpdateOps: 0,
+      maintenanceDeleteOps: 0,
+      maintenanceRebuildOps: 0,
+      maintenanceRows: 0,
+    };
+  }
+
+  private getOrCreateIndexObservabilityStats(table: string): IndexObservabilityStats {
+    const existing = this.indexObservability.get(table);
+    if (existing) return existing;
+    const created = this.emptyIndexObservabilityStats();
+    this.indexObservability.set(table, created);
+    return created;
+  }
+
+  private bumpIndexLookupStats(table: string, hit: boolean): void {
+    if (!this.getActiveIndexEntriesForTable(table).length) return;
+    const stats = this.getOrCreateIndexObservabilityStats(table);
+    stats.lookupCount += 1;
+    if (hit) stats.lookupHits += 1;
+    else stats.lookupMisses += 1;
+  }
+
+  private bumpIndexMaintenanceStats(table: string, op: "INSERT" | "UPDATE" | "DELETE" | "REBUILD", rows: number): void {
+    if (!this.getActiveIndexEntriesForTable(table).length) return;
+    const stats = this.getOrCreateIndexObservabilityStats(table);
+    if (op === "INSERT") stats.maintenanceInsertOps += 1;
+    else if (op === "UPDATE") stats.maintenanceUpdateOps += 1;
+    else if (op === "DELETE") stats.maintenanceDeleteOps += 1;
+    else stats.maintenanceRebuildOps += 1;
+    stats.maintenanceRows += Math.max(0, rows);
+  }
+
+  getIndexObservability(table?: string): Array<{
+    table: string;
+    lookupCount: number;
+    lookupHits: number;
+    lookupMisses: number;
+    hitRate: number;
+    failureRate: number;
+    maintenanceInsertOps: number;
+    maintenanceUpdateOps: number;
+    maintenanceDeleteOps: number;
+    maintenanceRebuildOps: number;
+    maintenanceRows: number;
+  }> {
+    const out: Array<{
+      table: string;
+      lookupCount: number;
+      lookupHits: number;
+      lookupMisses: number;
+      hitRate: number;
+      failureRate: number;
+      maintenanceInsertOps: number;
+      maintenanceUpdateOps: number;
+      maintenanceDeleteOps: number;
+      maintenanceRebuildOps: number;
+      maintenanceRows: number;
+    }> = [];
+    for (const [tableName, stats] of this.indexObservability.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      const hitRate = stats.lookupCount > 0 ? stats.lookupHits / stats.lookupCount : 0;
+      const failureRate = stats.lookupCount > 0 ? stats.lookupMisses / stats.lookupCount : 0;
+      out.push({
+        table: tableName,
+        lookupCount: stats.lookupCount,
+        lookupHits: stats.lookupHits,
+        lookupMisses: stats.lookupMisses,
+        hitRate,
+        failureRate,
+        maintenanceInsertOps: stats.maintenanceInsertOps,
+        maintenanceUpdateOps: stats.maintenanceUpdateOps,
+        maintenanceDeleteOps: stats.maintenanceDeleteOps,
+        maintenanceRebuildOps: stats.maintenanceRebuildOps,
+        maintenanceRows: stats.maintenanceRows,
+      });
+    }
+    out.sort((a, b) => a.table.localeCompare(b.table));
+    return out;
+  }
+
   getStorageWriteLog(table?: string): StorageWriteEvent[] {
     const events = table ? this.storageWriteLog.filter((evt) => evt.table === table) : this.storageWriteLog;
     return events.map((evt) => ({ ...evt }));
@@ -2044,6 +2155,7 @@ export class WalrusSqlClient {
       mode: "simulator",
       at: Date.now(),
     });
+    this.bumpIndexMaintenanceStats(table, "REBUILD", affectedRows);
   }
 
   private bumpConstraintCost(table: string, patch: Partial<ConstraintIndexCostStats>): void {
@@ -2312,6 +2424,7 @@ export class WalrusSqlClient {
       this.uniqueIndexes.delete(table);
       this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
+      this.indexObservability.delete(table);
       this.rowVersions.delete(table);
       this.tableVersionObjects.delete(table);
       for (const [indexName, history] of [...this.indexVersionObjects.entries()]) {
@@ -2353,6 +2466,7 @@ export class WalrusSqlClient {
         this.bumpTableWriteStats(table, { insertRows: 1 });
       } else {
         this.addRowToSecondaryIndexes(table, coerced);
+        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
         this.dirtyTables.add(table);
         this.applyImmediateRowVersion(table, "INSERT", coerced);
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
@@ -3891,6 +4005,7 @@ export class WalrusSqlClient {
         this.recordTransactionLogWrite(table, "DELETE", beforeImage, beforeImage, null);
         if (!this.isDmlWriteStagingActive()) {
           this.removeRowFromSecondaryIndexes(table, beforeImage);
+          this.bumpIndexMaintenanceStats(table, "DELETE", 1);
           this.applyImmediateRowVersion(table, "DELETE", beforeImage);
         }
         touched++;
@@ -4055,7 +4170,10 @@ export class WalrusSqlClient {
     if (!this.isDmlWriteStagingActive()) this.addRowToSecondaryIndexes(table, row);
     this.recordTransactionLogWrite(table, "UPDATE", beforeImage, beforeImage, { ...row });
     this.bumpConstraintCost(table, { updateOps: 1 });
-    if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "UPDATE", row);
+    if (!this.isDmlWriteStagingActive()) {
+      this.bumpIndexMaintenanceStats(table, "UPDATE", 1);
+      this.applyImmediateRowVersion(table, "UPDATE", row);
+    }
   }
 
   private didForeignKeyReferenceChange(fk: ForeignKeySpec, before: SqlRow, after: SqlRow): boolean {
@@ -4341,7 +4459,11 @@ export class WalrusSqlClient {
 
         const key = this.encodeTypedKey(eqValue as SqlPrimitive, `hash.index.lookup:${table}.${indexName}.${column}`);
         const hit = buckets.get(key);
-        if (!hit) return { rows: [], indexName, column };
+        if (!hit) {
+          this.bumpIndexLookupStats(table, false);
+          return { rows: [], indexName, column };
+        }
+        this.bumpIndexLookupStats(table, true);
         return { rows: [...hit], indexName, column };
       }
     }
@@ -4515,6 +4637,7 @@ export class WalrusSqlClient {
       const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
       if (!predicate) continue;
       const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
+      this.bumpIndexLookupStats(table, rows.length > 0);
       return { rows, indexName, column: runtime.column };
     }
 
@@ -4552,6 +4675,7 @@ export class WalrusSqlClient {
         orderedRows.push(...nullTail);
       }
 
+      this.bumpIndexLookupStats(table, orderedRows.length > 0);
       return {
         rows: orderedRows,
         indexName,
