@@ -3168,6 +3168,7 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      this.assertUpdatableViewDeferred("INSERT", table, "target");
       const parsedInsert = this.parseInsert(normalized);
       const bucket = this.requireWritableTableForDml(table);
       const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
@@ -3194,6 +3195,8 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("UPDATE")) {
       const plan = this.planUpdate(normalized);
+      this.assertUpdatableViewDeferred("UPDATE", plan.table, "target");
+      if (plan.join) this.assertUpdatableViewDeferred("UPDATE", plan.join.table, "source");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -3308,6 +3311,8 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DELETE")) {
       const plan = this.planDelete(normalized);
+      this.assertUpdatableViewDeferred("DELETE", plan.table, "target");
+      if (plan.join) this.assertUpdatableViewDeferred("DELETE", plan.join.table, "source");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -6576,6 +6581,29 @@ export class WalrusSqlClient {
 
   private normalizeViewName(name: string): string {
     return name.trim().toUpperCase();
+  }
+
+  private getViewCatalogEntry(name: string): ViewCatalogEntry | undefined {
+    return this.viewCatalog.get(this.normalizeViewName(name));
+  }
+
+  private assertUpdatableViewDeferred(
+    operation: "INSERT" | "UPDATE" | "DELETE",
+    tableName: string,
+    role: "target" | "source" = "target",
+  ): void {
+    const viewEntry = this.getViewCatalogEntry(tableName);
+    if (!viewEntry) return;
+
+    const code = operation === "INSERT"
+      ? ClientErrorCodeEnum.UnsupportedInsert
+      : operation === "UPDATE"
+        ? ClientErrorCodeEnum.UnsupportedUpdate
+        : ClientErrorCodeEnum.UnsupportedDelete;
+    throw sqlError(
+      code,
+      `updatable view is deferred in Phase 3: ${operation} ${role} cannot reference view ${viewEntry.name}`,
+    );
   }
 
   private hasTableNameConflict(name: string): boolean {
