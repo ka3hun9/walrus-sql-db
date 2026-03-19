@@ -1,0 +1,40 @@
+﻿[2026-03-19T16:47:08.0547091Z] P3-SUB-004 validation start
+
+>>> npm run build
+
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+
+[OK] npm run build
+
+>>> npx tsx test/unit-p3-sub-004-in-not-in-subquery-null-3vl.ts
+
+ok: P3-SUB-004 IN/NOT IN subquery semantics with NULL 3VL
+
+[OK] npx tsx test/unit-p3-sub-004-in-not-in-subquery-null-3vl.ts
+
+>>> npx tsx test/unit-p3-sub-003-exists-not-exists-short-circuit.ts
+
+ok: P3-SUB-003 EXISTS/NOT EXISTS semantics and short-circuit optimization
+
+[OK] npx tsx test/unit-p3-sub-003-exists-not-exists-short-circuit.ts
+
+>>> npx tsx test/unit-c-exec-002-predicate-semantics.ts
+
+ok: C-EXEC-002 predicate execution semantics (BETWEEN/LIKE/IN/EXISTS)
+
+[OK] npx tsx test/unit-c-exec-002-predicate-semantics.ts
+
+>>> npx tsx test/unit-d-dml-005-delete-subquery-where.ts
+
+ok: D-DML-005 DELETE subquery predicates (scalar/IN/EXISTS)
+
+[OK] npx tsx test/unit-d-dml-005-delete-subquery-where.ts
+
+[2026-03-19T16:47:28.8160254Z] P3-SUB-004 validation complete

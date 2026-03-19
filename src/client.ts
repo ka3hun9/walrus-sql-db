@@ -6790,7 +6790,7 @@ export class WalrusSqlClient {
       }
     }
 
-    const fields = plan.fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
+    const fields = this.splitTopLevelComma(plan.fieldExpr).map((x) => x.trim()).filter(Boolean);
     const projected = matchedEvalRows.map((row) => {
       const out: SqlRow = {};
       for (const f of fields) out[f] = this.evalExpr(row, f) ?? null;
@@ -6845,8 +6845,33 @@ export class WalrusSqlClient {
     return false;
   }
 
+  private assertSubquerySingleColumnProjection(plan: ParsedSubqueryPlan, subquerySql: string): void {
+    const fieldExpr = plan.fieldExpr.trim();
+    if (fieldExpr === "*") {
+      const schema = this.schemas.get(plan.table);
+      const projectedCount = schema?.columns.length
+        ?? (() => {
+          const first = this.tables.get(plan.table)?.[0];
+          return first ? Object.keys(first).length : undefined;
+        })();
+      if (projectedCount !== undefined && projectedCount !== 1) {
+        throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
+      }
+      return;
+    }
+
+    const projectedFields = this.splitTopLevelComma(fieldExpr).map((x) => x.trim()).filter(Boolean);
+    if (projectedFields.length !== 1) {
+      throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
+    }
+  }
+
   private parseSubqueryValues(subquerySql: string, field?: string, outerRow?: SqlRow): SqlPrimitive[] {
-    const rows = this.parseSubquerySelect(subquerySql, outerRow);
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    const plan = this.getParsedSubqueryPlan(normalized);
+    if (!field) this.assertSubquerySingleColumnProjection(plan, normalized);
+
+    const rows = this.parseSubquerySelect(normalized, outerRow);
     if (!rows.length) return [];
 
     if (field) {
