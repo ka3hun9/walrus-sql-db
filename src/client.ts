@@ -33,6 +33,7 @@ import type {
   TransactionLogRecord,
   TransactionLogWriteEntry,
   TransactionLogWriteOperation,
+  IndexVersionedStorageObject,
   VersionedStorageObject,
   WalrusSqlClientOptions,
 } from "./types.js";
@@ -259,6 +260,7 @@ type TransactionCommitRuntimeSnapshot = {
   storageWriteLog: StorageWriteEvent[];
   rowVersions: Map<string, Map<string, number>>;
   tableVersionObjects: Map<string, VersionedStorageObject[]>;
+  indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
 };
@@ -332,6 +334,7 @@ export class WalrusSqlClient {
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly rowVersions = new Map<string, Map<string, number>>();
   private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
+  private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -867,6 +870,208 @@ export class WalrusSqlClient {
     return this.cloneVersionObject(confirmed);
   }
 
+  private cloneIndexVersionObjectPayload(
+    payload: IndexVersionedStorageObject["payload"],
+  ): IndexVersionedStorageObject["payload"] {
+    if (payload.indexType === "HASH") {
+      return {
+        indexType: "HASH",
+        buckets: payload.buckets.map((bucket) => ({
+          encodedKey: bucket.encodedKey,
+          rowKeys: [...bucket.rowKeys],
+        })),
+      };
+    }
+
+    return {
+      indexType: "BTREE",
+      entries: payload.entries.map((entry) => ({
+        key: entry.key,
+        rowKeys: [...entry.rowKeys],
+      })),
+    };
+  }
+
+  private toImmutableIndexVersionObjectPayload(
+    payload: IndexVersionedStorageObject["payload"],
+  ): IndexVersionedStorageObject["payload"] {
+    const cloned = this.cloneIndexVersionObjectPayload(payload);
+    if (cloned.indexType === "HASH") {
+      return Object.freeze({
+        indexType: "HASH" as const,
+        buckets: Object.freeze(cloned.buckets.map((bucket) => Object.freeze({
+          encodedKey: bucket.encodedKey,
+          rowKeys: Object.freeze([...bucket.rowKeys]),
+        }))),
+      });
+    }
+
+    return Object.freeze({
+      indexType: "BTREE" as const,
+      entries: Object.freeze(cloned.entries.map((entry) => Object.freeze({
+        key: entry.key,
+        rowKeys: Object.freeze([...entry.rowKeys]),
+      }))),
+    });
+  }
+
+  private cloneIndexVersionObject(object: IndexVersionedStorageObject): IndexVersionedStorageObject {
+    return {
+      ...object,
+      payload: this.cloneIndexVersionObjectPayload(object.payload),
+    };
+  }
+
+  private encodeIndexRowRefKey(table: string, row: SqlRow): string {
+    return this.encodeRowVersionKey(this.buildTransactionRowKey(table, row));
+  }
+
+  private getActiveIndexEntriesForTable(table: string): IndexCatalogEntry[] {
+    const upper = table.toUpperCase();
+    return [...this.indexCatalog.values()]
+      .filter((entry) =>
+        entry.table.toUpperCase() === upper
+          && entry.status === "ACTIVE"
+          && entry.columns.length === 1
+          && (entry.type === "HASH" || entry.type === "BTREE"))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  private recordImmutableIndexVersionObject(entry: IndexCatalogEntry): void {
+    const indexName = this.normalizeIndexName(entry.name);
+    const table = entry.table;
+    const column = entry.columns[0]!;
+    const history = this.indexVersionObjects.get(indexName) ?? [];
+    const prevVersion = history[history.length - 1]?.currentVersion ?? null;
+    const currentVersion = (prevVersion ?? 0) + 1;
+    const version = currentVersion;
+    const createdAt = Date.now();
+
+    let keyCount = 0;
+    let rowCount = 0;
+    let payload: IndexVersionedStorageObject["payload"];
+
+    if (entry.type === "HASH") {
+      const buckets = this.hashIndexes.get(table)?.get(indexName);
+      const serializedBuckets = [...(buckets?.entries() ?? [])]
+        .map(([encodedKey, rows]) => {
+          const rowKeys = [...new Set(
+            [...rows].map((row) => this.encodeIndexRowRefKey(table, row)),
+          )].sort();
+          return { encodedKey, rowKeys };
+        })
+        .sort((a, b) => a.encodedKey.localeCompare(b.encodedKey));
+      keyCount = serializedBuckets.length;
+      rowCount = serializedBuckets.reduce((sum, bucket) => sum + bucket.rowKeys.length, 0);
+      payload = this.toImmutableIndexVersionObjectPayload({
+        indexType: "HASH",
+        buckets: serializedBuckets,
+      });
+    } else {
+      const runtime = this.btreeIndexes.get(table)?.get(indexName);
+      const serializedEntries = (runtime?.entries ?? [])
+        .map((leaf) => {
+          const rowKeys = [...new Set(
+            [...leaf.rows].map((row) => this.encodeIndexRowRefKey(table, row)),
+          )].sort();
+          return { key: leaf.key, rowKeys };
+        });
+      keyCount = serializedEntries.length;
+      rowCount = serializedEntries.reduce((sum, leaf) => sum + leaf.rowKeys.length, 0);
+      payload = this.toImmutableIndexVersionObjectPayload({
+        indexType: "BTREE",
+        entries: serializedEntries,
+      });
+    }
+
+    const digestPayload = this.cloneIndexVersionObjectPayload(payload);
+    const commitDigest = createHash("sha256")
+      .update(JSON.stringify({
+        table,
+        indexName,
+        indexType: entry.type,
+        column,
+        prevVersion,
+        currentVersion,
+        createdAt,
+        payload: digestPayload,
+      }))
+      .digest("hex");
+    const objectId = `0x${commitDigest.slice(0, 40)}`;
+
+    const object = Object.freeze({
+      table,
+      indexName,
+      column,
+      indexType: entry.type,
+      objectId,
+      version,
+      prevVersion,
+      currentVersion,
+      commitDigest,
+      createdAt,
+      confirmationStatus: this.opts.transactionCommitExecutor ? "pending" as const : "confirmed" as const,
+      immutable: true as const,
+      keyCount,
+      rowCount,
+      payload,
+    }) as IndexVersionedStorageObject;
+
+    history.push(object);
+    this.indexVersionObjects.set(indexName, history);
+  }
+
+  private recordImmutableIndexVersionObjectsForTable(table: string): void {
+    for (const entry of this.getActiveIndexEntriesForTable(table)) {
+      this.recordImmutableIndexVersionObject(entry);
+    }
+  }
+
+  getIndexVersionObjects(indexName?: string): IndexVersionedStorageObject[] | Record<string, IndexVersionedStorageObject[]> {
+    if (indexName) {
+      const normalized = this.normalizeIndexName(indexName);
+      return (this.indexVersionObjects.get(normalized) ?? []).map((object) => this.cloneIndexVersionObject(object));
+    }
+
+    const out: Record<string, IndexVersionedStorageObject[]> = {};
+    for (const [name, history] of this.indexVersionObjects.entries()) {
+      out[name] = history.map((object) => this.cloneIndexVersionObject(object));
+    }
+    return out;
+  }
+
+  confirmIndexVersionObject(indexName: string, version?: number): IndexVersionedStorageObject | null {
+    const normalized = this.normalizeIndexName(indexName);
+    const history = this.indexVersionObjects.get(normalized);
+    if (!history || history.length === 0) return null;
+    const targetVersion = version ?? history[history.length - 1]!.currentVersion;
+    const idx = history.findIndex((object) => object.currentVersion === targetVersion);
+    if (idx < 0) return null;
+
+    const current = history[idx]!;
+    if (current.confirmationStatus === "confirmed") return this.cloneIndexVersionObject(current);
+
+    const confirmed = Object.freeze({
+      ...current,
+      confirmationStatus: "confirmed" as const,
+    }) as IndexVersionedStorageObject;
+    history[idx] = confirmed;
+    return this.cloneIndexVersionObject(confirmed);
+  }
+
+  private pruneIndexVersionObjectsForTable(table: string): void {
+    const upper = table.toUpperCase();
+    const activeNames = new Set(
+      this.getActiveIndexEntriesForTable(table).map((entry) => this.normalizeIndexName(entry.name)),
+    );
+    for (const [indexName, history] of this.indexVersionObjects.entries()) {
+      if (!history.length) continue;
+      if (history[0]!.table.toUpperCase() !== upper) continue;
+      if (activeNames.has(indexName)) continue;
+      this.indexVersionObjects.delete(indexName);
+    }
+  }
+
   private buildLatestCommittedSnapshotTables(visibility: "pending" | "confirmed"): Map<string, SqlRow[]> {
     const snapshot = new Map<string, SqlRow[]>();
     const allTables = new Set<string>([...this.tables.keys(), ...this.tableVersionObjects.keys()]);
@@ -907,6 +1112,7 @@ export class WalrusSqlClient {
       constraintCost: Map<string, ConstraintIndexCostStats>;
       rowVersions: Map<string, Map<string, number>>;
       tableVersionObjects: Map<string, VersionedStorageObject[]>;
+      indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
     };
 
     internals.tables.clear();
@@ -921,6 +1127,7 @@ export class WalrusSqlClient {
     internals.constraintCost.clear();
     internals.rowVersions.clear();
     internals.tableVersionObjects.clear();
+    internals.indexVersionObjects.clear();
 
     return snapshotClient.query(sql);
   }
@@ -1071,6 +1278,114 @@ export class WalrusSqlClient {
     return rolledBackTxnIds;
   }
 
+  private buildRowLookupByEncodedKey(table: string, rows: SqlRow[]): Map<string, SqlRow> {
+    const lookup = new Map<string, SqlRow>();
+    for (const row of rows) {
+      lookup.set(this.encodeIndexRowRefKey(table, row), row);
+    }
+    return lookup;
+  }
+
+  private restoreSecondaryIndexesFromVersionObjectsForTable(table: string, rows: SqlRow[]): void {
+    const activeEntries = this.getActiveIndexEntriesForTable(table);
+    if (activeEntries.length === 0) {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    const rowLookup = this.buildRowLookupByEncodedKey(table, rows);
+    const restoredHashIndexes = new Map<string, Map<string, Set<SqlRow>>>();
+    const restoredBtreeIndexes: BtreeRuntimeIndexMap = new Map();
+
+    for (const entry of activeEntries) {
+      const indexName = this.normalizeIndexName(entry.name);
+      const history = this.indexVersionObjects.get(indexName) ?? [];
+      const latest = history[history.length - 1];
+      if (!latest) {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+      if (latest.indexType !== entry.type || latest.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+
+      if (entry.type === "HASH") {
+        if (latest.payload.indexType !== "HASH") {
+          this.rebuildSecondaryIndexesForTable(table);
+          return;
+        }
+
+        const buckets = new Map<string, Set<SqlRow>>();
+        for (const bucket of latest.payload.buckets) {
+          const restoredRows = bucket.rowKeys
+            .map((rowKey) => rowLookup.get(rowKey))
+            .filter((row): row is SqlRow => Boolean(row));
+          if (restoredRows.length === 0) continue;
+          buckets.set(bucket.encodedKey, new Set(restoredRows));
+        }
+
+        if (buckets.size > 0) restoredHashIndexes.set(indexName, buckets);
+        continue;
+      }
+
+      if (latest.payload.indexType !== "BTREE") {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+
+      const entries: BtreeIndexLeafEntry[] = [];
+      for (const leaf of latest.payload.entries) {
+        const restoredRows = leaf.rowKeys
+          .map((rowKey) => rowLookup.get(rowKey))
+          .filter((row): row is SqlRow => Boolean(row));
+        if (restoredRows.length === 0) continue;
+        entries.push({
+          key: leaf.key,
+          rows: new Set(restoredRows),
+        });
+      }
+
+      if (entries.length > 0) {
+        restoredBtreeIndexes.set(indexName, {
+          column: latest.column,
+          entries: entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC")),
+        });
+      }
+    }
+
+    if (restoredHashIndexes.size > 0) {
+      let keys = 0;
+      let rowsIndexed = 0;
+      for (const buckets of restoredHashIndexes.values()) {
+        keys += buckets.size;
+        for (const bucketRows of buckets.values()) rowsIndexed += bucketRows.size;
+      }
+      this.hashIndexes.set(table, restoredHashIndexes);
+      this.hashIndexStats.set(table, { keys, rowsIndexed });
+    } else {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+    }
+
+    if (restoredBtreeIndexes.size > 0) {
+      let keys = 0;
+      let rowsIndexed = 0;
+      for (const runtime of restoredBtreeIndexes.values()) {
+        keys += runtime.entries.length;
+        for (const leaf of runtime.entries) rowsIndexed += leaf.rows.size;
+      }
+      this.btreeIndexes.set(table, restoredBtreeIndexes);
+      this.btreeIndexStats.set(table, { keys, rowsIndexed });
+    } else {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+    }
+  }
+
   async recoverConsistentStateFromWalAndVersionChain(
     options?: { pendingStrategy?: "rollback" | "replay" },
   ): Promise<DurabilityRecoverySummary> {
@@ -1084,7 +1399,7 @@ export class WalrusSqlClient {
       const restoredRows = latest.rows.map((row) => ({ ...row }));
       this.tables.set(table, restoredRows);
       this.uniqueIndexes.set(table, this.buildUniqueIndexSnapshot(table, restoredRows));
-      this.rebuildSecondaryIndexesForTable(table);
+      this.restoreSecondaryIndexesFromVersionObjectsForTable(table, restoredRows);
 
       const versions = new Map<string, number>();
       for (const row of restoredRows) {
@@ -1154,6 +1469,9 @@ export class WalrusSqlClient {
       tableVersionObjects: new Map(
         [...this.tableVersionObjects.entries()].map(([table, history]) => [table, [...history]] as const),
       ),
+      indexVersionObjects: new Map(
+        [...this.indexVersionObjects.entries()].map(([indexName, history]) => [indexName, [...history]] as const),
+      ),
       writeVersion: this.writeVersion,
       queryCache: new Map(this.queryCache),
     };
@@ -1207,6 +1525,11 @@ export class WalrusSqlClient {
     this.tableVersionObjects.clear();
     for (const [table, history] of snapshot.tableVersionObjects.entries()) {
       this.tableVersionObjects.set(table, [...history]);
+    }
+
+    this.indexVersionObjects.clear();
+    for (const [indexName, history] of snapshot.indexVersionObjects.entries()) {
+      this.indexVersionObjects.set(indexName, [...history]);
     }
 
     this.writeVersion = snapshot.writeVersion;
@@ -1368,6 +1691,7 @@ export class WalrusSqlClient {
             stats: { insertRows, updateRows, deleteRows },
           });
           this.recordImmutableVersionObject(table, tableStage.rows);
+          this.recordImmutableIndexVersionObjectsForTable(table);
           committedRows += insertRows + updateRows + deleteRows;
         }
       }
@@ -1886,6 +2210,11 @@ export class WalrusSqlClient {
       this.constraintCost.delete(table);
       this.rowVersions.delete(table);
       this.tableVersionObjects.delete(table);
+      for (const [indexName, history] of [...this.indexVersionObjects.entries()]) {
+        if (!history.length) continue;
+        if (history[0]!.table.toUpperCase() !== table.toUpperCase()) continue;
+        this.indexVersionObjects.delete(indexName);
+      }
       this.dirtyTables.delete(table);
       this.recordStorageWrite(table, "DROP_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -2856,6 +3185,7 @@ export class WalrusSqlClient {
       this.rebuildUniqueIndexes(table);
       this.syncConstraintIndexesToCatalog(table);
       this.pruneInvalidIndexesForTable(table);
+      this.pruneIndexVersionObjectsForTable(table);
       this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
@@ -2905,6 +3235,7 @@ export class WalrusSqlClient {
       this.rebuildUniqueIndexes(table);
       this.syncConstraintIndexesToCatalog(table);
       this.pruneInvalidIndexesForTable(table);
+      this.pruneIndexVersionObjectsForTable(table);
       this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
@@ -3603,6 +3934,7 @@ export class WalrusSqlClient {
       status: "ACTIVE",
     });
     this.rebuildBtreeIndexesForTable(table);
+    this.recordImmutableIndexVersionObject(this.indexCatalog.get(indexName)!);
     return table;
   }
 

@@ -1150,6 +1150,46 @@ export interface VersionedStorageObject {
   rows: ReadonlyArray<Readonly<SqlRow>>;
 }
 
+export type IndexStorageObjectType = "HASH" | "BTREE";
+
+export interface IndexHashStorageBucket {
+  encodedKey: string;
+  rowKeys: ReadonlyArray<string>;
+}
+
+export interface IndexBtreeStorageEntry {
+  key: SqlPrimitive;
+  rowKeys: ReadonlyArray<string>;
+}
+
+export type IndexStoragePayload =
+  | {
+      indexType: "HASH";
+      buckets: ReadonlyArray<IndexHashStorageBucket>;
+    }
+  | {
+      indexType: "BTREE";
+      entries: ReadonlyArray<IndexBtreeStorageEntry>;
+    };
+
+export interface IndexVersionedStorageObject {
+  table: string;
+  indexName: string;
+  column: string;
+  indexType: IndexStorageObjectType;
+  objectId: string;
+  version: number;
+  prevVersion: number | null;
+  currentVersion: number;
+  commitDigest: string;
+  createdAt: number;
+  confirmationStatus: "pending" | "confirmed";
+  immutable: true;
+  keyCount: number;
+  rowCount: number;
+  payload: IndexStoragePayload;
+}
+
 export interface DurabilityRecoverySummary {
   strategy: "rollback" | "replay";
   restoredTables: string[];
