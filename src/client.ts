@@ -378,9 +378,16 @@ type BtreeRangeBound = {
   inclusive: boolean;
 };
 
+type BtreePrefixPredicate = {
+  prefix: string;
+  exact: boolean;
+  caseInsensitive: boolean;
+};
+
 type BtreeRangePredicate = {
   lower?: BtreeRangeBound;
   upper?: BtreeRangeBound;
+  prefix?: BtreePrefixPredicate;
 };
 
 type TransactionTableCommitSnapshot = {
@@ -7239,12 +7246,74 @@ export class WalrusSqlClient {
     return parsed as SqlPrimitive;
   }
 
+  private parseLikePrefixPredicate(rawExpr: string, escapeChar?: string): BtreePrefixPredicate | undefined {
+    const parsed = this.parseIndexLiteral(rawExpr);
+    if (typeof parsed !== "string") return undefined;
+
+    const pattern = parsed;
+    const escape = escapeChar?.[0];
+    let prefix = "";
+    let wildcardSeen = false;
+
+    for (let i = 0; i < pattern.length; i += 1) {
+      const ch = pattern[i]!;
+      if (escape && ch === escape) {
+        const next = pattern[i + 1];
+        if (next !== undefined) {
+          if (wildcardSeen) return undefined;
+          prefix += next;
+          i += 1;
+          continue;
+        }
+        if (wildcardSeen) return undefined;
+        prefix += ch;
+        continue;
+      }
+
+      if (ch === "_") return undefined;
+      if (ch === "%") {
+        wildcardSeen = true;
+        continue;
+      }
+      if (wildcardSeen) return undefined;
+      prefix += ch;
+    }
+
+    if (prefix.length === 0) return undefined;
+    return {
+      prefix,
+      exact: !wildcardSeen,
+      caseInsensitive: true,
+    };
+  }
+
+  private pickPreferredBtreePrefixPredicate(
+    current: BtreePrefixPredicate | undefined,
+    candidate: BtreePrefixPredicate,
+  ): BtreePrefixPredicate {
+    if (!current) return candidate;
+    if (candidate.prefix.length > current.prefix.length) return candidate;
+    if (candidate.prefix.length < current.prefix.length) return current;
+    if (candidate.exact && !current.exact) return candidate;
+    if (!candidate.exact && current.exact) return current;
+    return candidate.prefix.localeCompare(current.prefix) < 0 ? candidate : current;
+  }
+
+  private matchesBtreePrefix(key: SqlPrimitive, predicate: BtreePrefixPredicate): boolean {
+    const keyText = String(key);
+    const source = predicate.caseInsensitive ? keyText.toLowerCase() : keyText;
+    const target = predicate.caseInsensitive ? predicate.prefix.toLowerCase() : predicate.prefix;
+    if (predicate.exact) return source === target;
+    return source.startsWith(target);
+  }
+
   private extractBtreeRangePredicate(column: string, whereClauses: WhereClause[]): BtreeRangePredicate | null {
     if (whereClauses.length === 0) return null;
     if (whereClauses.some((clause) => clause.logic === "OR")) return null;
 
     let lower: BtreeRangeBound | undefined;
     let upper: BtreeRangeBound | undefined;
+    let prefix: BtreePrefixPredicate | undefined;
     const target = column.toUpperCase();
 
     for (const clause of whereClauses) {
@@ -7295,11 +7364,20 @@ export class WalrusSqlClient {
 
         lower = this.pickTighterBtreeBound(lower, { value: lowValue, inclusive: true }, "lower");
         upper = this.pickTighterBtreeBound(upper, { value: highValue, inclusive: true }, "upper");
+        continue;
+      }
+
+      if (clause.op === "LIKE") {
+        const patternRaw = clause.valueExprs?.[0];
+        if (!patternRaw) continue;
+        const parsedPrefix = this.parseLikePrefixPredicate(patternRaw, clause.likeEscape);
+        if (!parsedPrefix) continue;
+        prefix = this.pickPreferredBtreePrefixPredicate(prefix, parsedPrefix);
       }
     }
 
-    if (!lower && !upper) return null;
-    return { lower, upper };
+    if (!lower && !upper && !prefix) return null;
+    return { lower, upper, prefix };
   }
 
   private isBtreePredicateEmpty(predicate: BtreeRangePredicate): boolean {
@@ -7337,6 +7415,8 @@ export class WalrusSqlClient {
           continue;
         }
       }
+
+      if (predicate?.prefix && !this.matchesBtreePrefix(leaf.key, predicate.prefix)) continue;
 
       out.push(...leaf.rows.values());
     }
