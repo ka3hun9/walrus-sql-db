@@ -205,6 +205,7 @@ type PhysicalAccessPathMethod =
 type PhysicalIndexAccessStrategy = "FULL_TABLE_SCAN" | "INDEX_SCAN" | "INDEX_BACK_TABLE";
 
 type PlanStabilityReason = "NONE" | "PLAN_STABILITY_PIN" | "BAD_PLAN_FALLBACK_PIN";
+type JoinExecutionAlgorithm = "NESTED_LOOP" | "HASH_JOIN" | "SORT_MERGE_JOIN";
 
 type PhysicalSelectAccessPath = {
   method: PhysicalAccessPathMethod;
@@ -220,10 +221,19 @@ type PhysicalSelectRuntimePath = PhysicalSelectAccessPath & {
   rows: SqlRow[];
 };
 
+type PhysicalJoinPlanStep = {
+  algorithm: JoinExecutionAlgorithm;
+  estimatedCost: number;
+  estimatedOutputRows: number;
+  leftRows: number;
+  rightRows: number;
+};
+
 type PhysicalSelectPlan = {
   optimizerChosen: PhysicalSelectAccessPath;
   chosen: PhysicalSelectAccessPath;
   candidates: PhysicalSelectAccessPath[];
+  joinAlgorithms: PhysicalJoinPlanStep[];
   stabilityReason: PlanStabilityReason;
   stabilityPinned: boolean;
 };
@@ -522,6 +532,11 @@ const DEFAULT_EQUALITY_SELECTIVITY = 0.1;
 const DEFAULT_RANGE_SELECTIVITY = 1 / 3;
 const DEFAULT_LIKE_SELECTIVITY = 0.2;
 const DEFAULT_JOIN_SELECTIVITY = 0.1;
+const HASH_JOIN_STARTUP_COST = 8;
+const HASH_JOIN_BUILD_ROW_THRESHOLD = 64;
+const HASH_JOIN_SPILL_PENALTY_FACTOR = 4;
+const SORT_MERGE_SORT_WORK_FACTOR = 0.2;
+const SORT_MERGE_JOIN_STARTUP_COST = 12;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
@@ -3539,6 +3554,111 @@ export class WalrusSqlClient {
     return rows * logFactor * orderByCount;
   }
 
+  private estimateJoinSortWork(rows: number): number {
+    if (rows <= 1) return rows;
+    return Math.max(1, Math.ceil(this.estimateSortWork(rows, 1) * SORT_MERGE_SORT_WORK_FACTOR));
+  }
+
+  private estimateJoinStepSelectivity(join: SelectJoinStep): number {
+    const parseRef = (field: string): { table: string; column: string } | null => {
+      const trimmed = field.trim();
+      if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+      const parts = trimmed.split(".");
+      if (parts.length < 2) return null;
+      return { table: parts[0]!, column: parts.at(-1)! };
+    };
+
+    const leftRef = parseRef(join.leftField);
+    const rightRef = parseRef(join.rightField);
+    if (!leftRef || !rightRef) return DEFAULT_JOIN_SELECTIVITY;
+
+    const leftStats = this.getOptimizerStatistics(leftRef.table)[0];
+    const rightStats = this.getOptimizerStatistics(rightRef.table)[0];
+    if (!leftStats || !rightStats) return DEFAULT_JOIN_SELECTIVITY;
+
+    return this.estimateJoinReorderSelectivity(leftStats, leftRef.column, rightStats, rightRef.column);
+  }
+
+  private estimateJoinOutputRows(
+    leftRows: number,
+    rightRows: number,
+    join: SelectJoinStep,
+  ): number {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    const selectivity = this.clampSelectivity(this.estimateJoinStepSelectivity(join));
+    const matchedRows = Math.max(0, Math.ceil(left * right * selectivity));
+
+    if (join.type === "LEFT") return Math.max(left, matchedRows);
+    if (join.type === "RIGHT") return Math.max(right, matchedRows);
+    if (join.type === "FULL") return Math.max(Math.max(left, right), matchedRows);
+    return matchedRows;
+  }
+
+  private chooseJoinExecutionAlgorithm(leftRows: number, rightRows: number): {
+    algorithm: JoinExecutionAlgorithm;
+    estimatedCost: number;
+  } {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    const buildRows = Math.min(left, right);
+    const probeRows = Math.max(left, right);
+    const hashSpillPenalty = buildRows > HASH_JOIN_BUILD_ROW_THRESHOLD
+      ? Math.ceil(buildRows * HASH_JOIN_SPILL_PENALTY_FACTOR)
+      : 0;
+
+    const costs: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: Math.max(1, left * right),
+      HASH_JOIN: Math.max(1, buildRows + probeRows + HASH_JOIN_STARTUP_COST + hashSpillPenalty),
+      SORT_MERGE_JOIN: Math.max(
+        1,
+        this.estimateJoinSortWork(left) + this.estimateJoinSortWork(right) + left + right + SORT_MERGE_JOIN_STARTUP_COST,
+      ),
+    };
+
+    const rank: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: 0,
+      HASH_JOIN: 1,
+      SORT_MERGE_JOIN: 2,
+    };
+
+    let bestAlgorithm: JoinExecutionAlgorithm = "NESTED_LOOP";
+    for (const candidate of (["HASH_JOIN", "SORT_MERGE_JOIN"] as JoinExecutionAlgorithm[])) {
+      const candidateCost = costs[candidate];
+      const bestCost = costs[bestAlgorithm];
+      if (candidateCost < bestCost || (candidateCost === bestCost && rank[candidate] < rank[bestAlgorithm])) {
+        bestAlgorithm = candidate;
+      }
+    }
+
+    return {
+      algorithm: bestAlgorithm,
+      estimatedCost: costs[bestAlgorithm],
+    };
+  }
+
+  private buildPhysicalJoinPlan(baseRows: number, joins: SelectJoinStep[]): PhysicalJoinPlanStep[] {
+    const out: PhysicalJoinPlanStep[] = [];
+    let runningRows = Math.max(0, baseRows);
+
+    for (const join of joins) {
+      const rightRows = Math.max(0, this.requireTable(join.table).length);
+      const chosen = this.chooseJoinExecutionAlgorithm(runningRows, rightRows);
+      const estimatedOutputRows = this.estimateJoinOutputRows(runningRows, rightRows, join);
+
+      out.push({
+        algorithm: chosen.algorithm,
+        estimatedCost: chosen.estimatedCost,
+        estimatedOutputRows,
+        leftRows: runningRows,
+        rightRows,
+      });
+      runningRows = estimatedOutputRows;
+    }
+
+    return out;
+  }
+
   private toUnqualifiedColumnName(field: string): string | null {
     const trimmed = field.trim();
     if (!trimmed) return null;
@@ -4593,12 +4713,15 @@ export class WalrusSqlClient {
       indexColumn: candidate.indexColumn,
     });
 
+    const joinAlgorithms = this.buildPhysicalJoinPlan(chosenRuntime.rows.length, logicalPlan.joins);
+
     return {
       logical: logicalPlan,
       physical: {
         optimizerChosen: toPhysicalPath(optimizerChosen),
         chosen: toPhysicalPath(chosenRuntime),
         candidates: candidates.map((candidate) => toPhysicalPath(candidate)),
+        joinAlgorithms,
         stabilityReason: stabilized.reason,
         stabilityPinned: stabilized.reason !== "NONE",
       },
@@ -4740,6 +4863,16 @@ export class WalrusSqlClient {
           logicalJoinOrderFinal: explainPlan.logical.joinReorder.finalJoinOrder.length
             ? explainPlan.logical.joinReorder.finalJoinOrder.join(" -> ")
             : null,
+          physicalJoinCount: explainPlan.physical.joinAlgorithms.length,
+          physicalJoinAlgorithms: explainPlan.physical.joinAlgorithms.length
+            ? explainPlan.physical.joinAlgorithms.map((step) => step.algorithm).join(" -> ")
+            : null,
+          physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
+            ? explainPlan.physical.joinAlgorithms
+              .map((step, idx) =>
+                `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost}]`)
+              .join(" ; ")
+            : null,
           physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
           physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
           physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
@@ -4804,7 +4937,12 @@ export class WalrusSqlClient {
     const logicalPlan = selectPlan.logical;
     const baseRows = logicalPlan.joins.length
       ? logicalPlan.joins.reduce(
-          (acc, joinStep, idx) => this.applyJoin(idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table, acc, joinStep),
+          (acc, joinStep, idx) => this.applyJoin(
+            idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table,
+            acc,
+            joinStep,
+            selectPlan.physical.joinAlgorithms[idx]?.algorithm ?? "NESTED_LOOP",
+          ),
           selectPlan.scannedRows,
         )
       : selectPlan.scannedRows;
@@ -7582,10 +7720,228 @@ export class WalrusSqlClient {
     return undefined;
   }
 
+  private toJoinComparableKey(value: SqlPrimitive | undefined, sourceContext: string): string | null {
+    if (value === null || value === undefined) return null;
+    return this.encodeTypedKey(value, sourceContext);
+  }
+
+  private mergeJoinedRows(leftTable: string, leftRow: SqlRow, rightTable: string, rightRow: SqlRow): SqlRow {
+    const merged: SqlRow = {};
+    for (const [k, v] of Object.entries(leftRow)) {
+      merged[k] = v;
+      merged[`${leftTable}.${k}`] = v;
+    }
+    for (const [k, v] of Object.entries(rightRow)) {
+      merged[`${rightTable}.${k}`] = v;
+      if (!(k in merged)) merged[k] = v;
+    }
+    return merged;
+  }
+
+  private mergeUnmatchedLeftRow(leftTable: string, leftRow: SqlRow): SqlRow {
+    const merged: SqlRow = {};
+    for (const [k, v] of Object.entries(leftRow)) {
+      merged[k] = v;
+      merged[`${leftTable}.${k}`] = v;
+    }
+    return merged;
+  }
+
+  private mergeUnmatchedRightRow(rightTable: string, rightRow: SqlRow): SqlRow {
+    const merged: SqlRow = {};
+    for (const [k, v] of Object.entries(rightRow)) {
+      merged[`${rightTable}.${k}`] = v;
+      if (!(k in merged)) merged[k] = v;
+    }
+    return merged;
+  }
+
+  private applyNestedLoopJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+  ): SqlRow[] {
+    const rightRows = this.requireTable(join.table);
+    const out: SqlRow[] = [];
+    const matchedRightIndexes = new Set<number>();
+
+    for (const leftRow of leftRows) {
+      let matched = false;
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        const rightRow = rightRows[ri]!;
+        const leftVal = this.resolveJoinFieldValue(leftRow, join.leftField);
+        const rightVal = this.resolveJoinFieldValue(rightRow, join.rightField);
+        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
+        matched = true;
+        matchedRightIndexes.add(ri);
+        out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRow));
+      }
+
+      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRightIndexes.has(ri)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+      }
+    }
+
+    return out;
+  }
+
+  private applyHashJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+  ): SqlRow[] {
+    const rightRows = this.requireTable(join.table);
+    const rightIndex = new Map<string, number[]>();
+
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+        "join.hash.right",
+      );
+      if (key === null) continue;
+      const bucket = rightIndex.get(key);
+      if (bucket) bucket.push(ri);
+      else rightIndex.set(key, [ri]);
+    }
+
+    const out: SqlRow[] = [];
+    const matchedRightIndexes = new Set<number>();
+
+    for (const leftRow of leftRows) {
+      let matched = false;
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(leftRow, join.leftField),
+        "join.hash.left",
+      );
+      const rightHits = key === null ? undefined : rightIndex.get(key);
+      if (rightHits?.length) {
+        for (const ri of rightHits) {
+          matched = true;
+          matchedRightIndexes.add(ri);
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[ri]!));
+        }
+      }
+
+      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRightIndexes.has(ri)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+      }
+    }
+
+    return out;
+  }
+
+  private applySortMergeJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+  ): SqlRow[] {
+    const rightRows = this.requireTable(join.table);
+    type JoinEntry = { key: string; rowIndex: number };
+
+    const leftEntries: JoinEntry[] = [];
+    for (let li = 0; li < leftRows.length; li++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(leftRows[li]!, join.leftField),
+        "join.merge.left",
+      );
+      if (key !== null) leftEntries.push({ key, rowIndex: li });
+    }
+
+    const rightEntries: JoinEntry[] = [];
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+        "join.merge.right",
+      );
+      if (key !== null) rightEntries.push({ key, rowIndex: ri });
+    }
+
+    leftEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : a.key.localeCompare(b.key)));
+    rightEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : a.key.localeCompare(b.key)));
+
+    const matchesByLeft = new Map<number, number[]>();
+    const matchedRightIndexes = new Set<number>();
+
+    let li = 0;
+    let ri = 0;
+    while (li < leftEntries.length && ri < rightEntries.length) {
+      const leftEntry = leftEntries[li]!;
+      const rightEntry = rightEntries[ri]!;
+      const cmp = leftEntry.key.localeCompare(rightEntry.key);
+
+      if (cmp < 0) {
+        li += 1;
+        continue;
+      }
+      if (cmp > 0) {
+        ri += 1;
+        continue;
+      }
+
+      let liEnd = li + 1;
+      while (liEnd < leftEntries.length && leftEntries[liEnd]!.key === leftEntry.key) liEnd += 1;
+      let riEnd = ri + 1;
+      while (riEnd < rightEntries.length && rightEntries[riEnd]!.key === rightEntry.key) riEnd += 1;
+
+      const rightGroupIndexes = rightEntries.slice(ri, riEnd).map((entry) => entry.rowIndex);
+      for (let leftIdx = li; leftIdx < liEnd; leftIdx++) {
+        const leftRowIndex = leftEntries[leftIdx]!.rowIndex;
+        const bucket = matchesByLeft.get(leftRowIndex) ?? [];
+        for (const rightRowIndex of rightGroupIndexes) {
+          bucket.push(rightRowIndex);
+          matchedRightIndexes.add(rightRowIndex);
+        }
+        matchesByLeft.set(leftRowIndex, bucket);
+      }
+
+      li = liEnd;
+      ri = riEnd;
+    }
+
+    const out: SqlRow[] = [];
+    for (let leftRowIndex = 0; leftRowIndex < leftRows.length; leftRowIndex++) {
+      const leftRow = leftRows[leftRowIndex]!;
+      const rightHits = matchesByLeft.get(leftRowIndex);
+      if (rightHits?.length) {
+        for (const rightRowIndex of rightHits) {
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[rightRowIndex]!));
+        }
+        continue;
+      }
+      if (join.type === "LEFT" || join.type === "FULL") {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let rightRowIndex = 0; rightRowIndex < rightRows.length; rightRowIndex++) {
+        if (matchedRightIndexes.has(rightRowIndex)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[rightRowIndex]!));
+      }
+    }
+
+    return out;
+  }
+
   private applyJoin(
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
+    algorithm: JoinExecutionAlgorithm = "NESTED_LOOP",
   ): SqlRow[] {
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
@@ -7595,59 +7951,12 @@ export class WalrusSqlClient {
         leftField: join.rightField,
         rightField: join.leftField,
       };
-      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin);
+      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin, algorithm);
     }
 
-    const rightRows = this.requireTable(join.table);
-
-    const out: SqlRow[] = [];
-    const matchedRightIndexes = new Set<number>();
-    for (const l of leftRows) {
-      let matched = false;
-      for (let ri = 0; ri < rightRows.length; ri++) {
-        const r = rightRows[ri]!;
-        const leftVal = this.resolveJoinFieldValue(l, join.leftField);
-        const rightVal = this.resolveJoinFieldValue(r, join.rightField);
-        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
-        matched = true;
-        matchedRightIndexes.add(ri);
-        const merged: SqlRow = {};
-
-        for (const [k, v] of Object.entries(l)) {
-          merged[k] = v;
-          merged[`${leftTable}.${k}`] = v;
-        }
-        for (const [k, v] of Object.entries(r)) {
-          merged[`${join.table}.${k}`] = v;
-          if (!(k in merged)) merged[k] = v;
-        }
-
-        out.push(merged);
-      }
-
-      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-        const merged: SqlRow = {};
-        for (const [k, v] of Object.entries(l)) {
-          merged[k] = v;
-          merged[`${leftTable}.${k}`] = v;
-        }
-        out.push(merged);
-      }
-    }
-
-    if (join.type === "FULL") {
-      for (let ri = 0; ri < rightRows.length; ri++) {
-        if (matchedRightIndexes.has(ri)) continue;
-        const r = rightRows[ri]!;
-        const merged: SqlRow = {};
-        for (const [k, v] of Object.entries(r)) {
-          merged[`${join.table}.${k}`] = v;
-          if (!(k in merged)) merged[k] = v;
-        }
-        out.push(merged);
-      }
-    }
-    return out;
+    if (algorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join);
+    if (algorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join);
+    return this.applyNestedLoopJoin(leftTable, leftRows, join);
   }
 
   private parseWhereTree(whereExpr: string): WhereExprNode {
