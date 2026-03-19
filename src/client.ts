@@ -164,14 +164,24 @@ type LogicalPredicateSource = "AST" | "TREE" | "CLAUSES" | "NONE";
 type LogicalRewriteRule =
   | "RULE_CANONICALIZE_JOIN_CHAIN"
   | "RULE_PREFER_AST_PREDICATE"
-  | "RULE_NORMALIZE_ORDER_BY_DIRECTION";
+  | "RULE_NORMALIZE_ORDER_BY_DIRECTION"
+  | "RULE_COST_BASED_JOIN_REORDER";
 
 type SelectJoinStep = NonNullable<ParsedSelect["joins"]>[number];
+
+type LogicalJoinReorderInfo = {
+  applied: boolean;
+  algorithm: "NONE" | "GREEDY_CBO";
+  estimatedCost: number | null;
+  originalJoinOrder: string[];
+  finalJoinOrder: string[];
+};
 
 type LogicalSelectPlan = {
   table: string;
   fields: string[] | ["*"];
   joins: SelectJoinStep[];
+  joinReorder: LogicalJoinReorderInfo;
   predicateSource: LogicalPredicateSource;
   where?: string;
   having?: string;
@@ -511,6 +521,7 @@ const DEFAULT_PREDICATE_SELECTIVITY = 0.25;
 const DEFAULT_EQUALITY_SELECTIVITY = 0.1;
 const DEFAULT_RANGE_SELECTIVITY = 1 / 3;
 const DEFAULT_LIKE_SELECTIVITY = 0.2;
+const DEFAULT_JOIN_SELECTIVITY = 0.1;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
@@ -3206,10 +3217,254 @@ export class WalrusSqlClient {
     };
   }
 
+  private resolveJoinReorderFieldRef(
+    field: string,
+    knownTables: Map<string, string>,
+  ): { table: string; column: string } | null {
+    const trimmed = field.trim();
+    if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+    const parts = trimmed.split(".");
+    if (parts.length < 2) return null;
+    const tableToken = parts[0]!;
+    const column = parts.at(-1)!;
+    const table = knownTables.get(tableToken.toUpperCase());
+    if (!table) return null;
+    return { table, column };
+  }
+
+  private estimateJoinReorderTableSelectivity(
+    parsed: Pick<ParsedSelect, "table" | "whereClauses">,
+    table: string,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    if (parsed.whereClauses.length === 0) return 1;
+    const target = table.toUpperCase();
+    const base = parsed.table.toUpperCase();
+
+    const relevantClauses: WhereClause[] = [];
+    for (const clause of parsed.whereClauses) {
+      const field = clause.field?.trim();
+      if (!field) continue;
+      const parts = field.split(".");
+      const hasQualifier = parts.length >= 2;
+      if (hasQualifier) {
+        const qualifier = parts[0]!.toUpperCase();
+        if (qualifier !== target) continue;
+      } else if (target !== base) {
+        // Unqualified columns are assumed to belong to the base table in join planning.
+        continue;
+      }
+      relevantClauses.push(clause);
+    }
+
+    if (relevantClauses.length === 0) return 1;
+    return this.estimateWhereClausesSelectivity(relevantClauses, tableRowCount, stats);
+  }
+
+  private pickJoinReorderColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    column: string,
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats) return undefined;
+    return stats.columns.find((entry) => entry.column.toUpperCase() === column.toUpperCase());
+  }
+
+  private estimateJoinReorderSelectivity(
+    leftStats: OptimizerTableStatistics | undefined,
+    leftColumn: string,
+    rightStats: OptimizerTableStatistics | undefined,
+    rightColumn: string,
+  ): number {
+    const leftColumnStats = this.pickJoinReorderColumnStats(leftStats, leftColumn);
+    const rightColumnStats = this.pickJoinReorderColumnStats(rightStats, rightColumn);
+
+    const leftNonNull = this.clampSelectivity(1 - (leftColumnStats?.nullRatio ?? 0));
+    const rightNonNull = this.clampSelectivity(1 - (rightColumnStats?.nullRatio ?? 0));
+    const ndvLeft = leftColumnStats?.ndv ?? 0;
+    const ndvRight = rightColumnStats?.ndv ?? 0;
+    const denom = Math.max(ndvLeft, ndvRight);
+
+    if (denom <= 0) {
+      return this.clampSelectivity(leftNonNull * rightNonNull * DEFAULT_JOIN_SELECTIVITY);
+    }
+    return this.clampSelectivity((leftNonNull * rightNonNull) / denom);
+  }
+
+  private tryCostBasedJoinReorder(
+    baseTable: string,
+    joins: SelectJoinStep[],
+    parsed: Pick<ParsedSelect, "table" | "whereClauses">,
+  ): { joins: SelectJoinStep[]; joinReorder: LogicalJoinReorderInfo } {
+    const originalJoinOrder = joins.map((join) => join.table);
+    const baseJoinReorder: LogicalJoinReorderInfo = {
+      applied: false,
+      algorithm: "NONE",
+      estimatedCost: null,
+      originalJoinOrder,
+      finalJoinOrder: originalJoinOrder,
+    };
+
+    if (joins.length < 2) return { joins, joinReorder: baseJoinReorder };
+    if (joins.some((join) => join.type !== "INNER")) return { joins, joinReorder: baseJoinReorder };
+
+    const tableByUpper = new Map<string, string>();
+    const allTables = [baseTable, ...joins.map((join) => join.table)];
+    for (const table of allTables) {
+      const upper = table.toUpperCase();
+      if (tableByUpper.has(upper)) return { joins, joinReorder: baseJoinReorder };
+      tableByUpper.set(upper, table);
+    }
+
+    type JoinEdge = {
+      id: number;
+      leftTable: string;
+      leftColumn: string;
+      rightTable: string;
+      rightColumn: string;
+    };
+
+    const edges: JoinEdge[] = [];
+    for (let i = 0; i < joins.length; i++) {
+      const join = joins[i]!;
+      const leftRef = this.resolveJoinReorderFieldRef(join.leftField, tableByUpper);
+      const rightRef = this.resolveJoinReorderFieldRef(join.rightField, tableByUpper);
+      if (!leftRef || !rightRef) return { joins, joinReorder: baseJoinReorder };
+      if (leftRef.table.toUpperCase() === rightRef.table.toUpperCase()) return { joins, joinReorder: baseJoinReorder };
+
+      const joinTableUpper = join.table.toUpperCase();
+      if (joinTableUpper !== leftRef.table.toUpperCase() && joinTableUpper !== rightRef.table.toUpperCase()) {
+        return { joins, joinReorder: baseJoinReorder };
+      }
+
+      edges.push({
+        id: i,
+        leftTable: leftRef.table,
+        leftColumn: leftRef.column,
+        rightTable: rightRef.table,
+        rightColumn: rightRef.column,
+      });
+    }
+
+    const tableRuntime = new Map<string, {
+      rows: number;
+      filteredRows: number;
+      stats: OptimizerTableStatistics | undefined;
+    }>();
+    for (const table of tableByUpper.values()) {
+      const stats = this.getOptimizerStatistics(table)[0];
+      const rowCount = Math.max(0, stats?.rowCount ?? this.tables.get(table)?.length ?? 0);
+      const selectivity = this.estimateJoinReorderTableSelectivity(parsed, table, rowCount, stats);
+      const filteredRows = Math.max(0, Math.ceil(rowCount * selectivity));
+      tableRuntime.set(table, { rows: rowCount, filteredRows, stats });
+    }
+
+    const visitedTables = new Set<string>([baseTable.toUpperCase()]);
+    const usedEdges = new Set<number>();
+    const reorderedJoins: SelectJoinStep[] = [];
+
+    let runningRows = tableRuntime.get(baseTable)?.filteredRows ?? 0;
+    let totalCost = Math.max(1, runningRows);
+
+    while (reorderedJoins.length < joins.length) {
+      let bestCandidate: {
+        edgeId: number;
+        leftTable: string;
+        leftColumn: string;
+        rightTable: string;
+        rightColumn: string;
+        outputRows: number;
+        stepCost: number;
+      } | null = null;
+
+      for (const edge of edges) {
+        if (usedEdges.has(edge.id)) continue;
+        const leftVisited = visitedTables.has(edge.leftTable.toUpperCase());
+        const rightVisited = visitedTables.has(edge.rightTable.toUpperCase());
+        if (leftVisited === rightVisited) continue;
+
+        const leftTable = leftVisited ? edge.leftTable : edge.rightTable;
+        const rightTable = leftVisited ? edge.rightTable : edge.leftTable;
+        const leftColumn = leftVisited ? edge.leftColumn : edge.rightColumn;
+        const rightColumn = leftVisited ? edge.rightColumn : edge.leftColumn;
+
+        const rightRows = tableRuntime.get(rightTable)?.filteredRows ?? 0;
+        const joinSelectivity = this.estimateJoinReorderSelectivity(
+          tableRuntime.get(leftTable)?.stats,
+          leftColumn,
+          tableRuntime.get(rightTable)?.stats,
+          rightColumn,
+        );
+
+        const outputRows = Math.max(0, Math.ceil(runningRows * rightRows * joinSelectivity));
+        const stepCost = runningRows + rightRows + outputRows;
+
+        if (!bestCandidate) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (stepCost < bestCandidate.stepCost) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (stepCost > bestCandidate.stepCost) continue;
+        if (outputRows < bestCandidate.outputRows) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (outputRows > bestCandidate.outputRows) continue;
+        if (rightTable.localeCompare(bestCandidate.rightTable) < 0) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+        }
+      }
+
+      if (!bestCandidate) {
+        return { joins, joinReorder: baseJoinReorder };
+      }
+
+      usedEdges.add(bestCandidate.edgeId);
+      visitedTables.add(bestCandidate.rightTable.toUpperCase());
+      runningRows = bestCandidate.outputRows;
+      totalCost += bestCandidate.stepCost;
+
+      reorderedJoins.push({
+        type: "INNER",
+        table: bestCandidate.rightTable,
+        leftField: `${bestCandidate.leftTable}.${bestCandidate.leftColumn}`,
+        rightField: `${bestCandidate.rightTable}.${bestCandidate.rightColumn}`,
+      });
+    }
+
+    const finalJoinOrder = reorderedJoins.map((join) => join.table);
+    const applied = finalJoinOrder.some(
+      (table, idx) => table.toUpperCase() !== (originalJoinOrder[idx] ?? "").toUpperCase(),
+    );
+    if (!applied) {
+      return {
+        joins,
+        joinReorder: {
+          ...baseJoinReorder,
+          estimatedCost: Math.max(1, Math.ceil(totalCost)),
+        },
+      };
+    }
+
+    return {
+      joins: reorderedJoins,
+      joinReorder: {
+        applied: true,
+        algorithm: "GREEDY_CBO",
+        estimatedCost: Math.max(1, Math.ceil(totalCost)),
+        originalJoinOrder,
+        finalJoinOrder,
+      },
+    };
+  }
+
   private buildLogicalSelectPlan(parsed: ParsedSelect): LogicalSelectPlan {
     const rewriteRules: LogicalRewriteRule[] = [];
 
-    const joins = parsed.joins?.length
+    const rawJoins = parsed.joins?.length
       ? parsed.joins.map((j) => ({
           type: j.type,
           table: j.table,
@@ -3224,7 +3479,15 @@ export class WalrusSqlClient {
           rightField: parsed.join.rightField,
         }]
       : [];
-    if (joins.length > 0) rewriteRules.push("RULE_CANONICALIZE_JOIN_CHAIN");
+    if (rawJoins.length > 0) rewriteRules.push("RULE_CANONICALIZE_JOIN_CHAIN");
+
+    const reorderedJoinPlan = this.tryCostBasedJoinReorder(parsed.table, rawJoins, {
+      table: parsed.table,
+      whereClauses: parsed.whereClauses,
+    });
+    const joins = reorderedJoinPlan.joins;
+    const joinReorder = reorderedJoinPlan.joinReorder;
+    if (joinReorder.applied) rewriteRules.push("RULE_COST_BASED_JOIN_REORDER");
 
     const orderByList = parsed.orderByList?.map((order) => ({
       field: order.field.trim(),
@@ -3254,6 +3517,7 @@ export class WalrusSqlClient {
       table: parsed.table,
       fields: parsed.fields,
       joins,
+      joinReorder,
       predicateSource,
       where: parsed.where,
       having: parsed.having,
@@ -4467,6 +4731,15 @@ export class WalrusSqlClient {
           logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
           logicalPredicateSource: explainPlan.logical.predicateSource,
           logicalJoinCount: explainPlan.logical.joins.length,
+          logicalJoinReorderApplied: explainPlan.logical.joinReorder.applied,
+          logicalJoinReorderAlgorithm: explainPlan.logical.joinReorder.algorithm,
+          logicalJoinReorderCost: explainPlan.logical.joinReorder.estimatedCost,
+          logicalJoinOrderOriginal: explainPlan.logical.joinReorder.originalJoinOrder.length
+            ? explainPlan.logical.joinReorder.originalJoinOrder.join(" -> ")
+            : null,
+          logicalJoinOrderFinal: explainPlan.logical.joinReorder.finalJoinOrder.length
+            ? explainPlan.logical.joinReorder.finalJoinOrder.join(" -> ")
+            : null,
           physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
           physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
           physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
@@ -7298,6 +7571,17 @@ export class WalrusSqlClient {
     };
   }
 
+  private resolveJoinFieldValue(row: SqlRow, field: string): SqlPrimitive | undefined {
+    const trimmed = field.trim();
+    if (!trimmed) return undefined;
+    if (Object.prototype.hasOwnProperty.call(row, trimmed)) return row[trimmed] as SqlPrimitive;
+
+    const parts = trimmed.split(".");
+    const unqualified = parts.at(-1) ?? trimmed;
+    if (Object.prototype.hasOwnProperty.call(row, unqualified)) return row[unqualified] as SqlPrimitive;
+    return undefined;
+  }
+
   private applyJoin(
     leftTable: string,
     leftRows: SqlRow[],
@@ -7315,8 +7599,6 @@ export class WalrusSqlClient {
     }
 
     const rightRows = this.requireTable(join.table);
-    const leftField = join.leftField.includes(".") ? join.leftField.split(".")[1] : join.leftField;
-    const rightField = join.rightField.includes(".") ? join.rightField.split(".")[1] : join.rightField;
 
     const out: SqlRow[] = [];
     const matchedRightIndexes = new Set<number>();
@@ -7324,8 +7606,8 @@ export class WalrusSqlClient {
       let matched = false;
       for (let ri = 0; ri < rightRows.length; ri++) {
         const r = rightRows[ri]!;
-        const leftVal = l[leftField];
-        const rightVal = r[rightField];
+        const leftVal = this.resolveJoinFieldValue(l, join.leftField);
+        const rightVal = this.resolveJoinFieldValue(r, join.rightField);
         if (!this.joinKeyEqual(leftVal, rightVal)) continue;
         matched = true;
         matchedRightIndexes.add(ri);
