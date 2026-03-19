@@ -6801,6 +6801,50 @@ export class WalrusSqlClient {
     return this.deepCloneRows(projected);
   }
 
+  private parseSubqueryExistsValue(subquerySql: string, outerRow?: SqlRow): boolean {
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    const plan = this.getParsedSubqueryPlan(normalized);
+    const aggMatch = plan.fieldExpr.match(
+      /^([a-zA-Z_][a-zA-Z0-9_]*)\((\*|[a-zA-Z_][a-zA-Z0-9_\.]*)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*))?$/i,
+    );
+    if (aggMatch) {
+      const fn = aggMatch[1]!.toUpperCase();
+      if (fn === "COUNT" || fn === "SUM" || fn === "AVG" || fn === "MIN" || fn === "MAX") {
+        return this.parseSubquerySelect(normalized, outerRow).length > 0;
+      }
+    }
+
+    const stats = this.getOrCreateSubqueryStats(normalized);
+    const correlated = plan.outerRefs.length > 0;
+
+    stats.executions += 1;
+    if (correlated) stats.correlatedExecutions += 1;
+
+    const cacheKey = `${this.buildSubqueryResultCacheKey(plan, outerRow)}::EXISTS`;
+    const cached = this.subqueryRuntime?.resultCache.get(cacheKey);
+    if (cached) {
+      stats.cacheHits += 1;
+      stats.rowsReturned += cached.length;
+      return cached.length > 0;
+    }
+    stats.cacheMisses += 1;
+
+    const sourceRows = this.requireTable(plan.table);
+    for (const innerRow of sourceRows) {
+      this.consumeSubqueryCost(stats, correlated, normalized);
+      const evalRow = this.buildSubqueryEvalRow(innerRow, plan.table, plan.tableAlias, outerRow);
+      if (plan.whereTree && this.evaluateWhereTree(evalRow, plan.whereTree) !== "TRUE") continue;
+
+      const existsRow: SqlRow[] = [{ __exists: 1 }];
+      stats.rowsReturned += existsRow.length;
+      this.storeSubqueryResultCache(cacheKey, existsRow);
+      return true;
+    }
+
+    this.storeSubqueryResultCache(cacheKey, []);
+    return false;
+  }
+
   private parseSubqueryValues(subquerySql: string, field?: string, outerRow?: SqlRow): SqlPrimitive[] {
     const rows = this.parseSubquerySelect(subquerySql, outerRow);
     if (!rows.length) return [];
@@ -7252,7 +7296,7 @@ export class WalrusSqlClient {
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
-      const exists = this.parseSubquerySelect(subquerySql, row).length > 0;
+      const exists = this.parseSubqueryExistsValue(subquerySql, row);
       const tv: TruthValue = exists ? "TRUE" : "FALSE";
       return clause.op === "EXISTS" ? tv : this.tvNot(tv);
     }

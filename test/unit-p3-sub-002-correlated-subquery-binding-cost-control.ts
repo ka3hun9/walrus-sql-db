@@ -46,7 +46,7 @@ assert.equal(costStats!.executions, 5);
 assert.equal(costStats!.correlatedExecutions, 5);
 assert.equal(costStats!.cacheMisses, 3);
 assert.equal(costStats!.cacheHits, 2);
-assert.equal(costStats!.rowsScanned, 12);
+assert.equal(costStats!.rowsScanned, 8);
 assert.equal(costStats!.budgetExceededCount, 0);
 
 console.log("ok: P3-SUB-002 correlated subquery outer binding and cost control");
