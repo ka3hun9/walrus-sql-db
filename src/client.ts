@@ -6392,15 +6392,18 @@ export class WalrusSqlClient {
       };
     }
 
-    const cmpSubqueryMatch = expr.match(
-      /^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*\(\s*(SELECT\s+.+)\s*\)$/i,
-    );
-    if (cmpSubqueryMatch) {
-      return {
-        field: cmpSubqueryMatch[1],
-        op: cmpSubqueryMatch[2] as CompareOp,
-        subquerySql: cmpSubqueryMatch[3],
-      };
+    const cmpSubqueryTopLevel = this.findTopLevelComparator(expr);
+    if (cmpSubqueryTopLevel) {
+      const rightSubquery = cmpSubqueryTopLevel.right.trim().match(/^\(\s*(SELECT\s+.+)\s*\)$/i);
+      if (rightSubquery) {
+        const leftParsed = this.parseFieldExpr(cmpSubqueryTopLevel.left);
+        return {
+          field: leftParsed.field,
+          valueExpr: leftParsed.valueExpr,
+          op: cmpSubqueryTopLevel.op as CompareOp,
+          subquerySql: rightSubquery[1]!.trim(),
+        };
+      }
     }
 
     const truthPredMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?(TRUE|FALSE|UNKNOWN)$/i);

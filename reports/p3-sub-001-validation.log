@@ -1,0 +1,17 @@
+﻿=== P3-SUB-001 validation 2026-03-19T23:46:52.6111891+08:00 ===
+[cmd] npm run build
+
+> walrus-sql-db@0.3.0 build
+> npm run clean && tsc -p tsconfig.json
+
+
+> walrus-sql-db@0.3.0 clean
+> node -e "require('node:fs').rmSync('dist',{ recursive:true, force:true })"
+
+[cmd] npx tsx test/unit-p3-sub-001-scalar-subquery-single-row-semantics.ts
+ok: P3-SUB-001 scalar subquery execution and single-row error semantics
+[cmd] npx tsx test/unit-c-exec-003-scalar-subquery-cardinality.ts
+ok: C-EXEC-003 scalar subquery cardinality and error handling
+[cmd] npx tsx test/unit-d-dml-002-update-subquery-where.ts
+ok: D-DML-002 UPDATE subquery predicates (scalar/IN/EXISTS)
+=== validation complete ===
