@@ -323,12 +323,24 @@ type SelectExecutionPipelineStats = {
   rowsVisited: number;
   rowsReturned: number;
   maxBufferedRows: number;
+  joinSpillExecutions: number;
+  joinSpillChunks: number;
+  joinSpillRowsProcessed: number;
   lastMode: SelectExecutionMode;
   lastRowsVisited: number;
   lastRowsReturned: number;
   lastBufferedRows: number;
   lastEarlyStop: boolean;
+  lastJoinSpillSteps: number;
+  lastJoinSpillChunks: number;
+  lastJoinSpillRowsProcessed: number;
   lastBlockers: SelectPipelineBlocker[];
+};
+
+type JoinSpillRuntimeStats = {
+  steps: number;
+  chunks: number;
+  rowsProcessed: number;
 };
 
 type DmlPlan = {
@@ -3778,6 +3790,15 @@ export class WalrusSqlClient {
     return DEFAULT_JOIN_MEMORY_BUDGET_ROWS;
   }
 
+  private getJoinSpillChunkRows(): number {
+    const budgetRows = this.getJoinMemoryBudgetRows();
+    const configured = this.opts.joinExecution?.spillChunkRows;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.max(1, Math.min(Math.floor(configured), budgetRows));
+    }
+    return budgetRows;
+  }
+
   private estimateJoinAlgorithmMemoryRows(
     algorithm: JoinExecutionAlgorithm,
     leftRows: number,
@@ -4205,11 +4226,17 @@ export class WalrusSqlClient {
       rowsVisited: 0,
       rowsReturned: 0,
       maxBufferedRows: 0,
+      joinSpillExecutions: 0,
+      joinSpillChunks: 0,
+      joinSpillRowsProcessed: 0,
       lastMode: "MATERIALIZED",
       lastRowsVisited: 0,
       lastRowsReturned: 0,
       lastBufferedRows: 0,
       lastEarlyStop: false,
+      lastJoinSpillSteps: 0,
+      lastJoinSpillChunks: 0,
+      lastJoinSpillRowsProcessed: 0,
       lastBlockers: [],
     };
     this.selectExecutionPipelineStats.set(key, created);
@@ -4248,6 +4275,7 @@ export class WalrusSqlClient {
     bufferedRows: number,
     earlyStop: boolean,
     blockers: SelectPipelineBlocker[],
+    joinSpill?: JoinSpillRuntimeStats,
   ): void {
     const stats = this.getOrCreateSelectExecutionPipelineStats(key);
     stats.executions += 1;
@@ -4262,6 +4290,15 @@ export class WalrusSqlClient {
     stats.lastRowsReturned = rowsReturned;
     stats.lastBufferedRows = bufferedRows;
     stats.lastEarlyStop = earlyStop;
+    const joinSpillSteps = joinSpill?.steps ?? 0;
+    const joinSpillChunks = joinSpill?.chunks ?? 0;
+    const joinSpillRowsProcessed = joinSpill?.rowsProcessed ?? 0;
+    if (joinSpillSteps > 0) stats.joinSpillExecutions += 1;
+    stats.joinSpillChunks += joinSpillChunks;
+    stats.joinSpillRowsProcessed += joinSpillRowsProcessed;
+    stats.lastJoinSpillSteps = joinSpillSteps;
+    stats.lastJoinSpillChunks = joinSpillChunks;
+    stats.lastJoinSpillRowsProcessed = joinSpillRowsProcessed;
     stats.lastBlockers = [...blockers];
   }
 
@@ -4911,11 +4948,17 @@ export class WalrusSqlClient {
     rowsVisited: number;
     rowsReturned: number;
     maxBufferedRows: number;
+    joinSpillExecutions: number;
+    joinSpillChunks: number;
+    joinSpillRowsProcessed: number;
     lastMode: SelectExecutionMode;
     lastRowsVisited: number;
     lastRowsReturned: number;
     lastBufferedRows: number;
     lastEarlyStop: boolean;
+    lastJoinSpillSteps: number;
+    lastJoinSpillChunks: number;
+    lastJoinSpillRowsProcessed: number;
     lastBlockers: SelectPipelineBlocker[];
   }> {
     const target = sql?.trim().replace(/\s+/g, " ");
@@ -4928,11 +4971,17 @@ export class WalrusSqlClient {
       rowsVisited: number;
       rowsReturned: number;
       maxBufferedRows: number;
+      joinSpillExecutions: number;
+      joinSpillChunks: number;
+      joinSpillRowsProcessed: number;
       lastMode: SelectExecutionMode;
       lastRowsVisited: number;
       lastRowsReturned: number;
       lastBufferedRows: number;
       lastEarlyStop: boolean;
+      lastJoinSpillSteps: number;
+      lastJoinSpillChunks: number;
+      lastJoinSpillRowsProcessed: number;
       lastBlockers: SelectPipelineBlocker[];
     }> = [];
 
@@ -4947,11 +4996,17 @@ export class WalrusSqlClient {
         rowsVisited: stats.rowsVisited,
         rowsReturned: stats.rowsReturned,
         maxBufferedRows: stats.maxBufferedRows,
+        joinSpillExecutions: stats.joinSpillExecutions,
+        joinSpillChunks: stats.joinSpillChunks,
+        joinSpillRowsProcessed: stats.joinSpillRowsProcessed,
         lastMode: stats.lastMode,
         lastRowsVisited: stats.lastRowsVisited,
         lastRowsReturned: stats.lastRowsReturned,
         lastBufferedRows: stats.lastBufferedRows,
         lastEarlyStop: stats.lastEarlyStop,
+        lastJoinSpillSteps: stats.lastJoinSpillSteps,
+        lastJoinSpillChunks: stats.lastJoinSpillChunks,
+        lastJoinSpillRowsProcessed: stats.lastJoinSpillRowsProcessed,
         lastBlockers: [...stats.lastBlockers],
       });
     }
@@ -5258,6 +5313,7 @@ export class WalrusSqlClient {
             physicalJoinMemoryBudgetRows: explainPlan.physical.joinAlgorithms.length
               ? explainPlan.physical.joinAlgorithms[0]!.memoryBudgetRows
               : this.getJoinMemoryBudgetRows(),
+            physicalJoinSpillChunkRows: this.getJoinSpillChunkRows(),
             physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
               ? explainPlan.physical.joinAlgorithms
                 .map((step, idx) =>
@@ -5331,6 +5387,7 @@ export class WalrusSqlClient {
       });
 
       const logicalPlan = selectPlan.logical;
+      const joinSpillStats: JoinSpillRuntimeStats = { steps: 0, chunks: 0, rowsProcessed: 0 };
       const baseRows = logicalPlan.joins.length
         ? logicalPlan.joins.reduce(
             (acc, joinStep, idx) => this.applyJoin(
@@ -5338,6 +5395,7 @@ export class WalrusSqlClient {
               acc,
               joinStep,
               selectPlan.physical.joinAlgorithms[idx]?.algorithm ?? "NESTED_LOOP",
+              joinSpillStats,
             ),
             selectPlan.scannedRows,
           )
@@ -5356,6 +5414,7 @@ export class WalrusSqlClient {
           pipelinedResult.rows.length,
           pipelined.earlyStop,
           executionMode.blockers,
+          joinSpillStats,
         );
         const successMeta: Record<string, unknown> = {
           sql: normalized,
@@ -5401,6 +5460,7 @@ export class WalrusSqlClient {
           Math.max(baseRows.length, filtered.length, grouped.length, havingRows.length, orderedGrouped.length, pagedGrouped.length),
           false,
           executionMode.blockers,
+          joinSpillStats,
         );
         return groupedResult;
       }
@@ -5418,6 +5478,7 @@ export class WalrusSqlClient {
           Math.max(baseRows.length, filtered.length),
           false,
           executionMode.blockers,
+          joinSpillStats,
         );
         return aggregateResult;
       }
@@ -5441,6 +5502,7 @@ export class WalrusSqlClient {
         Math.max(baseRows.length, filtered.length, withWindow.length, ordered.length, paged.length),
         false,
         executionMode.blockers,
+        joinSpillStats,
       );
       const successMeta: Record<string, unknown> = {
         sql: normalized,
@@ -8895,15 +8957,81 @@ export class WalrusSqlClient {
     return out;
   }
 
-  private resolveJoinAlgorithmByMemoryBudget(
+  private shouldApplyJoinSpillStrategy(
     algorithm: JoinExecutionAlgorithm,
     leftRows: number,
     rightRows: number,
-  ): JoinExecutionAlgorithm {
-    if (algorithm === "NESTED_LOOP") return algorithm;
+  ): boolean {
+    if (algorithm === "NESTED_LOOP") return false;
     const budgetRows = this.getJoinMemoryBudgetRows();
     const estimatedMemoryRows = this.estimateJoinAlgorithmMemoryRows(algorithm, leftRows, rightRows);
-    return estimatedMemoryRows <= budgetRows ? algorithm : "NESTED_LOOP";
+    return estimatedMemoryRows > budgetRows;
+  }
+
+  private applySpillChunkJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[],
+    chunkRows: number,
+  ): { rows: SqlRow[]; chunks: number; rowsProcessed: number } {
+    const safeChunkRows = Math.max(1, Math.floor(chunkRows));
+    const out: SqlRow[] = [];
+    const trackLeft = join.type === "LEFT" || join.type === "FULL";
+    const matchedLeft = trackLeft ? new Uint8Array(leftRows.length) : null;
+    const matchedRight = join.type === "FULL" ? new Uint8Array(rightRows.length) : null;
+    let chunks = 0;
+    let rowsProcessed = 0;
+
+    for (let chunkStart = 0; chunkStart < rightRows.length; chunkStart += safeChunkRows) {
+      const chunkEnd = Math.min(rightRows.length, chunkStart + safeChunkRows);
+      chunks += 1;
+      rowsProcessed += chunkEnd - chunkStart;
+
+      const rightIndex = new Map<string, number[]>();
+      for (let ri = chunkStart; ri < chunkEnd; ri++) {
+        const key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+          "join.spill.right",
+        );
+        if (key === null) continue;
+        const bucket = rightIndex.get(key);
+        if (bucket) bucket.push(ri);
+        else rightIndex.set(key, [ri]);
+      }
+
+      for (let li = 0; li < leftRows.length; li++) {
+        const leftRow = leftRows[li]!;
+        const key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(leftRow, join.leftField),
+          "join.spill.left",
+        );
+        const rightHits = key === null ? undefined : rightIndex.get(key);
+        if (!rightHits?.length) continue;
+
+        if (matchedLeft) matchedLeft[li] = 1;
+        for (const ri of rightHits) {
+          if (matchedRight) matchedRight[ri] = 1;
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[ri]!));
+        }
+      }
+    }
+
+    if (matchedLeft) {
+      for (let li = 0; li < leftRows.length; li++) {
+        if (matchedLeft[li] === 1) continue;
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRows[li]!));
+      }
+    }
+
+    if (matchedRight) {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRight[ri] === 1) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+      }
+    }
+
+    return { rows: out, chunks, rowsProcessed };
   }
 
   private applyJoin(
@@ -8911,6 +9039,7 @@ export class WalrusSqlClient {
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
     algorithm: JoinExecutionAlgorithm = "NESTED_LOOP",
+    spillStats?: JoinSpillRuntimeStats,
   ): SqlRow[] {
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
@@ -8920,13 +9049,28 @@ export class WalrusSqlClient {
         leftField: join.rightField,
         rightField: join.leftField,
       };
-      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin, algorithm);
+      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin, algorithm, spillStats);
     }
 
     const rightRows = this.requireTable(join.table);
-    const effectiveAlgorithm = this.resolveJoinAlgorithmByMemoryBudget(algorithm, leftRows.length, rightRows.length);
-    if (effectiveAlgorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join, rightRows);
-    if (effectiveAlgorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join, rightRows);
+    if (this.shouldApplyJoinSpillStrategy(algorithm, leftRows.length, rightRows.length)) {
+      const spill = this.applySpillChunkJoin(
+        leftTable,
+        leftRows,
+        join,
+        rightRows,
+        this.getJoinSpillChunkRows(),
+      );
+      if (spillStats) {
+        spillStats.steps += 1;
+        spillStats.chunks += spill.chunks;
+        spillStats.rowsProcessed += spill.rowsProcessed;
+      }
+      return spill.rows;
+    }
+
+    if (algorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join, rightRows);
+    if (algorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join, rightRows);
     return this.applyNestedLoopJoin(leftTable, leftRows, join, rightRows);
   }
 

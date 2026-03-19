@@ -125,6 +125,14 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
       : undefined,
     4096,
   );
+  const joinSpillChunkDefault = joinMemoryBudgetRows ?? 4096;
+  const joinSpillChunkRows = pick(
+    overrides.joinExecution?.spillChunkRows,
+    env.WALRUS_SQL_JOIN_SPILL_CHUNK_ROWS !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_JOIN_SPILL_CHUNK_ROWS, joinSpillChunkDefault)))
+      : undefined,
+    joinSpillChunkDefault,
+  );
 
   return {
     packageId,
@@ -151,6 +159,7 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
     },
     joinExecution: {
       memoryBudgetRows: joinMemoryBudgetRows,
+      spillChunkRows: joinSpillChunkRows,
     },
   };
 }
