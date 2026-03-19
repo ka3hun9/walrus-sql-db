@@ -1218,6 +1218,55 @@ export class WalrusSqlClient {
     };
   }
 
+  private cloneTransactionLogWriteEntry(entry: TransactionLogWriteEntry): TransactionLogWriteEntry {
+    return {
+      table: entry.table,
+      op: entry.op,
+      key: { ...entry.key },
+      preImage: entry.preImage ? { ...entry.preImage } : null,
+      postImage: entry.postImage ? { ...entry.postImage } : null,
+    };
+  }
+
+  private buildTransactionWriteSetFromLogRecord(record: TransactionLogRecord): TransactionWriteSet {
+    const staged = this.createEmptyTransactionWriteSet();
+    staged.logEntries = record.writeSet.map((entry) => this.cloneTransactionLogWriteEntry(entry));
+    if (staged.logEntries.length === 0) return staged;
+
+    const tableStats = new Map<string, TransactionTableWriteStats>();
+    for (const entry of staged.logEntries) {
+      if (!this.tables.has(entry.table) || !this.schemas.has(entry.table)) {
+        throw sqlError("ERR_TABLE_NOT_FOUND", entry.table);
+      }
+
+      const stats = tableStats.get(entry.table) ?? { insertRows: 0, updateRows: 0, deleteRows: 0 };
+      if (entry.op === "INSERT") stats.insertRows += 1;
+      else if (entry.op === "UPDATE") stats.updateRows += 1;
+      else stats.deleteRows += 1;
+      tableStats.set(entry.table, stats);
+    }
+
+    const snapshotTables = this.buildConstraintRevalidationSnapshot(staged);
+    for (const [table, stats] of tableStats.entries()) {
+      const snapshotRows = snapshotTables.get(table) ?? [];
+      const rows = this.deepCloneRows(snapshotRows);
+      staged.tables.set(table, {
+        rows,
+        uniqueIndexes: this.buildUniqueIndexSnapshot(table, rows),
+        stats,
+      });
+    }
+
+    return staged;
+  }
+
+  private applyRecoveredPreparedTransactionRecord(record: TransactionLogRecord): void {
+    const staged = this.buildTransactionWriteSetFromLogRecord(record);
+    if (staged.tables.size === 0) return;
+    this.assertCommitConstraintRevalidation(staged);
+    this.applyTransactionWriteSetOnCommit(staged);
+  }
+
   private async executeTransactionCommitBatch(payload: TransactionCommitBatchPayload): Promise<void> {
     if (!this.opts.transactionCommitExecutor) return;
     await this.opts.transactionCommitExecutor(payload);
@@ -1250,7 +1299,9 @@ export class WalrusSqlClient {
 
     for (const record of pending) {
       try {
-        await this.processPreparedTransactionRecord(record);
+        await this.processPreparedTransactionRecord(record, {
+          applyLocalWriteSet: () => this.applyRecoveredPreparedTransactionRecord(record),
+        });
         replayedTxnIds.push(record.txnId);
       } catch (err) {
         this.logger.warn("WAL replay failed", {
@@ -1437,7 +1488,57 @@ export class WalrusSqlClient {
   private applyCommittedTableStage(table: string, tableStage: TransactionTableWriteSet): void {
     this.tables.set(table, tableStage.rows);
     this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
-    this.rebuildSecondaryIndexesForTable(table);
+  }
+
+  private findCommittedRowByVersionKey(table: string, encodedVersionKey: string): SqlRow | null {
+    const rows = this.tables.get(table);
+    if (!rows || rows.length === 0) return null;
+    for (const row of rows) {
+      if (this.encodeIndexRowRefKey(table, row) === encodedVersionKey) return row;
+    }
+    return null;
+  }
+
+  private resolveCommittedPostImageRow(
+    table: string,
+    postImage: SqlRow | null,
+    fallbackKey: Record<string, SqlPrimitive>,
+  ): SqlRow | null {
+    if (postImage) {
+      const encodedByPost = this.encodeIndexRowRefKey(table, postImage);
+      const byPost = this.findCommittedRowByVersionKey(table, encodedByPost);
+      if (byPost) return byPost;
+    }
+    return this.findCommittedRowByVersionKey(table, this.encodeRowVersionKey(fallbackKey));
+  }
+
+  private applyCommittedSecondaryIndexDeltas(staged: TransactionWriteSet): void {
+    const touchedTables = new Set<string>();
+
+    for (const entry of staged.logEntries) {
+      const table = entry.table;
+      if (!this.tables.has(table)) continue;
+
+      if (entry.op === "DELETE") {
+        if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
+        touchedTables.add(table);
+        continue;
+      }
+
+      if (entry.op === "INSERT") {
+        const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
+        if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+        touchedTables.add(table);
+        continue;
+      }
+
+      if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
+      const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
+      if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+      touchedTables.add(table);
+    }
+
+    for (const table of touchedTables.values()) this.recomputeSecondaryIndexStatsForTable(table);
   }
 
   private takeTransactionCommitRuntimeSnapshot(staged: TransactionWriteSet): TransactionCommitRuntimeSnapshot {
@@ -1672,8 +1773,8 @@ export class WalrusSqlClient {
     }
   }
 
-  private applyTransactionWriteSetOnCommit(): void {
-    const staged = this.transactionWriteSet;
+  private applyTransactionWriteSetOnCommit(stagedOverride?: TransactionWriteSet): void {
+    const staged = stagedOverride ?? this.transactionWriteSet;
     if (!staged || staged.tables.size === 0) return;
 
     const snapshot = this.takeTransactionCommitRuntimeSnapshot(staged);
@@ -1690,14 +1791,17 @@ export class WalrusSqlClient {
             table,
             stats: { insertRows, updateRows, deleteRows },
           });
-          this.recordImmutableVersionObject(table, tableStage.rows);
-          this.recordImmutableIndexVersionObjectsForTable(table);
           committedRows += insertRows + updateRows + deleteRows;
         }
       }
 
+      this.applyCommittedSecondaryIndexDeltas(staged);
+
       for (const effect of sideEffects) {
         const { table, stats } = effect;
+        const committedRowsForTable = this.tables.get(table) ?? [];
+        this.recordImmutableVersionObject(table, committedRowsForTable);
+        this.recordImmutableIndexVersionObjectsForTable(table);
         this.dirtyTables.add(table);
         if (stats.insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", stats.insertRows, "simulator");
         if (stats.updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", stats.updateRows, "simulator");
@@ -2248,6 +2352,7 @@ export class WalrusSqlClient {
         this.recordTransactionLogWrite(table, "INSERT", coerced, null, coerced);
         this.bumpTableWriteStats(table, { insertRows: 1 });
       } else {
+        this.addRowToSecondaryIndexes(table, coerced);
         this.dirtyTables.add(table);
         this.applyImmediateRowVersion(table, "INSERT", coerced);
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
@@ -3784,7 +3889,10 @@ export class WalrusSqlClient {
         const beforeImage = { ...row };
         this.removeRowFromUniqueIndexes(table, row);
         this.recordTransactionLogWrite(table, "DELETE", beforeImage, beforeImage, null);
-        if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "DELETE", beforeImage);
+        if (!this.isDmlWriteStagingActive()) {
+          this.removeRowFromSecondaryIndexes(table, beforeImage);
+          this.applyImmediateRowVersion(table, "DELETE", beforeImage);
+        }
         touched++;
       }
 
@@ -3795,12 +3903,156 @@ export class WalrusSqlClient {
     return counts;
   }
 
+  private findRowReferenceInSetByKey(table: string, rows: Set<SqlRow>, rowLike: SqlRow): SqlRow | null {
+    const target = this.encodeIndexRowRefKey(table, rowLike);
+    for (const candidate of rows.values()) {
+      if (this.encodeIndexRowRefKey(table, candidate) === target) return candidate;
+    }
+    return null;
+  }
+
+  private recomputeHashIndexStatsForTable(table: string): void {
+    const tableIndexes = this.hashIndexes.get(table);
+    if (!tableIndexes || tableIndexes.size === 0) {
+      this.hashIndexStats.delete(table);
+      return;
+    }
+
+    let keys = 0;
+    let rowsIndexed = 0;
+    for (const buckets of tableIndexes.values()) {
+      keys += buckets.size;
+      for (const rows of buckets.values()) rowsIndexed += rows.size;
+    }
+    this.hashIndexStats.set(table, { keys, rowsIndexed });
+  }
+
+  private recomputeBtreeIndexStatsForTable(table: string): void {
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes || tableIndexes.size === 0) {
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    let keys = 0;
+    let rowsIndexed = 0;
+    for (const runtime of tableIndexes.values()) {
+      keys += runtime.entries.length;
+      for (const leaf of runtime.entries) rowsIndexed += leaf.rows.size;
+    }
+    this.btreeIndexStats.set(table, { keys, rowsIndexed });
+  }
+
+  private recomputeSecondaryIndexStatsForTable(table: string): void {
+    this.recomputeHashIndexStatsForTable(table);
+    this.recomputeBtreeIndexStatsForTable(table);
+  }
+
+  private addRowToSecondaryIndexes(table: string, row: SqlRow, options?: { recomputeStats?: boolean }): void {
+    let changed = false;
+
+    for (const entry of this.getActiveIndexEntriesForTable(table)) {
+      const indexName = this.normalizeIndexName(entry.name);
+      const column = entry.columns[0]!;
+      const value = this.resolveRowValue(row, column);
+      if (value === null || value === undefined) continue;
+
+      if (entry.type === "HASH") {
+        const tableIndexes = this.hashIndexes.get(table) ?? new Map<string, Map<string, Set<SqlRow>>>();
+        const buckets = tableIndexes.get(indexName) ?? new Map<string, Set<SqlRow>>();
+        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.insert:${table}.${indexName}.${column}`);
+        const bucketRows = buckets.get(encodedKey) ?? new Set<SqlRow>();
+        if (!this.findRowReferenceInSetByKey(table, bucketRows, row)) {
+          bucketRows.add(row);
+          changed = true;
+        }
+        buckets.set(encodedKey, bucketRows);
+        tableIndexes.set(indexName, buckets);
+        this.hashIndexes.set(table, tableIndexes);
+        continue;
+      }
+
+      const tableIndexes = this.btreeIndexes.get(table) ?? new Map<string, BtreeRuntimeIndex>();
+      const runtime = tableIndexes.get(indexName) ?? { column, entries: [] };
+      let leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+      if (!leaf) {
+        leaf = { key: value, rows: new Set<SqlRow>() };
+        runtime.entries.push(leaf);
+        runtime.entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+      }
+      if (!this.findRowReferenceInSetByKey(table, leaf.rows, row)) {
+        leaf.rows.add(row);
+        changed = true;
+      }
+      tableIndexes.set(indexName, runtime);
+      this.btreeIndexes.set(table, tableIndexes);
+    }
+
+    if (changed && (options?.recomputeStats ?? true)) this.recomputeSecondaryIndexStatsForTable(table);
+  }
+
+  private removeRowFromSecondaryIndexes(table: string, row: SqlRow, options?: { recomputeStats?: boolean }): void {
+    let changed = false;
+
+    const hashIndexesForTable = this.hashIndexes.get(table);
+    if (hashIndexesForTable) {
+      for (const [indexName, buckets] of [...hashIndexesForTable.entries()]) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.type !== "HASH" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+
+        const column = entry.columns[0]!;
+        const value = this.resolveRowValue(row, column);
+        if (value === null || value === undefined) continue;
+        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.delete:${table}.${indexName}.${column}`);
+        const bucketRows = buckets.get(encodedKey);
+        if (!bucketRows) continue;
+
+        const existing = this.findRowReferenceInSetByKey(table, bucketRows, row);
+        if (!existing) continue;
+        bucketRows.delete(existing);
+        changed = true;
+        if (bucketRows.size === 0) buckets.delete(encodedKey);
+        if (buckets.size === 0) hashIndexesForTable.delete(indexName);
+      }
+
+      if (hashIndexesForTable.size === 0) this.hashIndexes.delete(table);
+    }
+
+    const btreeIndexesForTable = this.btreeIndexes.get(table);
+    if (btreeIndexesForTable) {
+      for (const [indexName, runtime] of [...btreeIndexesForTable.entries()]) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.type !== "BTREE" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+
+        const column = runtime.column;
+        const value = this.resolveRowValue(row, column);
+        if (value === null || value === undefined) continue;
+
+        const leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+        if (!leaf) continue;
+        const existing = this.findRowReferenceInSetByKey(table, leaf.rows, row);
+        if (!existing) continue;
+
+        leaf.rows.delete(existing);
+        changed = true;
+        if (leaf.rows.size === 0) runtime.entries = runtime.entries.filter((entryLeaf) => entryLeaf !== leaf);
+        if (runtime.entries.length === 0) btreeIndexesForTable.delete(indexName);
+      }
+
+      if (btreeIndexesForTable.size === 0) this.btreeIndexes.delete(table);
+    }
+
+    if (changed && (options?.recomputeStats ?? true)) this.recomputeSecondaryIndexStatsForTable(table);
+  }
+
   private commitRowUpdate(table: string, row: SqlRow, next: SqlRow): void {
     const beforeImage = { ...row };
     this.removeRowFromUniqueIndexes(table, row);
+    if (!this.isDmlWriteStagingActive()) this.removeRowFromSecondaryIndexes(table, beforeImage);
     Object.keys(row).forEach((k) => delete row[k]);
     Object.assign(row, next);
     this.addRowToUniqueIndexes(table, row);
+    if (!this.isDmlWriteStagingActive()) this.addRowToSecondaryIndexes(table, row);
     this.recordTransactionLogWrite(table, "UPDATE", beforeImage, beforeImage, { ...row });
     this.bumpConstraintCost(table, { updateOps: 1 });
     if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "UPDATE", row);
