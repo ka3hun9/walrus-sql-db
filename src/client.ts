@@ -381,6 +381,34 @@ type SelectPlanStabilityState = {
   lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
 };
 
+type ParsedSubqueryPlan = {
+  normalizedSql: string;
+  fieldExpr: string;
+  table: string;
+  tableAlias?: string;
+  where?: string;
+  whereTree?: WhereExprNode;
+  outerRefs: string[];
+};
+
+type SubqueryExecutionStats = {
+  executions: number;
+  correlatedExecutions: number;
+  cacheHits: number;
+  cacheMisses: number;
+  rowsScanned: number;
+  rowsReturned: number;
+  budgetExceededCount: number;
+};
+
+type SubqueryRuntimeState = {
+  depth: number;
+  costUnits: number;
+  costBudget: number;
+  planCache: Map<string, ParsedSubqueryPlan>;
+  resultCache: Map<string, SqlRow[]>;
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -408,6 +436,8 @@ const BAD_PLAN_FALLBACK_SCAN_RATIO = 0.85;
 const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
 const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
 const BAD_PLAN_FALLBACK_COOLDOWN = 3;
+const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
+const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
@@ -430,6 +460,7 @@ export class WalrusSqlClient {
   private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
   private readonly indexObservability = new Map<string, IndexObservabilityStats>();
   private readonly selectPlanStability = new Map<string, SelectPlanStabilityState>();
+  private readonly subqueryExecutionStats = new Map<string, SubqueryExecutionStats>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -445,6 +476,7 @@ export class WalrusSqlClient {
     lockWaitEvents: 0,
   };
   private writeVersion = 0;
+  private subqueryRuntime: SubqueryRuntimeState | null = null;
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -2011,38 +2043,43 @@ export class WalrusSqlClient {
         return result;
       }
 
-      this.assertTransactionNotTimedOut(normalized);
-      this.assertStatementAllowedDuringTransaction(normalized);
+      this.enterSubqueryRuntimeScope();
       try {
-        this.assertDdlTransactionPolicy(normalized);
-      } catch (err) {
-        this.transitionTransactionToAbortedOnError(normalized);
-        throw err;
-      }
+        this.assertTransactionNotTimedOut(normalized);
+        this.assertStatementAllowedDuringTransaction(normalized);
+        try {
+          this.assertDdlTransactionPolicy(normalized);
+        } catch (err) {
+          this.transitionTransactionToAbortedOnError(normalized);
+          throw err;
+        }
 
-      let result: ExecuteResult;
-      if ((this.opts.mode ?? "simulator") === "onchain") {
-        try {
-          result = await this.executeOnchain(sql);
-        } catch (err) {
-          this.transitionTransactionToAbortedOnError(normalized);
-          throw err;
+        let result: ExecuteResult;
+        if ((this.opts.mode ?? "simulator") === "onchain") {
+          try {
+            result = await this.executeOnchain(sql);
+          } catch (err) {
+            this.transitionTransactionToAbortedOnError(normalized);
+            throw err;
+          }
+        } else {
+          try {
+            result = await this.executeSimulator(sql);
+          } catch (err) {
+            this.transitionTransactionToAbortedOnError(normalized);
+            throw err;
+          }
         }
-      } else {
-        try {
-          result = await this.executeSimulator(sql);
-        } catch (err) {
-          this.transitionTransactionToAbortedOnError(normalized);
-          throw err;
-        }
+        this.logger.debug("execute success", {
+          sql: normalized,
+          statementType: result.statementType,
+          affectedRows: result.affectedRows ?? 0,
+          transactionState: this.transactionState,
+        });
+        return result;
+      } finally {
+        this.leaveSubqueryRuntimeScope();
       }
-      this.logger.debug("execute success", {
-        sql: normalized,
-        statementType: result.statementType,
-        affectedRows: result.affectedRows ?? 0,
-        transactionState: this.transactionState,
-      });
-      return result;
     } catch (err) {
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "execute() failed");
       this.logger.error("execute failed", { sql: normalized, error: wrapped.message });
@@ -2262,6 +2299,137 @@ export class WalrusSqlClient {
 
   private deepCloneRows(rows: SqlRow[]): SqlRow[] {
     return rows.map((r) => ({ ...r }));
+  }
+
+  private enterSubqueryRuntimeScope(): void {
+    if (!this.subqueryRuntime) {
+      this.subqueryRuntime = {
+        depth: 0,
+        costUnits: 0,
+        costBudget: CORRELATED_SUBQUERY_COST_BUDGET,
+        planCache: new Map<string, ParsedSubqueryPlan>(),
+        resultCache: new Map<string, SqlRow[]>(),
+      };
+    }
+    this.subqueryRuntime.depth += 1;
+  }
+
+  private leaveSubqueryRuntimeScope(): void {
+    if (!this.subqueryRuntime) return;
+    this.subqueryRuntime.depth = Math.max(0, this.subqueryRuntime.depth - 1);
+    if (this.subqueryRuntime.depth === 0) {
+      this.subqueryRuntime = null;
+    }
+  }
+
+  private getOrCreateSubqueryStats(normalizedSubquerySql: string): SubqueryExecutionStats {
+    let stats = this.subqueryExecutionStats.get(normalizedSubquerySql);
+    if (!stats) {
+      stats = {
+        executions: 0,
+        correlatedExecutions: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
+        rowsScanned: 0,
+        rowsReturned: 0,
+        budgetExceededCount: 0,
+      };
+      this.subqueryExecutionStats.set(normalizedSubquerySql, stats);
+    }
+    return stats;
+  }
+
+  private collectOuterReferences(expr: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const re = /\bouter\.([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\b/gi;
+
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(expr)) !== null) {
+      const ref = m[1]!;
+      const key = ref.toUpperCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(ref);
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }
+
+  private getParsedSubqueryPlan(normalizedSubquerySql: string): ParsedSubqueryPlan {
+    const cached = this.subqueryRuntime?.planCache.get(normalizedSubquerySql);
+    if (cached) return cached;
+
+    const m = normalizedSubquerySql.match(
+      /^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+WHERE\s+(.+))?$/i,
+    );
+    if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", normalizedSubquerySql);
+
+    const fieldExpr = m[1]!.trim();
+    const table = m[2]!.trim();
+    const tableAlias = m[3]?.trim();
+    const where = m[4]?.trim();
+    const outerRefs = this.collectOuterReferences(`${fieldExpr} ${where ?? ""}`);
+
+    const plan: ParsedSubqueryPlan = {
+      normalizedSql: normalizedSubquerySql,
+      fieldExpr,
+      table,
+      tableAlias,
+      where,
+      whereTree: where ? this.parseWhereTree(where) : undefined,
+      outerRefs,
+    };
+    this.subqueryRuntime?.planCache.set(normalizedSubquerySql, plan);
+    return plan;
+  }
+
+  private buildSubqueryResultCacheKey(plan: ParsedSubqueryPlan, outerRow?: SqlRow): string {
+    if (!plan.outerRefs.length || !outerRow) return `${plan.normalizedSql}::GLOBAL`;
+
+    const bindings = plan.outerRefs.map((ref) => {
+      const value = resolveIdentifierValue(outerRow, ref, "strict");
+      const encoded = this.encodeTypedKey((value ?? null) as SqlPrimitive, `subquery.outerRef:${ref}`);
+      return `${ref}=${encoded}`;
+    });
+    return `${plan.normalizedSql}::${bindings.join("|")}`;
+  }
+
+  private storeSubqueryResultCache(cacheKey: string, rows: SqlRow[]): void {
+    if (!this.subqueryRuntime) return;
+    if (this.subqueryRuntime.resultCache.has(cacheKey)) {
+      this.subqueryRuntime.resultCache.delete(cacheKey);
+    }
+    this.subqueryRuntime.resultCache.set(cacheKey, this.deepCloneRows(rows));
+
+    while (this.subqueryRuntime.resultCache.size > CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT) {
+      const oldest = this.subqueryRuntime.resultCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.subqueryRuntime.resultCache.delete(oldest);
+    }
+  }
+
+  private consumeSubqueryCost(stats: SubqueryExecutionStats, correlated: boolean, subquerySql: string): void {
+    stats.rowsScanned += 1;
+    if (!correlated || !this.subqueryRuntime) return;
+    this.subqueryRuntime.costUnits += 1;
+    if (this.subqueryRuntime.costUnits <= this.subqueryRuntime.costBudget) return;
+    stats.budgetExceededCount += 1;
+    throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Correlated subquery cost budget exceeded: ${subquerySql}`);
+  }
+
+  private buildSubqueryEvalRow(innerRow: SqlRow, table: string, tableAlias?: string, outerRow?: SqlRow): SqlRow {
+    const evalRow: SqlRow = {};
+    for (const [k, v] of Object.entries(innerRow)) {
+      evalRow[k] = v;
+      evalRow[`${table}.${k}`] = v;
+      if (tableAlias) evalRow[`${tableAlias}.${k}`] = v;
+    }
+
+    if (!outerRow) return evalRow;
+    for (const [k, v] of Object.entries(outerRow)) {
+      evalRow[`outer.${k}`] = v;
+    }
+    return evalRow;
   }
 
   private getCachedQuery(sql: string): SqlRow[] | null {
@@ -3097,6 +3265,45 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getSubqueryExecutionStats(subquerySql?: string): Array<{
+    key: string;
+    executions: number;
+    correlatedExecutions: number;
+    cacheHits: number;
+    cacheMisses: number;
+    rowsScanned: number;
+    rowsReturned: number;
+    budgetExceededCount: number;
+  }> {
+    const target = subquerySql?.trim().replace(/\s+/g, " ");
+    const out: Array<{
+      key: string;
+      executions: number;
+      correlatedExecutions: number;
+      cacheHits: number;
+      cacheMisses: number;
+      rowsScanned: number;
+      rowsReturned: number;
+      budgetExceededCount: number;
+    }> = [];
+
+    for (const [key, stats] of this.subqueryExecutionStats.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        executions: stats.executions,
+        correlatedExecutions: stats.correlatedExecutions,
+        cacheHits: stats.cacheHits,
+        cacheMisses: stats.cacheMisses,
+        rowsScanned: stats.rowsScanned,
+        rowsReturned: stats.rowsReturned,
+        budgetExceededCount: stats.budgetExceededCount,
+      });
+    }
+    out.sort((a, b) => a.key.localeCompare(b.key));
+    return out;
+  }
+
   private buildSelectExecutionPlan(
     parsed: ParsedSelect,
     bucket: SqlRow[],
@@ -3224,7 +3431,9 @@ export class WalrusSqlClient {
       const cachedRows = this.getCachedQuery(normalizedSql);
       if (cachedRows) return { rows: cachedRows };
 
-      const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+      this.enterSubqueryRuntimeScope();
+      try {
+        const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
     if (ast.kind === "union") {
       const rightPlan = this.splitSelectTail(ast.rightSql);
@@ -3412,8 +3621,11 @@ export class WalrusSqlClient {
       if (this.logger.level === "debug" && result.rows[0]) {
         successMeta.firstRowTyped = this.toTypedLogRow(result.rows[0], "debug.query.firstRow");
       }
-      this.logger.debug("query success", successMeta);
-      return result;
+        this.logger.debug("query success", successMeta);
+        return result;
+      } finally {
+        this.leaveSubqueryRuntimeScope();
+      }
     } catch (err) {
       this.transitionTransactionToAbortedOnError(normalized);
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
@@ -6508,22 +6720,40 @@ export class WalrusSqlClient {
 
   private parseSubquerySelect(subquerySql: string, outerRow?: SqlRow): SqlRow[] {
     const normalized = subquerySql.trim().replace(/\s+/g, " ");
-    const m = normalized.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?$/i);
-    if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", subquerySql);
+    const plan = this.getParsedSubqueryPlan(normalized);
+    const stats = this.getOrCreateSubqueryStats(normalized);
+    const correlated = plan.outerRefs.length > 0;
 
-    const fieldExpr = m[1]!.trim();
-    const table = m[2]!.trim();
-    const where = m[3]?.trim();
+    stats.executions += 1;
+    if (correlated) stats.correlatedExecutions += 1;
 
-    const rows = this.requireTable(table);
-    const boundWhere = where && outerRow ? this.bindOuterRefs(where, outerRow) : where;
-    const filtered = boundWhere
-      ? rows.filter((r) => this.evaluateWhereTree(r, this.parseWhereTree(boundWhere)) === "TRUE")
-      : rows;
+    const cacheKey = this.buildSubqueryResultCacheKey(plan, outerRow);
+    const cached = this.subqueryRuntime?.resultCache.get(cacheKey);
+    if (cached) {
+      stats.cacheHits += 1;
+      stats.rowsReturned += cached.length;
+      return this.deepCloneRows(cached);
+    }
+    stats.cacheMisses += 1;
 
-    if (fieldExpr === "*") return filtered.map((r) => ({ ...r }));
+    const sourceRows = this.requireTable(plan.table);
+    const matchedInnerRows: SqlRow[] = [];
+    const matchedEvalRows: SqlRow[] = [];
+    for (const innerRow of sourceRows) {
+      this.consumeSubqueryCost(stats, correlated, normalized);
+      const evalRow = this.buildSubqueryEvalRow(innerRow, plan.table, plan.tableAlias, outerRow);
+      if (plan.whereTree && this.evaluateWhereTree(evalRow, plan.whereTree) !== "TRUE") continue;
+      matchedInnerRows.push({ ...innerRow });
+      matchedEvalRows.push(evalRow);
+    }
 
-    const aggMatch = fieldExpr.match(
+    if (plan.fieldExpr === "*") {
+      stats.rowsReturned += matchedInnerRows.length;
+      this.storeSubqueryResultCache(cacheKey, matchedInnerRows);
+      return this.deepCloneRows(matchedInnerRows);
+    }
+
+    const aggMatch = plan.fieldExpr.match(
       /^([a-zA-Z_][a-zA-Z0-9_]*)\((\*|[a-zA-Z_][a-zA-Z0-9_\.]*)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*))?$/i,
     );
     if (aggMatch) {
@@ -6533,27 +6763,42 @@ export class WalrusSqlClient {
 
       if (fn === "COUNT") {
         const count = aggField === "*"
-          ? filtered.length
-          : filtered.filter((r) => this.resolveRowValue(r, aggField) !== null && this.resolveRowValue(r, aggField) !== undefined).length;
-        return [{ [alias]: count }];
+          ? matchedEvalRows.length
+          : matchedEvalRows.filter((r) => {
+              const value = this.resolveRowValue(r, aggField);
+              return value !== null && value !== undefined;
+            }).length;
+        const out = [{ [alias]: count }];
+        stats.rowsReturned += out.length;
+        this.storeSubqueryResultCache(cacheKey, out);
+        return this.deepCloneRows(out);
       }
 
-      const nums = filtered
+      const nums = matchedEvalRows
         .map((r) => Number(this.resolveRowValue(r, aggField)))
         .filter((n) => Number.isFinite(n));
 
-      if (fn === "SUM") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) : null }];
-      if (fn === "AVG") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null }];
-      if (fn === "MIN") return [{ [alias]: nums.length ? Math.min(...nums) : null }];
-      if (fn === "MAX") return [{ [alias]: nums.length ? Math.max(...nums) : null }];
+      let out: SqlRow[] | null = null;
+      if (fn === "SUM") out = [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) : null }];
+      else if (fn === "AVG") out = [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null }];
+      else if (fn === "MIN") out = [{ [alias]: nums.length ? Math.min(...nums) : null }];
+      else if (fn === "MAX") out = [{ [alias]: nums.length ? Math.max(...nums) : null }];
+      if (out) {
+        stats.rowsReturned += out.length;
+        this.storeSubqueryResultCache(cacheKey, out);
+        return this.deepCloneRows(out);
+      }
     }
 
-    const fields = fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
-    return filtered.map((row) => {
+    const fields = plan.fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
+    const projected = matchedEvalRows.map((row) => {
       const out: SqlRow = {};
       for (const f of fields) out[f] = this.evalExpr(row, f) ?? null;
       return out;
     });
+    stats.rowsReturned += projected.length;
+    this.storeSubqueryResultCache(cacheKey, projected);
+    return this.deepCloneRows(projected);
   }
 
   private parseSubqueryValues(subquerySql: string, field?: string, outerRow?: SqlRow): SqlPrimitive[] {
@@ -6609,17 +6854,6 @@ export class WalrusSqlClient {
       quantifier: m[3]!.toUpperCase() === "SOME" ? "ANY" : (m[3]!.toUpperCase() as "ANY" | "ALL"),
       subquerySql: m[4]!.trim(),
     };
-  }
-
-  private bindOuterRefs(expr: string, outerRow: SqlRow): string {
-    return expr.replace(/\bouter\.([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_m, key: string) => {
-      const v = outerRow[key];
-      if (v === null || v === undefined) return "NULL";
-      if (typeof v === "number") return String(v);
-      if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
-      const s = String(v).replace(/'/g, "''");
-      return `'${s}'`;
-    });
   }
 
   private evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
