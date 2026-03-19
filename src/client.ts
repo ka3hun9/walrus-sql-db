@@ -306,6 +306,31 @@ type SelectExecutionPlan = {
   orderSatisfied: boolean;
 };
 
+type SelectExecutionMode = "PIPELINED" | "MATERIALIZED";
+
+type SelectPipelineBlocker =
+  | "JOIN_CHAIN"
+  | "GROUP_BY"
+  | "AGGREGATE"
+  | "ROW_NUMBER"
+  | "ORDER_BY_SORT";
+
+type SelectExecutionPipelineStats = {
+  executions: number;
+  pipelinedExecutions: number;
+  materializedExecutions: number;
+  earlyStopExecutions: number;
+  rowsVisited: number;
+  rowsReturned: number;
+  maxBufferedRows: number;
+  lastMode: SelectExecutionMode;
+  lastRowsVisited: number;
+  lastRowsReturned: number;
+  lastBufferedRows: number;
+  lastEarlyStop: boolean;
+  lastBlockers: SelectPipelineBlocker[];
+};
+
 type DmlPlan = {
   table: string;
   whereExpr: string;
@@ -632,6 +657,7 @@ export class WalrusSqlClient {
   private readonly optimizerStatsVersionObjects = new Map<string, OptimizerStatsVersionedStorageObject[]>();
   private readonly indexObservability = new Map<string, IndexObservabilityStats>();
   private readonly selectPlanStability = new Map<string, SelectPlanStabilityState>();
+  private readonly selectExecutionPipelineStats = new Map<string, SelectExecutionPipelineStats>();
   private readonly subqueryExecutionStats = new Map<string, SubqueryExecutionStats>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
@@ -4168,6 +4194,77 @@ export class WalrusSqlClient {
     this.selectPlanStability.set(stabilityKey, state);
   }
 
+  private getOrCreateSelectExecutionPipelineStats(key: string): SelectExecutionPipelineStats {
+    const existing = this.selectExecutionPipelineStats.get(key);
+    if (existing) return existing;
+    const created: SelectExecutionPipelineStats = {
+      executions: 0,
+      pipelinedExecutions: 0,
+      materializedExecutions: 0,
+      earlyStopExecutions: 0,
+      rowsVisited: 0,
+      rowsReturned: 0,
+      maxBufferedRows: 0,
+      lastMode: "MATERIALIZED",
+      lastRowsVisited: 0,
+      lastRowsReturned: 0,
+      lastBufferedRows: 0,
+      lastEarlyStop: false,
+      lastBlockers: [],
+    };
+    this.selectExecutionPipelineStats.set(key, created);
+    return created;
+  }
+
+  private getSelectPipelineBlockers(
+    logicalPlan: LogicalSelectPlan,
+    orderSatisfied: boolean,
+  ): SelectPipelineBlocker[] {
+    const blockers: SelectPipelineBlocker[] = [];
+    if (logicalPlan.joins.length > 0) blockers.push("JOIN_CHAIN");
+    if (logicalPlan.groupBy?.length) blockers.push("GROUP_BY");
+    if (logicalPlan.aggregate) blockers.push("AGGREGATE");
+    if (logicalPlan.rowNumberAlias) blockers.push("ROW_NUMBER");
+    if (logicalPlan.orderByList?.length && !orderSatisfied) blockers.push("ORDER_BY_SORT");
+    return blockers;
+  }
+
+  private resolveSelectExecutionMode(
+    logicalPlan: LogicalSelectPlan,
+    orderSatisfied: boolean,
+  ): { mode: SelectExecutionMode; blockers: SelectPipelineBlocker[] } {
+    const blockers = this.getSelectPipelineBlockers(logicalPlan, orderSatisfied);
+    return {
+      mode: blockers.length === 0 ? "PIPELINED" : "MATERIALIZED",
+      blockers,
+    };
+  }
+
+  private recordSelectExecutionPipelineStats(
+    key: string,
+    mode: SelectExecutionMode,
+    rowsVisited: number,
+    rowsReturned: number,
+    bufferedRows: number,
+    earlyStop: boolean,
+    blockers: SelectPipelineBlocker[],
+  ): void {
+    const stats = this.getOrCreateSelectExecutionPipelineStats(key);
+    stats.executions += 1;
+    if (mode === "PIPELINED") stats.pipelinedExecutions += 1;
+    else stats.materializedExecutions += 1;
+    if (earlyStop) stats.earlyStopExecutions += 1;
+    stats.rowsVisited += rowsVisited;
+    stats.rowsReturned += rowsReturned;
+    stats.maxBufferedRows = Math.max(stats.maxBufferedRows, bufferedRows);
+    stats.lastMode = mode;
+    stats.lastRowsVisited = rowsVisited;
+    stats.lastRowsReturned = rowsReturned;
+    stats.lastBufferedRows = bufferedRows;
+    stats.lastEarlyStop = earlyStop;
+    stats.lastBlockers = [...blockers];
+  }
+
   private resolveCanonicalTableName(table: string): string | null {
     const target = table.trim().toUpperCase();
     if (!target) return null;
@@ -4805,6 +4902,64 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getSelectExecutionPipelineStats(sql?: string): Array<{
+    key: string;
+    executions: number;
+    pipelinedExecutions: number;
+    materializedExecutions: number;
+    earlyStopExecutions: number;
+    rowsVisited: number;
+    rowsReturned: number;
+    maxBufferedRows: number;
+    lastMode: SelectExecutionMode;
+    lastRowsVisited: number;
+    lastRowsReturned: number;
+    lastBufferedRows: number;
+    lastEarlyStop: boolean;
+    lastBlockers: SelectPipelineBlocker[];
+  }> {
+    const target = sql?.trim().replace(/\s+/g, " ");
+    const out: Array<{
+      key: string;
+      executions: number;
+      pipelinedExecutions: number;
+      materializedExecutions: number;
+      earlyStopExecutions: number;
+      rowsVisited: number;
+      rowsReturned: number;
+      maxBufferedRows: number;
+      lastMode: SelectExecutionMode;
+      lastRowsVisited: number;
+      lastRowsReturned: number;
+      lastBufferedRows: number;
+      lastEarlyStop: boolean;
+      lastBlockers: SelectPipelineBlocker[];
+    }> = [];
+
+    for (const [key, stats] of this.selectExecutionPipelineStats.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        executions: stats.executions,
+        pipelinedExecutions: stats.pipelinedExecutions,
+        materializedExecutions: stats.materializedExecutions,
+        earlyStopExecutions: stats.earlyStopExecutions,
+        rowsVisited: stats.rowsVisited,
+        rowsReturned: stats.rowsReturned,
+        maxBufferedRows: stats.maxBufferedRows,
+        lastMode: stats.lastMode,
+        lastRowsVisited: stats.lastRowsVisited,
+        lastRowsReturned: stats.lastRowsReturned,
+        lastBufferedRows: stats.lastBufferedRows,
+        lastEarlyStop: stats.lastEarlyStop,
+        lastBlockers: [...stats.lastBlockers],
+      });
+    }
+
+    out.sort((a, b) => a.key.localeCompare(b.key));
+    return out;
+  }
+
   getSubqueryExecutionStats(subquerySql?: string): Array<{
     key: string;
     executions: number;
@@ -5060,6 +5215,7 @@ export class WalrusSqlClient {
           trackLookupStats: false,
           stabilityKey: planStabilityKey,
         });
+        const explainExecutionMode = this.resolveSelectExecutionMode(explainPlan.logical, explainPlan.orderSatisfied);
         const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
         const explainStats = this.getOptimizerStatistics(parsed.table)[0];
         const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
@@ -5125,6 +5281,11 @@ export class WalrusSqlClient {
             physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
             physicalPlanExecutions: explainStability?.executions ?? 0,
             physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
+            executionPipelineEligible: explainExecutionMode.mode === "PIPELINED",
+            executionPipelineMode: explainExecutionMode.mode,
+            executionPipelineBlockers: explainExecutionMode.blockers.length
+              ? explainExecutionMode.blockers.join(",")
+              : null,
             statsAnalyzedAt: explainStats?.analyzedAt ?? null,
             statsTableRowCount: explainTableRows,
             statsColumnCount: explainStats?.columns.length ?? 0,
@@ -5182,6 +5343,34 @@ export class WalrusSqlClient {
           )
         : selectPlan.scannedRows;
 
+      const executionMode = this.resolveSelectExecutionMode(logicalPlan, selectPlan.orderSatisfied);
+      if (executionMode.mode === "PIPELINED") {
+        const pipelined = this.executeSelectPipelineRows(baseRows, logicalPlan, parsed);
+        const pipelinedResult = this.buildQueryResult(normalizedSql, pipelined.rows);
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, pipelinedResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "PIPELINED",
+          pipelined.rowsVisited,
+          pipelinedResult.rows.length,
+          pipelinedResult.rows.length,
+          pipelined.earlyStop,
+          executionMode.blockers,
+        );
+        const successMeta: Record<string, unknown> = {
+          sql: normalized,
+          rows: pipelinedResult.rows.length,
+          executionMode: "PIPELINED",
+          pipelineRowsVisited: pipelined.rowsVisited,
+          pipelineEarlyStop: pipelined.earlyStop,
+        };
+        if (this.logger.level === "debug" && pipelinedResult.rows[0]) {
+          successMeta.firstRowTyped = this.toTypedLogRow(pipelinedResult.rows[0], "debug.query.firstRow");
+        }
+        this.logger.debug("query success", successMeta);
+        return pipelinedResult;
+      }
+
       const filtered = logicalPlan.predicateSource === "AST" && parsed.whereAst
         ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
         : logicalPlan.predicateSource === "TREE" && parsed.whereTree
@@ -5204,6 +5393,15 @@ export class WalrusSqlClient {
           pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
         );
         this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, groupedResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "MATERIALIZED",
+          baseRows.length,
+          groupedResult.rows.length,
+          Math.max(baseRows.length, filtered.length, grouped.length, havingRows.length, orderedGrouped.length, pagedGrouped.length),
+          false,
+          executionMode.blockers,
+        );
         return groupedResult;
       }
 
@@ -5212,6 +5410,15 @@ export class WalrusSqlClient {
           this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField),
         ]);
         this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "MATERIALIZED",
+          baseRows.length,
+          aggregateResult.rows.length,
+          Math.max(baseRows.length, filtered.length),
+          false,
+          executionMode.blockers,
+        );
         return aggregateResult;
       }
 
@@ -5226,9 +5433,19 @@ export class WalrusSqlClient {
         paged.map((row) => this.pickFields(row, logicalPlan.fields)),
       );
       this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, result.rows.length, bucket.length);
+      this.recordSelectExecutionPipelineStats(
+        normalizedSql,
+        "MATERIALIZED",
+        baseRows.length,
+        result.rows.length,
+        Math.max(baseRows.length, filtered.length, withWindow.length, ordered.length, paged.length),
+        false,
+        executionMode.blockers,
+      );
       const successMeta: Record<string, unknown> = {
         sql: normalized,
         rows: result.rows.length,
+        executionMode: "MATERIALIZED",
       };
       if (this.logger.level === "debug" && result.rows[0]) {
         successMeta.firstRowTyped = this.toTypedLogRow(result.rows[0], "debug.query.firstRow");
@@ -9695,19 +9912,70 @@ export class WalrusSqlClient {
 
   private applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {
     return rows.filter((row) => {
-      let acc: TruthValue | null = null;
-      for (const c of clauses) {
-        const matched = this.evaluateClause(row, c);
-        if (acc === null) {
-          acc = matched;
-        } else if (c.logic === "OR") {
-          acc = this.tvOr(acc, matched);
-        } else {
-          acc = this.tvAnd(acc, matched);
-        }
-      }
-      return acc === "TRUE";
+      return this.evaluateClauseChain(row, clauses) === "TRUE";
     });
+  }
+
+  private evaluateClauseChain(row: SqlRow, clauses: WhereClause[]): TruthValue {
+    let acc: TruthValue | null = null;
+    for (const c of clauses) {
+      const matched = this.evaluateClause(row, c);
+      if (acc === null) {
+        acc = matched;
+      } else if (c.logic === "OR") {
+        acc = this.tvOr(acc, matched);
+      } else {
+        acc = this.tvAnd(acc, matched);
+      }
+    }
+    return acc ?? "FALSE";
+  }
+
+  private evaluateSelectPredicateRow(row: SqlRow, logicalPlan: LogicalSelectPlan, parsed: ParsedSelect): boolean {
+    if (logicalPlan.predicateSource === "AST" && parsed.whereAst) {
+      return this.evaluateWhereAst(row, parsed.whereAst, parsed.where) === "TRUE";
+    }
+    if (logicalPlan.predicateSource === "TREE" && parsed.whereTree) {
+      return this.evaluateWhereTree(row, parsed.whereTree) === "TRUE";
+    }
+    if (logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length > 0) {
+      return this.evaluateClauseChain(row, parsed.whereClauses) === "TRUE";
+    }
+    return true;
+  }
+
+  private executeSelectPipelineRows(
+    rows: SqlRow[],
+    logicalPlan: LogicalSelectPlan,
+    parsed: ParsedSelect,
+  ): { rows: SqlRow[]; rowsVisited: number; earlyStop: boolean } {
+    const offset = Math.max(0, logicalPlan.offset ?? 0);
+    const rawLimit = logicalPlan.limit;
+    const hasLimit = rawLimit !== undefined;
+    const limit = hasLimit ? Math.max(0, rawLimit ?? 0) : undefined;
+    if (limit === 0) return { rows: [], rowsVisited: 0, earlyStop: true };
+
+    let rowsVisited = 0;
+    let matchedRows = 0;
+    let emittedRows = 0;
+    const out: SqlRow[] = [];
+
+    for (const row of rows) {
+      rowsVisited += 1;
+      if (!this.evaluateSelectPredicateRow(row, logicalPlan, parsed)) continue;
+      if (matchedRows < offset) {
+        matchedRows += 1;
+        continue;
+      }
+
+      out.push(this.pickFields(row, logicalPlan.fields));
+      emittedRows += 1;
+      if (limit !== undefined && emittedRows >= limit) {
+        return { rows: out, rowsVisited, earlyStop: true };
+      }
+    }
+
+    return { rows: out, rowsVisited, earlyStop: false };
   }
 
   private likeToRegex(patternRaw: string, escapeChar?: string): string {
