@@ -76,7 +76,7 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
     ? "create_index"
     : startsWithWord(up, "DROP INDEX")
       ? "drop_index"
-      : hasWord(up, "UNION") || hasWord(up, "INTERSECT")
+      : hasWord(up, "UNION") || hasWord(up, "INTERSECT") || hasWord(up, "EXCEPT")
         ? "union"
         : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
           ? "select"
@@ -92,7 +92,7 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
     groupBy: /\bGROUP\s+BY\b/i.test(up) ? "present" : "absent",
     having: hasWord(up, "HAVING") ? "present" : "absent",
     windowOver: hasWindowOver(up) ? "present" : "absent",
-    setOpUnion: hasWord(up, "UNION") || hasWord(up, "INTERSECT") ? "present" : "absent",
+    setOpUnion: hasWord(up, "UNION") || hasWord(up, "INTERSECT") || hasWord(up, "EXCEPT") ? "present" : "absent",
     orderBy: /\bORDER\s+BY\b/i.test(up) ? "present" : "absent",
     limit: hasWord(up, "LIMIT") ? "present" : "absent",
     offset: hasWord(up, "OFFSET") ? "present" : "absent",

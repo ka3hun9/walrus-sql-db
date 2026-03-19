@@ -7,6 +7,7 @@ export type SqlAstStatement =
   | SelectStatementAst
   | UnionStatementAst
   | IntersectStatementAst
+  | ExceptStatementAst
   | TransactionStatementAst
   | CreateIndexStatementAst
   | DropIndexStatementAst
@@ -27,6 +28,14 @@ export type UnionStatementAst = {
 
 export type IntersectStatementAst = {
   kind: "intersect";
+  all: boolean;
+  leftSql: string;
+  rightSql: string;
+  rawSql: string;
+};
+
+export type ExceptStatementAst = {
+  kind: "except";
   all: boolean;
   leftSql: string;
   rightSql: string;

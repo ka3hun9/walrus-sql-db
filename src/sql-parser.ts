@@ -542,6 +542,7 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
       "JOIN",
       "UNION",
       "INTERSECT",
+      "EXCEPT",
     ]);
     if (!clauseKeywords.has(token)) {
       alias = aliasCandidate[1]!;
@@ -555,7 +556,7 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
   };
 }
 
-type TopLevelSetOperator = "UNION" | "INTERSECT";
+type TopLevelSetOperator = "UNION" | "INTERSECT" | "EXCEPT";
 
 function splitSetOpTopLevel(
   sql: string,
@@ -612,6 +613,13 @@ function splitSetOpTopLevel(
       lastOperator = "INTERSECT";
       continue;
     }
+    if (rest.startsWith("EXCEPT ALL") && (rest.length === "EXCEPT ALL".length || /\s/.test(rest["EXCEPT ALL".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "EXCEPT ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "EXCEPT";
+      continue;
+    }
     if (rest.startsWith("UNION") && (rest.length === "UNION".length || /\s/.test(rest["UNION".length]!))) {
       lastSetOpIndex = i;
       lastSetOpLength = "UNION".length;
@@ -624,6 +632,13 @@ function splitSetOpTopLevel(
       lastSetOpLength = "INTERSECT".length;
       lastSetOpAll = false;
       lastOperator = "INTERSECT";
+      continue;
+    }
+    if (rest.startsWith("EXCEPT") && (rest.length === "EXCEPT".length || /\s/.test(rest["EXCEPT".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "EXCEPT".length;
+      lastSetOpAll = false;
+      lastOperator = "EXCEPT";
     }
   }
 
@@ -840,7 +855,7 @@ export function parseSqlToAst(
     }
 
     return {
-      kind: setOp.operator === "UNION" ? "union" : "intersect",
+      kind: setOp.operator === "UNION" ? "union" : setOp.operator === "INTERSECT" ? "intersect" : "except",
       all: setOp.all,
       leftSql: setOp.leftSql,
       rightSql: setOp.rightSql,
@@ -861,7 +876,7 @@ export function parseSqlToAst(
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
       message:
-        "Only SELECT/UNION/INTERSECT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
+        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }
