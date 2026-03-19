@@ -192,6 +192,8 @@ type PhysicalAccessPathMethod =
   | "BTREE_INDEX_LOOKUP"
   | "BTREE_ORDERED_SCAN";
 
+type PlanStabilityReason = "NONE" | "PLAN_STABILITY_PIN" | "BAD_PLAN_FALLBACK_PIN";
+
 type PhysicalSelectAccessPath = {
   method: PhysicalAccessPathMethod;
   estimatedCost: number;
@@ -206,8 +208,11 @@ type PhysicalSelectRuntimePath = PhysicalSelectAccessPath & {
 };
 
 type PhysicalSelectPlan = {
+  optimizerChosen: PhysicalSelectAccessPath;
   chosen: PhysicalSelectAccessPath;
   candidates: PhysicalSelectAccessPath[];
+  stabilityReason: PlanStabilityReason;
+  stabilityPinned: boolean;
 };
 
 type SelectExecutionPlan = {
@@ -364,6 +369,18 @@ type IndexObservabilityStats = {
   maintenanceRows: number;
 };
 
+type SelectPlanStabilityState = {
+  preferredMethod: PhysicalAccessPathMethod;
+  preferredIndexName?: string;
+  preferredIndexColumn?: string;
+  badPlanFallbackRemaining: number;
+  badPlanFallbackCount: number;
+  stablePinCount: number;
+  planSwitchCount: number;
+  executions: number;
+  lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -386,6 +403,12 @@ const SESSION_TRANSACTION_TRANSITIONS: Record<
   },
 };
 
+const SELECT_PLAN_STABILITY_SWITCH_RATIO = 0.85;
+const BAD_PLAN_FALLBACK_SCAN_RATIO = 0.85;
+const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
+const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
+const BAD_PLAN_FALLBACK_COOLDOWN = 3;
+
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly isolationLevel: "read_committed";
@@ -406,6 +429,7 @@ export class WalrusSqlClient {
   private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
   private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
   private readonly indexObservability = new Map<string, IndexObservabilityStats>();
+  private readonly selectPlanStability = new Map<string, SelectPlanStabilityState>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -2899,10 +2923,184 @@ export class WalrusSqlClient {
     return best;
   }
 
+  private samePhysicalAccessPath(
+    left: Pick<PhysicalSelectAccessPath, "method" | "indexName" | "indexColumn">,
+    right: Pick<PhysicalSelectAccessPath, "method" | "indexName" | "indexColumn">,
+  ): boolean {
+    return (
+      left.method === right.method
+      && (left.indexName ?? null) === (right.indexName ?? null)
+      && (left.indexColumn ?? null) === (right.indexColumn ?? null)
+    );
+  }
+
+  private findPreferredRuntimePath(
+    candidates: PhysicalSelectRuntimePath[],
+    state: SelectPlanStabilityState,
+  ): PhysicalSelectRuntimePath | null {
+    const preferredIndexName = state.preferredIndexName?.toUpperCase();
+    const preferredIndexColumn = state.preferredIndexColumn?.toUpperCase();
+    for (const candidate of candidates) {
+      if (candidate.method !== state.preferredMethod) continue;
+      if (preferredIndexName && candidate.indexName?.toUpperCase() !== preferredIndexName) continue;
+      if (preferredIndexColumn && candidate.indexColumn?.toUpperCase() !== preferredIndexColumn) continue;
+      return candidate;
+    }
+    return candidates.find((candidate) => candidate.method === state.preferredMethod) ?? null;
+  }
+
+  private applySelectPlanStabilityPolicy(
+    stabilityKey: string | undefined,
+    optimizerChoice: PhysicalSelectRuntimePath,
+    candidates: PhysicalSelectRuntimePath[],
+  ): { chosen: PhysicalSelectRuntimePath; reason: PlanStabilityReason } {
+    if (!stabilityKey) return { chosen: optimizerChoice, reason: "NONE" };
+    const state = this.selectPlanStability.get(stabilityKey);
+    if (!state) return { chosen: optimizerChoice, reason: "NONE" };
+
+    const tableScan = candidates.find((candidate) => candidate.method === "TABLE_SCAN");
+    if (state.badPlanFallbackRemaining > 0 && tableScan) {
+      return { chosen: tableScan, reason: "BAD_PLAN_FALLBACK_PIN" };
+    }
+
+    const preferred = this.findPreferredRuntimePath(candidates, state);
+    if (!preferred) return { chosen: optimizerChoice, reason: "NONE" };
+    if (this.samePhysicalAccessPath(preferred, optimizerChoice)) {
+      return { chosen: optimizerChoice, reason: "NONE" };
+    }
+
+    if (optimizerChoice.estimatedCost <= preferred.estimatedCost * SELECT_PLAN_STABILITY_SWITCH_RATIO) {
+      return { chosen: optimizerChoice, reason: "NONE" };
+    }
+
+    return { chosen: preferred, reason: "PLAN_STABILITY_PIN" };
+  }
+
+  private shouldTriggerBadPlanFallback(
+    parsed: ParsedSelect,
+    chosen: PhysicalSelectAccessPath,
+    tableRows: number,
+    resultRows: number,
+  ): boolean {
+    if (chosen.method !== "HASH_INDEX_LOOKUP" && chosen.method !== "BTREE_INDEX_LOOKUP") return false;
+    if (tableRows < BAD_PLAN_FALLBACK_MIN_TABLE_ROWS) return false;
+    if (chosen.orderSatisfied) return false;
+
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    if (!hasPredicate) return false;
+
+    const scannedRows = Math.max(1, chosen.estimatedRows);
+    const scanRatio = scannedRows / Math.max(1, tableRows);
+    if (scanRatio < BAD_PLAN_FALLBACK_SCAN_RATIO) return false;
+
+    const rowRetention = resultRows / scannedRows;
+    if (rowRetention < BAD_PLAN_FALLBACK_RESULT_RATIO) return false;
+    return true;
+  }
+
+  private recordSelectPlanFeedback(
+    stabilityKey: string | undefined,
+    parsed: ParsedSelect,
+    plan: SelectExecutionPlan,
+    resultRows: number,
+    tableRows: number,
+  ): void {
+    if (!stabilityKey) return;
+
+    const chosen = plan.physical.chosen;
+    const state: SelectPlanStabilityState = this.selectPlanStability.get(stabilityKey) ?? {
+      preferredMethod: chosen.method,
+      preferredIndexName: chosen.indexName,
+      preferredIndexColumn: chosen.indexColumn,
+      badPlanFallbackRemaining: 0,
+      badPlanFallbackCount: 0,
+      stablePinCount: 0,
+      planSwitchCount: 0,
+      executions: 0,
+      lastReason: "NONE",
+    };
+
+    state.executions += 1;
+    if (plan.physical.stabilityReason === "PLAN_STABILITY_PIN") state.stablePinCount += 1;
+    if (plan.physical.stabilityReason === "BAD_PLAN_FALLBACK_PIN" && state.badPlanFallbackRemaining > 0) {
+      state.badPlanFallbackRemaining = Math.max(0, state.badPlanFallbackRemaining - 1);
+    }
+
+    if (this.shouldTriggerBadPlanFallback(parsed, chosen, tableRows, resultRows)) {
+      state.badPlanFallbackCount += 1;
+      state.badPlanFallbackRemaining = Math.max(state.badPlanFallbackRemaining, BAD_PLAN_FALLBACK_COOLDOWN);
+      state.preferredMethod = "TABLE_SCAN";
+      state.preferredIndexName = undefined;
+      state.preferredIndexColumn = undefined;
+      state.lastReason = "BAD_PLAN_TRIGGER";
+      this.selectPlanStability.set(stabilityKey, state);
+      return;
+    }
+
+    if (
+      state.preferredMethod !== chosen.method
+      || (state.preferredIndexName ?? null) !== (chosen.indexName ?? null)
+      || (state.preferredIndexColumn ?? null) !== (chosen.indexColumn ?? null)
+    ) {
+      state.planSwitchCount += 1;
+      state.preferredMethod = chosen.method;
+      state.preferredIndexName = chosen.indexName;
+      state.preferredIndexColumn = chosen.indexColumn;
+    }
+
+    state.lastReason = plan.physical.stabilityReason;
+    this.selectPlanStability.set(stabilityKey, state);
+  }
+
+  getSelectPlanStability(sql?: string): Array<{
+    key: string;
+    preferredMethod: PhysicalAccessPathMethod;
+    preferredIndexName?: string;
+    preferredIndexColumn?: string;
+    badPlanFallbackRemaining: number;
+    badPlanFallbackCount: number;
+    stablePinCount: number;
+    planSwitchCount: number;
+    executions: number;
+    lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+  }> {
+    const target = sql ? sql.trim().replace(/\s+/g, " ") : undefined;
+    const out: Array<{
+      key: string;
+      preferredMethod: PhysicalAccessPathMethod;
+      preferredIndexName?: string;
+      preferredIndexColumn?: string;
+      badPlanFallbackRemaining: number;
+      badPlanFallbackCount: number;
+      stablePinCount: number;
+      planSwitchCount: number;
+      executions: number;
+      lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+    }> = [];
+
+    for (const [key, state] of this.selectPlanStability.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        preferredMethod: state.preferredMethod,
+        preferredIndexName: state.preferredIndexName,
+        preferredIndexColumn: state.preferredIndexColumn,
+        badPlanFallbackRemaining: state.badPlanFallbackRemaining,
+        badPlanFallbackCount: state.badPlanFallbackCount,
+        stablePinCount: state.stablePinCount,
+        planSwitchCount: state.planSwitchCount,
+        executions: state.executions,
+        lastReason: state.lastReason,
+      });
+    }
+    out.sort((a, b) => a.key.localeCompare(b.key));
+    return out;
+  }
+
   private buildSelectExecutionPlan(
     parsed: ParsedSelect,
     bucket: SqlRow[],
-    opts?: { refreshIndexes?: boolean; trackLookupStats?: boolean },
+    opts?: { refreshIndexes?: boolean; trackLookupStats?: boolean; stabilityKey?: string },
   ): SelectExecutionPlan {
     const logicalPlan = this.buildLogicalSelectPlan(parsed);
     const canUseSingleTableIndexes = logicalPlan.joins.length === 0;
@@ -2967,7 +3165,9 @@ export class WalrusSqlClient {
       }
     }
 
-    const chosenRuntime = this.pickBestPhysicalAccessPath(candidates);
+    const optimizerChosen = this.pickBestPhysicalAccessPath(candidates);
+    const stabilized = this.applySelectPlanStabilityPolicy(opts?.stabilityKey, optimizerChosen, candidates);
+    const chosenRuntime = stabilized.chosen;
     if ((opts?.trackLookupStats ?? true) && chosenRuntime.method !== "TABLE_SCAN") {
       this.bumpIndexLookupStats(parsed.table, chosenRuntime.rows.length > 0);
     }
@@ -2984,8 +3184,11 @@ export class WalrusSqlClient {
     return {
       logical: logicalPlan,
       physical: {
+        optimizerChosen: toPhysicalPath(optimizerChosen),
         chosen: toPhysicalPath(chosenRuntime),
         candidates: candidates.map((candidate) => toPhysicalPath(candidate)),
+        stabilityReason: stabilized.reason,
+        stabilityPinned: stabilized.reason !== "NONE",
       },
       scannedRows: chosenRuntime.rows,
       orderSatisfied: chosenRuntime.orderSatisfied,
@@ -3072,13 +3275,16 @@ export class WalrusSqlClient {
     }
 
     const parsed = this.parseSelect(normalizedSql, sql);
+    const planStabilityKey = parsed.explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "").trim() : normalizedSql;
 
     if (parsed.explain) {
       const explainBucket = this.tables.get(parsed.table) ?? [];
       const explainPlan = this.buildSelectExecutionPlan(parsed, explainBucket, {
         refreshIndexes: false,
         trackLookupStats: false,
+        stabilityKey: planStabilityKey,
       });
+      const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
       return this.buildQueryResult(normalizedSql, [
         {
           type: "EXPLAIN",
@@ -3097,10 +3303,20 @@ export class WalrusSqlClient {
           logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
           logicalPredicateSource: explainPlan.logical.predicateSource,
           logicalJoinCount: explainPlan.logical.joins.length,
+          physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
+          physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
+          physicalOptimizerEstimatedRows: explainPlan.physical.optimizerChosen.estimatedRows,
           physicalAccessPath: explainPlan.physical.chosen.method,
           physicalCost: explainPlan.physical.chosen.estimatedCost,
           physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
           physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
+          physicalStabilityReason: explainPlan.physical.stabilityReason,
+          physicalStabilityPinned: explainPlan.physical.stabilityPinned,
+          physicalBadPlanFallbackRemaining: explainStability?.badPlanFallbackRemaining ?? 0,
+          physicalBadPlanFallbackCount: explainStability?.badPlanFallbackCount ?? 0,
+          physicalStablePinCount: explainStability?.stablePinCount ?? 0,
+          physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
+          physicalPlanExecutions: explainStability?.executions ?? 0,
           physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
         },
       ]);
@@ -3134,6 +3350,7 @@ export class WalrusSqlClient {
     const selectPlan = this.buildSelectExecutionPlan(parsed, bucket, {
       refreshIndexes: true,
       trackLookupStats: true,
+      stabilityKey: planStabilityKey,
     });
 
     const logicalPlan = selectPlan.logical;
@@ -3161,14 +3378,20 @@ export class WalrusSqlClient {
         : grouped;
       const orderedGrouped = this.applyOrder(havingRows, logicalPlan.orderByList);
       const pagedGrouped = this.applyPage(orderedGrouped, logicalPlan.offset, logicalPlan.limit);
-      return this.buildQueryResult(
+      const groupedResult = this.buildQueryResult(
         normalizedSql,
         pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
       );
+      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, groupedResult.rows.length, bucket.length);
+      return groupedResult;
     }
 
     if (logicalPlan.aggregate) {
-      return this.buildQueryResult(normalizedSql, [this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField)]);
+      const aggregateResult = this.buildQueryResult(normalizedSql, [
+        this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField),
+      ]);
+      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
+      return aggregateResult;
     }
 
     const withWindow = logicalPlan.rowNumberAlias
@@ -3181,6 +3404,7 @@ export class WalrusSqlClient {
         normalizedSql,
         paged.map((row) => this.pickFields(row, logicalPlan.fields)),
       );
+      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, result.rows.length, bucket.length);
       const successMeta: Record<string, unknown> = {
         sql: normalized,
         rows: result.rows.length,

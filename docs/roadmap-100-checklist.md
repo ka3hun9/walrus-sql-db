@@ -25,7 +25,7 @@
 - [ ] P3-OPT-005 索引选择策略（全表扫 vs 索引扫 vs 索引回表）
 - [ ] P3-OPT-006 连接顺序搜索（基于代价的 join reorder）
 - [ ] P3-OPT-007 连接算法实现：Nested Loop / Hash Join / Sort-Merge Join
-- [ ] P3-OPT-008 计划稳定性与回退策略（bad plan fallback）
+- [x] P3-OPT-008 计划稳定性与回退策略（bad plan fallback） [validated: 2026-03-19]
 
 ## P3-C. 子查询与集合操作
 
