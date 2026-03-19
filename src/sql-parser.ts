@@ -557,6 +557,9 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
 function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; all: boolean } | null {
   let depth = 0;
   let quote = "";
+  let lastUnionIndex: number | null = null;
+  let lastUnionLength = 0;
+  let lastUnionAll = false;
 
   for (let i = 0; i < sql.length; i++) {
     const ch = sql[i]!;
@@ -582,24 +585,29 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
 
     if (depth !== 0) continue;
 
+    const prev = i === 0 ? " " : sql[i - 1]!;
+    if (/[a-zA-Z0-9_]/.test(prev)) continue;
+
     const rest = sql.slice(i).toUpperCase();
     if (rest.startsWith("UNION ALL") && (rest.length === "UNION ALL".length || /\s/.test(rest["UNION ALL".length]!))) {
-      return {
-        leftSql: sql.slice(0, i).trim(),
-        rightSql: sql.slice(i + "UNION ALL".length).trim(),
-        all: true,
-      };
+      lastUnionIndex = i;
+      lastUnionLength = "UNION ALL".length;
+      lastUnionAll = true;
+      continue;
     }
     if (rest.startsWith("UNION") && (rest.length === "UNION".length || /\s/.test(rest["UNION".length]!))) {
-      return {
-        leftSql: sql.slice(0, i).trim(),
-        rightSql: sql.slice(i + "UNION".length).trim(),
-        all: false,
-      };
+      lastUnionIndex = i;
+      lastUnionLength = "UNION".length;
+      lastUnionAll = false;
     }
   }
 
-  return null;
+  if (lastUnionIndex === null) return null;
+  return {
+    leftSql: sql.slice(0, lastUnionIndex).trim(),
+    rightSql: sql.slice(lastUnionIndex + lastUnionLength).trim(),
+    all: lastUnionAll,
+  };
 }
 
 const NESTED_TRANSACTION_POLICY = "error_on_nested_begin" as const;

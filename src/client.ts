@@ -3435,34 +3435,43 @@ export class WalrusSqlClient {
       try {
         const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
-    if (ast.kind === "union") {
-      const rightPlan = this.splitSelectTail(ast.rightSql);
+        if (ast.kind === "union") {
+          const rightPlan = this.splitSelectTail(ast.rightSql);
 
-      const left = await this.query(ast.leftSql);
-      const right = await this.query(rightPlan.baseSql);
+          const left = await this.query(ast.leftSql);
+          const right = await this.query(rightPlan.baseSql);
 
-      const inferredLeftColumns = this.inferUnionColumns(ast.leftSql);
-      const leftColumns =
-        inferredLeftColumns
-        ?? (left.rows[0] ? Object.keys(left.rows[0]) : right.rows[0] ? Object.keys(right.rows[0]) : undefined);
+          const leftStaticArity = this.inferUnionArity(ast.leftSql);
+          const rightStaticArity = this.inferUnionArity(rightPlan.baseSql);
+          const leftRuntimeColumns = this.inferRuntimeProjectionColumns(left.rows);
+          const rightRuntimeColumns = this.inferRuntimeProjectionColumns(right.rows);
+          const leftArity = leftRuntimeColumns?.length ?? leftStaticArity;
+          const rightArity = rightRuntimeColumns?.length ?? rightStaticArity;
+          this.assertUnionArityCompatible(leftArity, rightArity);
 
-      const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
-      const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
+          const leftColumns =
+            leftRuntimeColumns
+            ?? this.inferUnionColumns(ast.leftSql)
+            ?? rightRuntimeColumns
+            ?? this.inferUnionColumns(rightPlan.baseSql);
 
-      const merged = ast.all
-        ? [...normalizedLeft, ...normalizedRight]
-        : (() => {
-            const dedup = new Map<string, SqlRow>();
-            for (const row of [...normalizedLeft, ...normalizedRight]) {
-              dedup.set(this.makeRowKey(row), row);
-            }
-            return [...dedup.values()];
-          })();
+          const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
+          const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
 
-      const ordered = this.applyOrder(merged, rightPlan.orderByList);
-      const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
-      return this.buildQueryResult(normalizedSql, paged);
-    }
+          const merged = ast.all
+            ? [...normalizedLeft, ...normalizedRight]
+            : (() => {
+                const dedup = new Map<string, SqlRow>();
+                for (const row of [...normalizedLeft, ...normalizedRight]) {
+                  dedup.set(this.makeRowKey(row), row);
+                }
+                return [...dedup.values()];
+              })();
+
+          const ordered = this.applyOrder(merged, rightPlan.orderByList);
+          const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
+          return this.buildQueryResult(normalizedSql, paged);
+        }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
       const { subquerySql, alias, rewrittenSql } = ast.from;
@@ -5987,6 +5996,7 @@ export class WalrusSqlClient {
 
   private inferUnionColumns(selectSql: string): string[] | undefined {
     const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind === "union") return this.inferUnionColumns(ast.leftSql);
     if (ast.kind !== "select") return undefined;
 
     return ast.selectItems.map((it, idx) => {
@@ -6003,8 +6013,42 @@ export class WalrusSqlClient {
     });
   }
 
+  private inferUnionArity(selectSql: string): number | undefined {
+    const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind === "select") return ast.selectItems.length;
+    if (ast.kind !== "union") return undefined;
+
+    const left = this.inferUnionArity(ast.leftSql);
+    const right = this.inferUnionArity(ast.rightSql);
+    this.assertUnionArityCompatible(left, right);
+    return left ?? right;
+  }
+
+  private inferRuntimeProjectionColumns(rows: SqlRow[]): string[] | undefined {
+    if (!rows.length) return undefined;
+    const [first] = rows;
+    if (!first) return undefined;
+    return Object.keys(first);
+  }
+
+  private assertUnionArityCompatible(left?: number, right?: number): void {
+    if (left === undefined || right === undefined) return;
+    if (left === right) return;
+    throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
+      message: `UNION branches must project the same number of columns (left=${left}, right=${right})`,
+      token: "UNION",
+    });
+  }
+
   private normalizeUnionRow(row: SqlRow, columns: string[]): SqlRow {
     const values = Object.values(row);
+    if (values.length !== columns.length) {
+      throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
+        message: `UNION branch row width mismatch: expected ${columns.length} columns but got ${values.length}`,
+        token: "UNION",
+      });
+    }
+
     const out: SqlRow = {};
     columns.forEach((col, idx) => {
       out[col] = values[idx] ?? null;
