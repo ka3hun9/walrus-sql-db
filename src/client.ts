@@ -1,4 +1,4 @@
-import { randomUUID, createHash } from "node:crypto";
+﻿import { randomUUID, createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
@@ -1272,7 +1272,7 @@ export class WalrusSqlClient {
           && entry.status === "ACTIVE"
           && entry.columns.length === 1
           && (entry.type === "HASH" || entry.type === "BTREE"))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) => this.textOrder(a.name, b.name));
   }
 
   private recordImmutableIndexVersionObject(entry: IndexCatalogEntry): void {
@@ -1298,7 +1298,7 @@ export class WalrusSqlClient {
           )].sort();
           return { encodedKey, rowKeys };
         })
-        .sort((a, b) => a.encodedKey.localeCompare(b.encodedKey));
+        .sort((a, b) => this.textOrder(a.encodedKey, b.encodedKey));
       keyCount = serializedBuckets.length;
       rowCount = serializedBuckets.reduce((sum, bucket) => sum + bucket.rowKeys.length, 0);
       payload = this.toImmutableIndexVersionObjectPayload({
@@ -2597,9 +2597,9 @@ export class WalrusSqlClient {
       .map((entry) => ({ ...entry, columns: [...entry.columns] }));
 
     out.sort((a, b) => {
-      const byTable = a.table.localeCompare(b.table);
+      const byTable = this.textOrder(a.table, b.table);
       if (byTable !== 0) return byTable;
-      return a.name.localeCompare(b.name);
+      return this.textOrder(a.name, b.name);
     });
 
     return out;
@@ -2709,7 +2709,7 @@ export class WalrusSqlClient {
         maintenanceRows: stats.maintenanceRows,
       });
     }
-    out.sort((a, b) => a.table.localeCompare(b.table));
+    out.sort((a, b) => this.textOrder(a.table, b.table));
     return out;
   }
 
@@ -2723,7 +2723,7 @@ export class WalrusSqlClient {
           columns: [...dependency.columns],
         })),
       }));
-    out.sort((a, b) => a.name.localeCompare(b.name));
+    out.sort((a, b) => this.textOrder(a.name, b.name));
     return out;
   }
 
@@ -2954,7 +2954,7 @@ export class WalrusSqlClient {
       seen.add(key);
       out.push(ref);
     }
-    return out.sort((a, b) => a.localeCompare(b));
+    return out.sort((a, b) => this.textOrder(a, b));
   }
 
   private getParsedSubqueryPlan(normalizedSubquerySql: string): ParsedSubqueryPlan {
@@ -3773,7 +3773,7 @@ export class WalrusSqlClient {
           continue;
         }
         if (outputRows > bestCandidate.outputRows) continue;
-        if (rightTable.localeCompare(bestCandidate.rightTable) < 0) {
+        if (this.textOrder(rightTable, bestCandidate.rightTable) < 0) {
           bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
         }
       }
@@ -4891,7 +4891,7 @@ export class WalrusSqlClient {
 
     const tables = resolvedTable
       ? [resolvedTable]
-      : [...this.optimizerStatsVersionObjects.keys()].sort((a, b) => a.localeCompare(b));
+      : [...this.optimizerStatsVersionObjects.keys()].sort((a, b) => this.textOrder(a, b));
 
     for (const tableName of tables) {
       const picked = this.pickOptimizerStatsVersionObject(tableName, {
@@ -4912,7 +4912,7 @@ export class WalrusSqlClient {
     const resolvedTable = table ? this.resolveCanonicalTableName(table) : null;
     if (table && !resolvedTable) return out;
 
-    const tables = resolvedTable ? [resolvedTable] : [...this.schemas.keys()].sort((a, b) => a.localeCompare(b));
+    const tables = resolvedTable ? [resolvedTable] : [...this.schemas.keys()].sort((a, b) => this.textOrder(a, b));
     for (const tableName of tables) {
       const stats = this.collectOptimizerStatisticsForTable(tableName);
       if (stats) out.push(stats);
@@ -4952,7 +4952,7 @@ export class WalrusSqlClient {
     for (const column of from.statistics.columns) fromColumns.set(column.column.toUpperCase(), column);
     for (const column of to.statistics.columns) toColumns.set(column.column.toUpperCase(), column);
 
-    const allColumnNames = [...new Set([...fromColumns.keys(), ...toColumns.keys()])].sort((a, b) => a.localeCompare(b));
+    const allColumnNames = [...new Set([...fromColumns.keys(), ...toColumns.keys()])].sort((a, b) => this.textOrder(a, b));
     const addedColumns: string[] = [];
     const removedColumns: string[] = [];
     const changedColumns: OptimizerStatisticsVersionDiffColumn[] = [];
@@ -5000,9 +5000,9 @@ export class WalrusSqlClient {
       }
     }
 
-    addedColumns.sort((a, b) => a.localeCompare(b));
-    removedColumns.sort((a, b) => a.localeCompare(b));
-    changedColumns.sort((a, b) => a.column.localeCompare(b.column));
+    addedColumns.sort((a, b) => this.textOrder(a, b));
+    removedColumns.sort((a, b) => this.textOrder(a, b));
+    changedColumns.sort((a, b) => this.textOrder(a.column, b.column));
 
     return {
       table: canonical,
@@ -5057,7 +5057,7 @@ export class WalrusSqlClient {
         lastReason: state.lastReason,
       });
     }
-    out.sort((a, b) => a.key.localeCompare(b.key));
+    out.sort((a, b) => this.textOrder(a.key, b.key));
     return out;
   }
 
@@ -5133,7 +5133,7 @@ export class WalrusSqlClient {
       });
     }
 
-    out.sort((a, b) => a.key.localeCompare(b.key));
+    out.sort((a, b) => this.textOrder(a.key, b.key));
     return out;
   }
 
@@ -5172,7 +5172,7 @@ export class WalrusSqlClient {
         budgetExceededCount: stats.budgetExceededCount,
       });
     }
-    out.sort((a, b) => a.key.localeCompare(b.key));
+    out.sort((a, b) => this.textOrder(a.key, b.key));
     return out;
   }
 
@@ -7325,7 +7325,7 @@ export class WalrusSqlClient {
         columns: [...columns.values()].sort(),
       });
     }
-    out.sort((a, b) => a.source.localeCompare(b.source));
+    out.sort((a, b) => this.textOrder(a.source, b.source));
     return out;
   }
 
@@ -7642,7 +7642,7 @@ export class WalrusSqlClient {
           continue;
         }
         if (candidate.rows.length > best.rows.length) continue;
-        if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
+        if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
       }
     }
 
@@ -7748,7 +7748,7 @@ export class WalrusSqlClient {
     if (candidate.prefix.length < current.prefix.length) return current;
     if (candidate.exact && !current.exact) return candidate;
     if (!candidate.exact && current.exact) return current;
-    return candidate.prefix.localeCompare(current.prefix) < 0 ? candidate : current;
+    return this.textOrder(candidate.prefix, current.prefix) < 0 ? candidate : current;
   }
 
   private matchesBtreePrefix(key: SqlPrimitive, predicate: BtreePrefixPredicate): boolean {
@@ -7901,7 +7901,7 @@ export class WalrusSqlClient {
         continue;
       }
       if (candidate.rows.length > best.rows.length) continue;
-      if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
+      if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
     }
 
     if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
@@ -7956,7 +7956,7 @@ export class WalrusSqlClient {
         continue;
       }
       if (candidate.rows.length > best.rows.length) continue;
-      if (candidate.indexName.localeCompare(best.indexName) < 0) best = candidate;
+      if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
     }
 
     if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
@@ -7969,7 +7969,7 @@ export class WalrusSqlClient {
       if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
       out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
     }
-    out.sort((a, b) => a.table.localeCompare(b.table));
+    out.sort((a, b) => this.textOrder(a.table, b.table));
     return out;
   }
 
@@ -7979,7 +7979,7 @@ export class WalrusSqlClient {
       if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
       out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
     }
-    out.sort((a, b) => a.table.localeCompare(b.table));
+    out.sort((a, b) => this.textOrder(a.table, b.table));
     return out;
   }
 
@@ -8880,17 +8880,35 @@ export class WalrusSqlClient {
     return merged;
   }
 
-  private mergeUnmatchedLeftRow(leftTable: string, leftRow: SqlRow): SqlRow {
+  private mergeUnmatchedLeftRow(leftTable: string, leftRow: SqlRow, rightTable?: string): SqlRow {
     const merged: SqlRow = {};
     for (const [k, v] of Object.entries(leftRow)) {
       merged[k] = v;
       merged[`${leftTable}.${k}`] = v;
     }
+
+    if (rightTable) {
+      const rightColumns = this.schemas.get(rightTable)?.columns.map((c) => c.name) ?? [];
+      for (const col of rightColumns) {
+        merged[`${rightTable}.${col}`] = null;
+        if (!(col in merged)) merged[col] = null;
+      }
+    }
+
     return merged;
   }
 
-  private mergeUnmatchedRightRow(rightTable: string, rightRow: SqlRow): SqlRow {
+  private mergeUnmatchedRightRow(rightTable: string, rightRow: SqlRow, leftTable?: string): SqlRow {
     const merged: SqlRow = {};
+
+    if (leftTable) {
+      const leftColumns = this.schemas.get(leftTable)?.columns.map((c) => c.name) ?? [];
+      for (const col of leftColumns) {
+        merged[`${leftTable}.${col}`] = null;
+        if (!(col in merged)) merged[col] = null;
+      }
+    }
+
     for (const [k, v] of Object.entries(rightRow)) {
       merged[`${rightTable}.${k}`] = v;
       if (!(k in merged)) merged[k] = v;
@@ -8920,14 +8938,14 @@ export class WalrusSqlClient {
       }
 
       if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
       }
     }
 
     if (join.type === "FULL") {
       for (let ri = 0; ri < rightRows.length; ri++) {
         if (matchedRightIndexes.has(ri)) continue;
-        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
       }
     }
 
@@ -8972,14 +8990,14 @@ export class WalrusSqlClient {
       }
 
       if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
       }
     }
 
     if (join.type === "FULL") {
       for (let ri = 0; ri < rightRows.length; ri++) {
         if (matchedRightIndexes.has(ri)) continue;
-        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
       }
     }
 
@@ -9012,8 +9030,8 @@ export class WalrusSqlClient {
       if (key !== null) rightEntries.push({ key, rowIndex: ri });
     }
 
-    leftEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : a.key.localeCompare(b.key)));
-    rightEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : a.key.localeCompare(b.key)));
+    leftEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : this.textOrder(a.key, b.key)));
+    rightEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : this.textOrder(a.key, b.key)));
 
     const matchesByLeft = new Map<number, number[]>();
     const matchedRightIndexes = new Set<number>();
@@ -9023,7 +9041,7 @@ export class WalrusSqlClient {
     while (li < leftEntries.length && ri < rightEntries.length) {
       const leftEntry = leftEntries[li]!;
       const rightEntry = rightEntries[ri]!;
-      const cmp = leftEntry.key.localeCompare(rightEntry.key);
+      const cmp = this.textOrder(leftEntry.key, rightEntry.key);
 
       if (cmp < 0) {
         li += 1;
@@ -9065,14 +9083,14 @@ export class WalrusSqlClient {
         continue;
       }
       if (join.type === "LEFT" || join.type === "FULL") {
-        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow));
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
       }
     }
 
     if (join.type === "FULL") {
       for (let rightRowIndex = 0; rightRowIndex < rightRows.length; rightRowIndex++) {
         if (matchedRightIndexes.has(rightRowIndex)) continue;
-        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[rightRowIndex]!));
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[rightRowIndex]!, leftTable));
       }
     }
 
@@ -9142,14 +9160,14 @@ export class WalrusSqlClient {
     if (matchedLeft) {
       for (let li = 0; li < leftRows.length; li++) {
         if (matchedLeft[li] === 1) continue;
-        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRows[li]!));
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRows[li]!, join.table));
       }
     }
 
     if (matchedRight) {
       for (let ri = 0; ri < rightRows.length; ri++) {
         if (matchedRight[ri] === 1) continue;
-        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!));
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
       }
     }
 
@@ -10064,6 +10082,15 @@ export class WalrusSqlClient {
     );
   }
 
+  private textOrder(a: string, b: string): number {
+    const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(a, b, "text.order");
+    const lt = typedValueComparator.lt(leftTyped, rightTyped);
+    if (lt === true) return -1;
+    const gt = typedValueComparator.gt(leftTyped, rightTyped);
+    if (gt === true) return 1;
+    return 0;
+  }
+
   private normalizeComparableTypedPair(
     left: SqlPrimitive | undefined,
     right: SqlPrimitive | undefined,
@@ -10691,3 +10718,5 @@ export class WalrusSqlClient {
     return v;
   }
 }
+
+
