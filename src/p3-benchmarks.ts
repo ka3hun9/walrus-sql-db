@@ -7,6 +7,22 @@ type InternalTableStore = {
   tables: Map<string, Array<Record<string, number | string | null>>>;
 };
 
+type InternalSelectPlanStabilityState = {
+  preferredMethod: "TABLE_SCAN" | "HASH_INDEX_LOOKUP" | "BTREE_INDEX_LOOKUP" | "BTREE_ORDERED_SCAN";
+  preferredIndexName?: string;
+  preferredIndexColumn?: string;
+  badPlanFallbackRemaining: number;
+  badPlanFallbackCount: number;
+  stablePinCount: number;
+  planSwitchCount: number;
+  executions: number;
+  lastReason: string;
+};
+
+type InternalSelectPlanStabilityStore = {
+  selectPlanStability: Map<string, InternalSelectPlanStabilityState>;
+};
+
 export interface P3Bench001NoIndexConfig {
   customers: number;
   ordersPerCustomer: number;
@@ -152,7 +168,61 @@ export interface P3Bench002IndexedReport {
   };
 }
 
-export type P3BenchReport = P3Bench001NoIndexReport | P3Bench002IndexedReport;
+export interface P3Bench003CboBenefitConfig {
+  rows: number;
+  scoreModulo: number;
+  scoreWindowStart: number;
+  scoreWindowWidth: number;
+  warmupRounds: number;
+  measuredRounds: number;
+}
+
+type P3Bench003Explain = P3Bench002Explain & {
+  physicalStabilityReason: string;
+};
+
+type P3Bench003Scenario = {
+  explain: P3Bench003Explain;
+  performance: P3Bench002Performance;
+  execution: P3Bench002Execution;
+  observability: P3Bench002Observability;
+};
+
+export interface P3Bench003CboBenefitReport {
+  benchmark: "p3-bench-003-cbo-benefit-vs-fixed-rule-baseline";
+  at: string;
+  config: P3Bench003CboBenefitConfig;
+  dataset: {
+    rows: number;
+    distinctScores: number;
+    indexedColumn: string;
+    indexName: string;
+  };
+  query: {
+    sql: string;
+    warmupRounds: number;
+    measuredRounds: number;
+    fixedRulePolicy: string;
+  };
+  fixedRuleBaseline: P3Bench003Scenario;
+  cbo: P3Bench003Scenario;
+  gains: {
+    throughputQpsDelta: number;
+    throughputQpsGainPct: number;
+    p95LatencyMsDelta: number;
+    p95LatencyReductionPct: number;
+    rowsVisitedPerQueryDelta: number;
+    rowsVisitedReductionPct: number;
+    physicalCostDelta: number;
+    physicalCostReductionPct: number;
+  };
+  verdict: {
+    cboPreferred: boolean;
+    reasons: string[];
+  };
+}
+
+export type P3BenchReport = P3Bench001NoIndexReport | P3Bench002IndexedReport | P3Bench003CboBenefitReport;
 
 const defaultP3Bench001Config: P3Bench001NoIndexConfig = {
   customers: 600,
@@ -172,6 +242,15 @@ const defaultP3Bench002Config: P3Bench002IndexedConfig = {
   measuredRounds: 16,
 };
 
+const defaultP3Bench003Config: P3Bench003CboBenefitConfig = {
+  rows: 24000,
+  scoreModulo: 5000,
+  scoreWindowStart: 1900,
+  scoreWindowWidth: 2,
+  warmupRounds: 3,
+  measuredRounds: 16,
+};
+
 const BENCH_TABLES = {
   customers: "p3_bench1_customers",
   orders: "p3_bench1_orders",
@@ -179,6 +258,9 @@ const BENCH_TABLES = {
 } as const;
 
 const BENCH2_TABLE = "p3_bench2_orders";
+const BENCH3_TABLE = "p3_bench3_metrics";
+const BENCH3_INDEX = "idx_p3_bench3_score";
+const BENCH3_FIXED_RULE_POLICY = "ALWAYS_TABLE_SCAN";
 
 function mkClient(): WalrusSqlClient {
   return new WalrusSqlClient({
@@ -209,6 +291,26 @@ function toFiniteNumber(input: unknown): number {
   const n = Number(input);
   if (!Number.isFinite(n)) return 0;
   return n;
+}
+
+function normalizeSqlKey(sql: string): string {
+  return sql.trim().replace(/\s+/g, " ");
+}
+
+function applyFixedRuleTableScan(db: WalrusSqlClient, sql: string, rounds: number): void {
+  const key = normalizeSqlKey(sql);
+  const stability = (db as unknown as InternalSelectPlanStabilityStore).selectPlanStability;
+  stability.set(key, {
+    preferredMethod: "TABLE_SCAN",
+    preferredIndexName: undefined,
+    preferredIndexColumn: undefined,
+    badPlanFallbackRemaining: Math.max(1, rounds),
+    badPlanFallbackCount: 1,
+    stablePinCount: 0,
+    planSwitchCount: 0,
+    executions: 0,
+    lastReason: "BAD_PLAN_FALLBACK_PIN",
+  });
 }
 
 function summarizeIndexObservability(
@@ -309,6 +411,94 @@ async function runBench002Scenario(
       materializedExecutions: Math.max(0, materializedAfter - materializedBefore),
     },
     observability: summarizeIndexObservability(db, BENCH2_TABLE),
+  };
+}
+
+async function runBench003Scenario(
+  db: WalrusSqlClient,
+  sql: string,
+  warmupRounds: number,
+  measuredRounds: number,
+  instabilityTag: string,
+): Promise<P3Bench003Scenario> {
+  const explainRow = (await db.query(`EXPLAIN ${sql}`)).rows[0] ?? {};
+
+  for (let i = 0; i < warmupRounds; i += 1) {
+    await db.query(sql);
+  }
+
+  const warmedStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedBefore = warmedStats?.rowsVisited ?? 0;
+  const pipelinedBefore = warmedStats?.pipelinedExecutions ?? 0;
+  const materializedBefore = warmedStats?.materializedExecutions ?? 0;
+
+  const latenciesMs: number[] = [];
+  let expectedResultRows = -1;
+  let totalRowsReturned = 0;
+
+  const started = performance.now();
+  for (let i = 0; i < measuredRounds; i += 1) {
+    const queryStarted = performance.now();
+    const result = await db.query(sql);
+    const elapsed = performance.now() - queryStarted;
+    latenciesMs.push(elapsed);
+
+    if (expectedResultRows < 0) expectedResultRows = result.rows.length;
+    else if (result.rows.length !== expectedResultRows) {
+      throw new Error(
+        `${instabilityTag} result-size instability: expected=${expectedResultRows} actual=${result.rows.length} round=${i + 1}`,
+      );
+    }
+    totalRowsReturned += result.rows.length;
+  }
+  const totalDurationMs = performance.now() - started;
+
+  const afterStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedAfter = afterStats?.rowsVisited ?? 0;
+  const pipelinedAfter = afterStats?.pipelinedExecutions ?? 0;
+  const materializedAfter = afterStats?.materializedExecutions ?? 0;
+  const rowsVisitedDelta = Math.max(0, rowsVisitedAfter - rowsVisitedBefore);
+
+  const sortedLatencies = [...latenciesMs].sort((a, b) => a - b);
+  const avgLatencyMs = latenciesMs.reduce((sum, value) => sum + value, 0) / Math.max(1, latenciesMs.length);
+  const minLatencyMs = sortedLatencies[0] ?? 0;
+  const maxLatencyMs = sortedLatencies[sortedLatencies.length - 1] ?? 0;
+  const p50LatencyMs = toLatencyPercentile(sortedLatencies, 50);
+  const p95LatencyMs = toLatencyPercentile(sortedLatencies, 95);
+  const p99LatencyMs = toLatencyPercentile(sortedLatencies, 99);
+
+  return {
+    explain: {
+      physicalOptimizerAccessPath: String(explainRow.physicalOptimizerAccessPath ?? ""),
+      physicalOptimizerIndexStrategy: String(explainRow.physicalOptimizerIndexStrategy ?? ""),
+      physicalOptimizerCost: toFixed(toFiniteNumber(explainRow.physicalOptimizerCost)),
+      physicalAccessPath: String(explainRow.physicalAccessPath ?? ""),
+      physicalIndexStrategy: String(explainRow.physicalIndexStrategy ?? ""),
+      physicalCost: toFixed(toFiniteNumber(explainRow.physicalCost)),
+      physicalCandidates: String(explainRow.physicalCandidates ?? ""),
+      physicalStabilityReason: String(explainRow.physicalStabilityReason ?? ""),
+    },
+    performance: {
+      queryCount: measuredRounds,
+      totalDurationMs: toFixed(totalDurationMs),
+      throughputQps: toQps(measuredRounds, totalDurationMs),
+      avgLatencyMs: toFixed(avgLatencyMs),
+      minLatencyMs: toFixed(minLatencyMs),
+      p50LatencyMs: toFixed(p50LatencyMs),
+      p95LatencyMs: toFixed(p95LatencyMs),
+      p99LatencyMs: toFixed(p99LatencyMs),
+      maxLatencyMs: toFixed(maxLatencyMs),
+    },
+    execution: {
+      resultRows: Math.max(0, expectedResultRows),
+      totalRowsReturned,
+      rowsVisited: rowsVisitedDelta,
+      rowsVisitedPerQuery: toFixed(rowsVisitedDelta / Math.max(1, measuredRounds)),
+      lastRowsVisited: afterStats?.lastRowsVisited ?? 0,
+      pipelinedExecutions: Math.max(0, pipelinedAfter - pipelinedBefore),
+      materializedExecutions: Math.max(0, materializedAfter - materializedBefore),
+    },
+    observability: summarizeIndexObservability(db, BENCH3_TABLE),
   };
 }
 
@@ -606,6 +796,162 @@ export async function runP3Bench002IndexedSameLoadBenefit(
       rowsVisitedReductionPct,
       physicalCostDelta,
       physicalCostReductionPct,
+    },
+  };
+}
+
+export async function runP3Bench003CboBenefitVsFixedRuleBaseline(
+  config?: Partial<P3Bench003CboBenefitConfig>,
+): Promise<P3Bench003CboBenefitReport> {
+  const rows = Math.max(5000, Math.floor(config?.rows ?? defaultP3Bench003Config.rows));
+  const scoreModulo = Math.max(200, Math.floor(config?.scoreModulo ?? defaultP3Bench003Config.scoreModulo));
+  const warmupRounds = Math.max(1, Math.floor(config?.warmupRounds ?? defaultP3Bench003Config.warmupRounds));
+  const measuredRounds = Math.max(10, Math.floor(config?.measuredRounds ?? defaultP3Bench003Config.measuredRounds));
+  const startCandidate = Math.floor(config?.scoreWindowStart ?? defaultP3Bench003Config.scoreWindowStart);
+  const scoreWindowStart = Math.max(0, Math.min(scoreModulo - 2, startCandidate));
+  const maxWindowWidth = Math.max(1, scoreModulo - scoreWindowStart);
+  const widthCandidate = Math.floor(config?.scoreWindowWidth ?? defaultP3Bench003Config.scoreWindowWidth);
+  const minWindowWidth = Math.min(1, maxWindowWidth);
+  const scoreWindowWidth = Math.max(minWindowWidth, Math.min(maxWindowWidth, widthCandidate));
+  const scoreWindowEnd = scoreWindowStart + scoreWindowWidth;
+
+  const c: P3Bench003CboBenefitConfig = {
+    rows,
+    scoreModulo,
+    scoreWindowStart,
+    scoreWindowWidth,
+    warmupRounds,
+    measuredRounds,
+  };
+
+  const tableRows = new Array<Record<string, number | string | null>>(c.rows);
+  const distinctScores = new Set<number>();
+  for (let id = 1; id <= c.rows; id += 1) {
+    const score = (id * 37) % c.scoreModulo;
+    distinctScores.add(score);
+    tableRows[id - 1] = {
+      id,
+      score,
+      payload: `p${id % 97}`,
+    };
+  }
+
+  const sql =
+    `SELECT score FROM ${BENCH3_TABLE} ` +
+    `WHERE score >= ${scoreWindowStart} AND score < ${scoreWindowEnd} ` +
+    "ORDER BY score ASC LIMIT 120";
+
+  const setupBench003Client = async (): Promise<WalrusSqlClient> => {
+    const db = mkClient();
+    await db.execute(`CREATE TABLE ${BENCH3_TABLE} (id INT, score INT, payload TEXT)`);
+    (db as unknown as InternalTableStore).tables.set(
+      BENCH3_TABLE,
+      tableRows.map((row) => ({ ...row })),
+    );
+    await db.execute(`CREATE INDEX ${BENCH3_INDEX} ON ${BENCH3_TABLE}(score)`);
+    return db;
+  };
+
+  const fixedRuleDb = await setupBench003Client();
+  const cboDb = await setupBench003Client();
+
+  applyFixedRuleTableScan(fixedRuleDb, sql, c.warmupRounds + c.measuredRounds + 8);
+
+  const fixedRuleBaseline = await runBench003Scenario(
+    fixedRuleDb,
+    sql,
+    c.warmupRounds,
+    c.measuredRounds,
+    "P3-BENCH-003 fixed-rule",
+  );
+  const cbo = await runBench003Scenario(
+    cboDb,
+    sql,
+    c.warmupRounds,
+    c.measuredRounds,
+    "P3-BENCH-003 cbo",
+  );
+
+  if (fixedRuleBaseline.execution.resultRows !== cbo.execution.resultRows) {
+    throw new Error(
+      `P3-BENCH-003 result-size mismatch: fixedRule=${fixedRuleBaseline.execution.resultRows} cbo=${cbo.execution.resultRows}`,
+    );
+  }
+
+  const throughputQpsDelta = toFixed(cbo.performance.throughputQps - fixedRuleBaseline.performance.throughputQps);
+  const throughputQpsGainPct =
+    fixedRuleBaseline.performance.throughputQps > 0
+      ? toFixed((throughputQpsDelta / fixedRuleBaseline.performance.throughputQps) * 100)
+      : 0;
+  const p95LatencyMsDelta = toFixed(fixedRuleBaseline.performance.p95LatencyMs - cbo.performance.p95LatencyMs);
+  const p95LatencyReductionPct =
+    fixedRuleBaseline.performance.p95LatencyMs > 0
+      ? toFixed((p95LatencyMsDelta / fixedRuleBaseline.performance.p95LatencyMs) * 100)
+      : 0;
+  const rowsVisitedPerQueryDelta = toFixed(
+    fixedRuleBaseline.execution.rowsVisitedPerQuery - cbo.execution.rowsVisitedPerQuery,
+  );
+  const rowsVisitedReductionPct =
+    fixedRuleBaseline.execution.rowsVisitedPerQuery > 0
+      ? toFixed((rowsVisitedPerQueryDelta / fixedRuleBaseline.execution.rowsVisitedPerQuery) * 100)
+      : 0;
+  const physicalCostDelta = toFixed(fixedRuleBaseline.explain.physicalCost - cbo.explain.physicalCost);
+  const physicalCostReductionPct =
+    fixedRuleBaseline.explain.physicalCost > 0
+      ? toFixed((physicalCostDelta / fixedRuleBaseline.explain.physicalCost) * 100)
+      : 0;
+
+  const reasons: string[] = [];
+  if (fixedRuleBaseline.explain.physicalAccessPath === "TABLE_SCAN") {
+    reasons.push("fixed-rule baseline used TABLE_SCAN");
+  }
+  if (cbo.explain.physicalAccessPath !== "TABLE_SCAN") {
+    reasons.push(`CBO selected ${cbo.explain.physicalAccessPath}`);
+  }
+  if (rowsVisitedPerQueryDelta > 0) {
+    reasons.push(`rowsVisited/query reduced by ${rowsVisitedPerQueryDelta}`);
+  }
+  if (physicalCostDelta > 0) {
+    reasons.push(`physical cost reduced by ${physicalCostDelta}`);
+  }
+
+  const cboPreferred =
+    fixedRuleBaseline.explain.physicalAccessPath === "TABLE_SCAN"
+    && cbo.explain.physicalAccessPath !== "TABLE_SCAN"
+    && rowsVisitedPerQueryDelta > 0
+    && physicalCostDelta > 0;
+
+  return {
+    benchmark: "p3-bench-003-cbo-benefit-vs-fixed-rule-baseline",
+    at: new Date().toISOString(),
+    config: c,
+    dataset: {
+      rows: tableRows.length,
+      distinctScores: distinctScores.size,
+      indexedColumn: "score",
+      indexName: BENCH3_INDEX,
+    },
+    query: {
+      sql,
+      warmupRounds: c.warmupRounds,
+      measuredRounds: c.measuredRounds,
+      fixedRulePolicy: BENCH3_FIXED_RULE_POLICY,
+    },
+    fixedRuleBaseline,
+    cbo,
+    gains: {
+      throughputQpsDelta,
+      throughputQpsGainPct,
+      p95LatencyMsDelta,
+      p95LatencyReductionPct,
+      rowsVisitedPerQueryDelta,
+      rowsVisitedReductionPct,
+      physicalCostDelta,
+      physicalCostReductionPct,
+    },
+    verdict: {
+      cboPreferred,
+      reasons,
     },
   };
 }
