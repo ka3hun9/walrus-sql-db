@@ -39,6 +39,7 @@
     "p2:bench:tpcc": "tsx examples/p2-bench-tpcc-mini.ts",
     "p2:bench:conflict": "tsx examples/p2-bench-conflict.ts",
     "p2:bench:longrun": "tsx examples/p2-bench-longrun.ts",
+    "p3:bench:001": "tsx examples/p3-bench-001-no-index-complex-baseline.ts",
     "test:ci:unit": "tsx scripts/run-ci-tests.ts unit",
     "test:ci:integration": "tsx scripts/run-ci-tests.ts integration",
     "test:ci:regression": "tsx scripts/run-ci-tests.ts regression",

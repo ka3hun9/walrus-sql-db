@@ -11,6 +11,7 @@ export * from "./sql-parser.js";
 export * from "./sql-executor.js";
 export * from "./performance-benchmarks.js";
 export * from "./p2-benchmarks.js";
+export * from "./p3-benchmarks.js";
 export * from "./config.js";
 export * from "./logger.js";
 export * from "./client.js";
