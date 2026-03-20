@@ -10,7 +10,9 @@ for (const snippet of [
   "## J-MILE-007",
   "examples/sql-compare-matrix.ts",
   "examples/sql-semantic-grouped-runner.ts",
+  "docs/sql-p3-operations-runbook.md",
   "npm run sql:compare:matrix:category",
+  "npm run sql:semantic:grouped",
   "PASS",
 ]) {
   assert.ok(doc.includes(snippet), `missing doc snippet: ${snippet}`);
@@ -20,10 +22,21 @@ for (const file of [
   "examples/sql-compare-matrix.ts",
   "examples/sql-semantic-grouped-runner.ts",
   "examples/sql-logic-runner.ts",
+  "docs/sql-p3-operations-runbook.md",
   "test/sqllogic/p1-basic.slt",
   "test/sqllogic/p2-extended.slt",
 ]) {
   assert.equal(existsSync(file), true, `missing sync artifact: ${file}`);
+}
+
+const runbook = readFileSync("docs/sql-p3-operations-runbook.md", "utf8");
+for (const snippet of [
+  "# P3 Operations Runbook",
+  "npm run sql:compare:matrix:category",
+  "npm run sql:semantic:grouped",
+  "npm run sql:logic:all",
+]) {
+  assert.ok(runbook.includes(snippet), `missing runbook snippet: ${snippet}`);
 }
 
 const tmpRoot = mkdtempSync(join(tmpdir(), "walrus-j-mile-007-"));

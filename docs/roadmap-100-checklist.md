@@ -78,7 +78,7 @@
 - [x] P3-MILE-004 视图 SELECT 能力验收通过（可更新视图暂缓） [validated: 2026-03-20]
 - [x] P3-MILE-005 大数据复杂查询性能达标且稳定 [validated: 2026-03-21]
 - [x] P3-MILE-006 全测试管线绿灯（build/unit/integration/regression/bench） [validated: 2026-03-21]
-- [ ] P3-MILE-007 文档、示例、运维手册同步
+- [x] P3-MILE-007 文档、示例、运维手册同步 [validated: 2026-03-21]
 
 ---
 
