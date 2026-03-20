@@ -64,7 +64,95 @@ export interface P3Bench001NoIndexReport {
   };
 }
 
-export type P3BenchReport = P3Bench001NoIndexReport;
+export interface P3Bench002IndexedConfig {
+  customers: number;
+  ordersPerCustomer: number;
+  paidEveryNOrders: number;
+  customerRangeStart: number;
+  customerRangeEnd: number;
+  warmupRounds: number;
+  measuredRounds: number;
+}
+
+type P3Bench002Explain = {
+  physicalOptimizerAccessPath: string;
+  physicalOptimizerIndexStrategy: string;
+  physicalOptimizerCost: number;
+  physicalAccessPath: string;
+  physicalIndexStrategy: string;
+  physicalCost: number;
+  physicalCandidates: string;
+};
+
+type P3Bench002Performance = {
+  queryCount: number;
+  totalDurationMs: number;
+  throughputQps: number;
+  avgLatencyMs: number;
+  minLatencyMs: number;
+  p50LatencyMs: number;
+  p95LatencyMs: number;
+  p99LatencyMs: number;
+  maxLatencyMs: number;
+};
+
+type P3Bench002Execution = {
+  resultRows: number;
+  totalRowsReturned: number;
+  rowsVisited: number;
+  rowsVisitedPerQuery: number;
+  lastRowsVisited: number;
+  pipelinedExecutions: number;
+  materializedExecutions: number;
+};
+
+type P3Bench002Observability = {
+  indexObservabilityEntries: number;
+  lookupCountTotal: number;
+  lookupHitsTotal: number;
+  lookupMissesTotal: number;
+  maintenanceRowsTotal: number;
+};
+
+type P3Bench002Scenario = {
+  explain: P3Bench002Explain;
+  performance: P3Bench002Performance;
+  execution: P3Bench002Execution;
+  observability: P3Bench002Observability;
+};
+
+export interface P3Bench002IndexedReport {
+  benchmark: "p3-bench-002-indexed-same-load-benefit";
+  at: string;
+  config: P3Bench002IndexedConfig;
+  dataset: {
+    customers: number;
+    orders: number;
+    paidOrders: number;
+  };
+  query: {
+    sql: string;
+    warmupRounds: number;
+    measuredRounds: number;
+  };
+  baseline: P3Bench002Scenario;
+  indexed: P3Bench002Scenario & {
+    indexBuildMs: number;
+    createdIndexes: string[];
+  };
+  gains: {
+    throughputQpsDelta: number;
+    throughputQpsGainPct: number;
+    p95LatencyMsDelta: number;
+    p95LatencyReductionPct: number;
+    rowsVisitedPerQueryDelta: number;
+    rowsVisitedReductionPct: number;
+    physicalCostDelta: number;
+    physicalCostReductionPct: number;
+  };
+}
+
+export type P3BenchReport = P3Bench001NoIndexReport | P3Bench002IndexedReport;
 
 const defaultP3Bench001Config: P3Bench001NoIndexConfig = {
   customers: 600,
@@ -74,11 +162,23 @@ const defaultP3Bench001Config: P3Bench001NoIndexConfig = {
   measuredRounds: 12,
 };
 
+const defaultP3Bench002Config: P3Bench002IndexedConfig = {
+  customers: 1200,
+  ordersPerCustomer: 14,
+  paidEveryNOrders: 7,
+  customerRangeStart: 120,
+  customerRangeEnd: 720,
+  warmupRounds: 3,
+  measuredRounds: 16,
+};
+
 const BENCH_TABLES = {
   customers: "p3_bench1_customers",
   orders: "p3_bench1_orders",
   refunds: "p3_bench1_refunds",
 } as const;
+
+const BENCH2_TABLE = "p3_bench2_orders";
 
 function mkClient(): WalrusSqlClient {
   return new WalrusSqlClient({
@@ -103,6 +203,113 @@ function toLatencyPercentile(sortedValues: number[], percentile: number): number
 
 function toFixed(value: number): number {
   return Number(value.toFixed(3));
+}
+
+function toFiniteNumber(input: unknown): number {
+  const n = Number(input);
+  if (!Number.isFinite(n)) return 0;
+  return n;
+}
+
+function summarizeIndexObservability(
+  db: WalrusSqlClient,
+  table?: string,
+): P3Bench002Observability {
+  const rows = db.getIndexObservability(table);
+  return {
+    indexObservabilityEntries: rows.length,
+    lookupCountTotal: rows.reduce((sum, row) => sum + row.lookupCount, 0),
+    lookupHitsTotal: rows.reduce((sum, row) => sum + row.lookupHits, 0),
+    lookupMissesTotal: rows.reduce((sum, row) => sum + row.lookupMisses, 0),
+    maintenanceRowsTotal: rows.reduce((sum, row) => sum + row.maintenanceRows, 0),
+  };
+}
+
+async function runBench002Scenario(
+  db: WalrusSqlClient,
+  sql: string,
+  warmupRounds: number,
+  measuredRounds: number,
+  instabilityTag: string,
+): Promise<P3Bench002Scenario> {
+  const explainRow = (await db.query(`EXPLAIN ${sql}`)).rows[0] ?? {};
+
+  for (let i = 0; i < warmupRounds; i += 1) {
+    await db.query(sql);
+  }
+
+  const warmedStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedBefore = warmedStats?.rowsVisited ?? 0;
+  const pipelinedBefore = warmedStats?.pipelinedExecutions ?? 0;
+  const materializedBefore = warmedStats?.materializedExecutions ?? 0;
+
+  const latenciesMs: number[] = [];
+  let expectedResultRows = -1;
+  let totalRowsReturned = 0;
+
+  const started = performance.now();
+  for (let i = 0; i < measuredRounds; i += 1) {
+    const queryStarted = performance.now();
+    const result = await db.query(sql);
+    const elapsed = performance.now() - queryStarted;
+    latenciesMs.push(elapsed);
+
+    if (expectedResultRows < 0) expectedResultRows = result.rows.length;
+    else if (result.rows.length !== expectedResultRows) {
+      throw new Error(
+        `${instabilityTag} result-size instability: expected=${expectedResultRows} actual=${result.rows.length} round=${i + 1}`,
+      );
+    }
+    totalRowsReturned += result.rows.length;
+  }
+  const totalDurationMs = performance.now() - started;
+
+  const afterStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedAfter = afterStats?.rowsVisited ?? 0;
+  const pipelinedAfter = afterStats?.pipelinedExecutions ?? 0;
+  const materializedAfter = afterStats?.materializedExecutions ?? 0;
+  const rowsVisitedDelta = Math.max(0, rowsVisitedAfter - rowsVisitedBefore);
+
+  const sortedLatencies = [...latenciesMs].sort((a, b) => a - b);
+  const avgLatencyMs = latenciesMs.reduce((sum, value) => sum + value, 0) / Math.max(1, latenciesMs.length);
+  const minLatencyMs = sortedLatencies[0] ?? 0;
+  const maxLatencyMs = sortedLatencies[sortedLatencies.length - 1] ?? 0;
+  const p50LatencyMs = toLatencyPercentile(sortedLatencies, 50);
+  const p95LatencyMs = toLatencyPercentile(sortedLatencies, 95);
+  const p99LatencyMs = toLatencyPercentile(sortedLatencies, 99);
+
+  return {
+    explain: {
+      physicalOptimizerAccessPath: String(explainRow.physicalOptimizerAccessPath ?? ""),
+      physicalOptimizerIndexStrategy: String(explainRow.physicalOptimizerIndexStrategy ?? ""),
+      physicalOptimizerCost: toFixed(toFiniteNumber(explainRow.physicalOptimizerCost)),
+      physicalAccessPath: String(explainRow.physicalAccessPath ?? ""),
+      physicalIndexStrategy: String(explainRow.physicalIndexStrategy ?? ""),
+      physicalCost: toFixed(toFiniteNumber(explainRow.physicalCost)),
+      physicalCandidates: String(explainRow.physicalCandidates ?? ""),
+    },
+    performance: {
+      queryCount: measuredRounds,
+      totalDurationMs: toFixed(totalDurationMs),
+      throughputQps: toQps(measuredRounds, totalDurationMs),
+      avgLatencyMs: toFixed(avgLatencyMs),
+      minLatencyMs: toFixed(minLatencyMs),
+      p50LatencyMs: toFixed(p50LatencyMs),
+      p95LatencyMs: toFixed(p95LatencyMs),
+      p99LatencyMs: toFixed(p99LatencyMs),
+      maxLatencyMs: toFixed(maxLatencyMs),
+    },
+    execution: {
+      resultRows: Math.max(0, expectedResultRows),
+      totalRowsReturned,
+      rowsVisited: rowsVisitedDelta,
+      rowsVisitedPerQuery: toFixed(rowsVisitedDelta / Math.max(1, measuredRounds)),
+      lastRowsVisited: afterStats?.lastRowsVisited ?? 0,
+      pipelinedExecutions: Math.max(0, pipelinedAfter - pipelinedBefore),
+      materializedExecutions: Math.max(0, materializedAfter - materializedBefore),
+    },
+    observability: summarizeIndexObservability(db, BENCH2_TABLE),
+  };
 }
 
 export async function runP3Bench001NoIndexComplexBaseline(
@@ -271,6 +478,134 @@ export async function runP3Bench001NoIndexComplexBaseline(
       lookupCountTotal,
       maintenanceRowsTotal,
       noIndexObserved,
+    },
+  };
+}
+
+export async function runP3Bench002IndexedSameLoadBenefit(
+  config?: Partial<P3Bench002IndexedConfig>,
+): Promise<P3Bench002IndexedReport> {
+  const customers = Math.max(400, config?.customers ?? defaultP3Bench002Config.customers);
+  const ordersPerCustomer = Math.max(6, config?.ordersPerCustomer ?? defaultP3Bench002Config.ordersPerCustomer);
+  const paidEveryNOrders = Math.max(3, config?.paidEveryNOrders ?? defaultP3Bench002Config.paidEveryNOrders);
+  const warmupRounds = Math.max(1, config?.warmupRounds ?? defaultP3Bench002Config.warmupRounds);
+  const measuredRounds = Math.max(8, config?.measuredRounds ?? defaultP3Bench002Config.measuredRounds);
+  const startCandidate = Math.floor(config?.customerRangeStart ?? defaultP3Bench002Config.customerRangeStart);
+  const endCandidate = Math.floor(config?.customerRangeEnd ?? defaultP3Bench002Config.customerRangeEnd);
+  const customerRangeStart = Math.max(1, Math.min(customers - 1, startCandidate));
+  const customerRangeEnd = Math.max(customerRangeStart + 1, Math.min(customers, endCandidate));
+
+  const c: P3Bench002IndexedConfig = {
+    customers,
+    ordersPerCustomer,
+    paidEveryNOrders,
+    customerRangeStart,
+    customerRangeEnd,
+    warmupRounds,
+    measuredRounds,
+  };
+
+  const db = mkClient();
+  await db.execute(`CREATE TABLE ${BENCH2_TABLE} (id INT, customer_id INT, amount INT, status TEXT)`);
+
+  const orderRows = new Array<Record<string, number | string | null>>(c.customers * c.ordersPerCustomer);
+  const nonPaidStatuses = ["draft", "shipped", "cancelled", "pending"] as const;
+
+  let paidOrders = 0;
+  let orderId = 1;
+  for (let customerId = 1; customerId <= c.customers; customerId += 1) {
+    for (let i = 0; i < c.ordersPerCustomer; i += 1) {
+      const amount = 15 + ((orderId * 13 + customerId * 17 + i * 7) % 500);
+      const status =
+        orderId % c.paidEveryNOrders === 0
+          ? "paid"
+          : (nonPaidStatuses[(orderId + customerId + i) % nonPaidStatuses.length] ?? "draft");
+      if (status === "paid") paidOrders += 1;
+
+      orderRows[orderId - 1] = {
+        id: orderId,
+        customer_id: customerId,
+        amount,
+        status,
+      };
+      orderId += 1;
+    }
+  }
+  (db as unknown as InternalTableStore).tables.set(BENCH2_TABLE, orderRows);
+
+  const sql =
+    "SELECT customer_id, SUM(amount) " +
+    `FROM ${BENCH2_TABLE} ` +
+    `WHERE status = 'paid' AND customer_id >= ${c.customerRangeStart} AND customer_id <= ${c.customerRangeEnd} ` +
+    "GROUP BY customer_id " +
+    "ORDER BY sum DESC, customer_id ASC LIMIT 80";
+
+  const baseline = await runBench002Scenario(db, sql, c.warmupRounds, c.measuredRounds, "P3-BENCH-002 baseline");
+
+  const createdIndexes = ["idx_p3_bench2_orders_status", "idx_p3_bench2_orders_customer_id"];
+  const indexBuildStarted = performance.now();
+  await db.execute(`CREATE INDEX ${createdIndexes[0]} ON ${BENCH2_TABLE}(status)`);
+  await db.execute(`CREATE INDEX ${createdIndexes[1]} ON ${BENCH2_TABLE}(customer_id)`);
+  const indexBuildMs = performance.now() - indexBuildStarted;
+
+  const indexed = await runBench002Scenario(db, sql, c.warmupRounds, c.measuredRounds, "P3-BENCH-002 indexed");
+
+  if (baseline.execution.resultRows !== indexed.execution.resultRows) {
+    throw new Error(
+      `P3-BENCH-002 result-size mismatch: baseline=${baseline.execution.resultRows} indexed=${indexed.execution.resultRows}`,
+    );
+  }
+
+  const throughputQpsDelta = toFixed(indexed.performance.throughputQps - baseline.performance.throughputQps);
+  const throughputQpsGainPct =
+    baseline.performance.throughputQps > 0
+      ? toFixed((throughputQpsDelta / baseline.performance.throughputQps) * 100)
+      : 0;
+  const p95LatencyMsDelta = toFixed(baseline.performance.p95LatencyMs - indexed.performance.p95LatencyMs);
+  const p95LatencyReductionPct =
+    baseline.performance.p95LatencyMs > 0
+      ? toFixed((p95LatencyMsDelta / baseline.performance.p95LatencyMs) * 100)
+      : 0;
+  const rowsVisitedPerQueryDelta = toFixed(baseline.execution.rowsVisitedPerQuery - indexed.execution.rowsVisitedPerQuery);
+  const rowsVisitedReductionPct =
+    baseline.execution.rowsVisitedPerQuery > 0
+      ? toFixed((rowsVisitedPerQueryDelta / baseline.execution.rowsVisitedPerQuery) * 100)
+      : 0;
+  const physicalCostDelta = toFixed(baseline.explain.physicalCost - indexed.explain.physicalCost);
+  const physicalCostReductionPct =
+    baseline.explain.physicalCost > 0
+      ? toFixed((physicalCostDelta / baseline.explain.physicalCost) * 100)
+      : 0;
+
+  return {
+    benchmark: "p3-bench-002-indexed-same-load-benefit",
+    at: new Date().toISOString(),
+    config: c,
+    dataset: {
+      customers: c.customers,
+      orders: orderRows.length,
+      paidOrders,
+    },
+    query: {
+      sql,
+      warmupRounds: c.warmupRounds,
+      measuredRounds: c.measuredRounds,
+    },
+    baseline,
+    indexed: {
+      ...indexed,
+      indexBuildMs: toFixed(indexBuildMs),
+      createdIndexes,
+    },
+    gains: {
+      throughputQpsDelta,
+      throughputQpsGainPct,
+      p95LatencyMsDelta,
+      p95LatencyReductionPct,
+      rowsVisitedPerQueryDelta,
+      rowsVisitedReductionPct,
+      physicalCostDelta,
+      physicalCostReductionPct,
     },
   };
 }
