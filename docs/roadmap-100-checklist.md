@@ -74,7 +74,7 @@
 - [ ] P3-BENCH-004 大数据集复杂连接/子查询压测报告
 - [x] P3-MILE-001 索引系统验收通过（建索引、命中、恢复一致） [validated: 2026-03-20]
 - [x] P3-MILE-002 CBO 验收通过（统计驱动计划选择） [validated: 2026-03-20]
-- [ ] P3-MILE-003 子查询与集合操作全路径验收通过
+- [x] P3-MILE-003 子查询与集合操作全路径验收通过 [validated: 2026-03-20]
 - [ ] P3-MILE-004 视图 SELECT 能力验收通过（可更新视图暂缓）
 - [ ] P3-MILE-005 大数据复杂查询性能达标且稳定
 - [ ] P3-MILE-006 全测试管线绿灯（build/unit/integration/regression/bench）
