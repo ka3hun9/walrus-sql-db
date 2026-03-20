@@ -222,7 +222,88 @@ export interface P3Bench003CboBenefitReport {
   };
 }
 
-export type P3BenchReport = P3Bench001NoIndexReport | P3Bench002IndexedReport | P3Bench003CboBenefitReport;
+export interface P3Bench004LargeDatasetConfig {
+  customers: number;
+  ordersPerCustomer: number;
+  shipmentDeliveredEveryNOrders: number;
+  refundEveryNOrders: number;
+  warmupRounds: number;
+  measuredRounds: number;
+  joinMemoryBudgetRows: number;
+  joinSpillChunkRows: number;
+}
+
+type P3Bench004Explain = P3Bench002Explain & {
+  physicalJoinCount: number;
+  physicalJoinAlgorithms: string;
+  physicalJoinPlan: string;
+};
+
+type P3Bench004Execution = P3Bench002Execution & {
+  earlyStopExecutions: number;
+  joinSpillExecutions: number;
+  joinSpillChunks: number;
+  joinSpillRowsProcessed: number;
+};
+
+type P3Bench004SubqueryEvidence = {
+  entries: number;
+  executions: number;
+  correlatedExecutions: number;
+  cacheHits: number;
+  cacheMisses: number;
+  rowsScanned: number;
+  rowsReturned: number;
+  budgetExceededCount: number;
+};
+
+type P3Bench004Scenario = {
+  explain: P3Bench004Explain;
+  performance: P3Bench002Performance;
+  execution: P3Bench004Execution;
+  observability: P3Bench002Observability;
+  subquery?: P3Bench004SubqueryEvidence;
+};
+
+export interface P3Bench004LargeDatasetReport {
+  benchmark: "p3-bench-004-large-dataset-complex-join-subquery-stress";
+  at: string;
+  config: P3Bench004LargeDatasetConfig;
+  dataset: {
+    customers: number;
+    orders: number;
+    shipments: number;
+    refunds: number;
+    paidOrders: number;
+    shippedOrders: number;
+  };
+  query: {
+    joinSql: string;
+    subquerySql: string;
+    warmupRounds: number;
+    measuredRounds: number;
+    subqueryFragments: {
+      inSubquery: string;
+      existsSubquery: string;
+      scalarSubquery: string;
+    };
+  };
+  joinStress: P3Bench004Scenario;
+  subqueryStress: P3Bench004Scenario;
+  verdict: {
+    largeDataset: boolean;
+    complexJoinObserved: boolean;
+    complexSubqueryObserved: boolean;
+    stableResultRows: boolean;
+    reasons: string[];
+  };
+}
+
+export type P3BenchReport =
+  | P3Bench001NoIndexReport
+  | P3Bench002IndexedReport
+  | P3Bench003CboBenefitReport
+  | P3Bench004LargeDatasetReport;
 
 const defaultP3Bench001Config: P3Bench001NoIndexConfig = {
   customers: 600,
@@ -251,6 +332,17 @@ const defaultP3Bench003Config: P3Bench003CboBenefitConfig = {
   measuredRounds: 16,
 };
 
+const defaultP3Bench004Config: P3Bench004LargeDatasetConfig = {
+  customers: 2600,
+  ordersPerCustomer: 18,
+  shipmentDeliveredEveryNOrders: 2,
+  refundEveryNOrders: 6,
+  warmupRounds: 2,
+  measuredRounds: 10,
+  joinMemoryBudgetRows: 250000,
+  joinSpillChunkRows: 4096,
+};
+
 const BENCH_TABLES = {
   customers: "p3_bench1_customers",
   orders: "p3_bench1_orders",
@@ -261,6 +353,12 @@ const BENCH2_TABLE = "p3_bench2_orders";
 const BENCH3_TABLE = "p3_bench3_metrics";
 const BENCH3_INDEX = "idx_p3_bench3_score";
 const BENCH3_FIXED_RULE_POLICY = "ALWAYS_TABLE_SCAN";
+const BENCH4_TABLES = {
+  customers: "p3_bench4_customers",
+  orders: "p3_bench4_orders",
+  shipments: "p3_bench4_shipments",
+  refunds: "p3_bench4_refunds",
+} as const;
 
 function mkClient(): WalrusSqlClient {
   return new WalrusSqlClient({
@@ -324,6 +422,41 @@ function summarizeIndexObservability(
     lookupHitsTotal: rows.reduce((sum, row) => sum + row.lookupHits, 0),
     lookupMissesTotal: rows.reduce((sum, row) => sum + row.lookupMisses, 0),
     maintenanceRowsTotal: rows.reduce((sum, row) => sum + row.maintenanceRows, 0),
+  };
+}
+
+type SubqueryStatSnapshot = {
+  executions: number;
+  correlatedExecutions: number;
+  cacheHits: number;
+  cacheMisses: number;
+  rowsScanned: number;
+  rowsReturned: number;
+  budgetExceededCount: number;
+};
+
+function readSubquerySnapshot(db: WalrusSqlClient, subquerySql: string): SubqueryStatSnapshot {
+  const row = db.getSubqueryExecutionStats(subquerySql)[0];
+  return {
+    executions: row?.executions ?? 0,
+    correlatedExecutions: row?.correlatedExecutions ?? 0,
+    cacheHits: row?.cacheHits ?? 0,
+    cacheMisses: row?.cacheMisses ?? 0,
+    rowsScanned: row?.rowsScanned ?? 0,
+    rowsReturned: row?.rowsReturned ?? 0,
+    budgetExceededCount: row?.budgetExceededCount ?? 0,
+  };
+}
+
+function diffSubquerySnapshot(after: SubqueryStatSnapshot, before: SubqueryStatSnapshot): SubqueryStatSnapshot {
+  return {
+    executions: Math.max(0, after.executions - before.executions),
+    correlatedExecutions: Math.max(0, after.correlatedExecutions - before.correlatedExecutions),
+    cacheHits: Math.max(0, after.cacheHits - before.cacheHits),
+    cacheMisses: Math.max(0, after.cacheMisses - before.cacheMisses),
+    rowsScanned: Math.max(0, after.rowsScanned - before.rowsScanned),
+    rowsReturned: Math.max(0, after.rowsReturned - before.rowsReturned),
+    budgetExceededCount: Math.max(0, after.budgetExceededCount - before.budgetExceededCount),
   };
 }
 
@@ -499,6 +632,127 @@ async function runBench003Scenario(
       materializedExecutions: Math.max(0, materializedAfter - materializedBefore),
     },
     observability: summarizeIndexObservability(db, BENCH3_TABLE),
+  };
+}
+
+async function runBench004Scenario(
+  db: WalrusSqlClient,
+  sql: string,
+  warmupRounds: number,
+  measuredRounds: number,
+  instabilityTag: string,
+  trackedSubqueries: string[] = [],
+): Promise<P3Bench004Scenario> {
+  const explainRow = (await db.query(`EXPLAIN ${sql}`)).rows[0] ?? {};
+  const subqueryBefore = trackedSubqueries.map((subquerySql) => readSubquerySnapshot(db, subquerySql));
+
+  for (let i = 0; i < warmupRounds; i += 1) {
+    await db.query(sql);
+  }
+
+  const warmedStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedBefore = warmedStats?.rowsVisited ?? 0;
+  const pipelinedBefore = warmedStats?.pipelinedExecutions ?? 0;
+  const materializedBefore = warmedStats?.materializedExecutions ?? 0;
+  const earlyStopBefore = warmedStats?.earlyStopExecutions ?? 0;
+  const spillExecutionsBefore = warmedStats?.joinSpillExecutions ?? 0;
+  const spillChunksBefore = warmedStats?.joinSpillChunks ?? 0;
+  const spillRowsProcessedBefore = warmedStats?.joinSpillRowsProcessed ?? 0;
+
+  const latenciesMs: number[] = [];
+  let expectedResultRows = -1;
+  let totalRowsReturned = 0;
+
+  const started = performance.now();
+  for (let i = 0; i < measuredRounds; i += 1) {
+    const queryStarted = performance.now();
+    const result = await db.query(sql);
+    const elapsed = performance.now() - queryStarted;
+    latenciesMs.push(elapsed);
+
+    if (expectedResultRows < 0) expectedResultRows = result.rows.length;
+    else if (result.rows.length !== expectedResultRows) {
+      throw new Error(
+        `${instabilityTag} result-size instability: expected=${expectedResultRows} actual=${result.rows.length} round=${i + 1}`,
+      );
+    }
+    totalRowsReturned += result.rows.length;
+  }
+  const totalDurationMs = performance.now() - started;
+
+  const afterStats = db.getSelectExecutionPipelineStats(sql)[0];
+  const rowsVisitedAfter = afterStats?.rowsVisited ?? 0;
+  const pipelinedAfter = afterStats?.pipelinedExecutions ?? 0;
+  const materializedAfter = afterStats?.materializedExecutions ?? 0;
+  const earlyStopAfter = afterStats?.earlyStopExecutions ?? 0;
+  const spillExecutionsAfter = afterStats?.joinSpillExecutions ?? 0;
+  const spillChunksAfter = afterStats?.joinSpillChunks ?? 0;
+  const spillRowsProcessedAfter = afterStats?.joinSpillRowsProcessed ?? 0;
+  const rowsVisitedDelta = Math.max(0, rowsVisitedAfter - rowsVisitedBefore);
+
+  const sortedLatencies = [...latenciesMs].sort((a, b) => a - b);
+  const avgLatencyMs = latenciesMs.reduce((sum, value) => sum + value, 0) / Math.max(1, latenciesMs.length);
+  const minLatencyMs = sortedLatencies[0] ?? 0;
+  const maxLatencyMs = sortedLatencies[sortedLatencies.length - 1] ?? 0;
+  const p50LatencyMs = toLatencyPercentile(sortedLatencies, 50);
+  const p95LatencyMs = toLatencyPercentile(sortedLatencies, 95);
+  const p99LatencyMs = toLatencyPercentile(sortedLatencies, 99);
+
+  let subquery: P3Bench004SubqueryEvidence | undefined;
+  if (trackedSubqueries.length > 0) {
+    const subqueryAfter = trackedSubqueries.map((subquerySql) => readSubquerySnapshot(db, subquerySql));
+    const delta = subqueryAfter.map((after, idx) => diffSubquerySnapshot(after, subqueryBefore[idx]!));
+    subquery = {
+      entries: trackedSubqueries.length,
+      executions: delta.reduce((sum, row) => sum + row.executions, 0),
+      correlatedExecutions: delta.reduce((sum, row) => sum + row.correlatedExecutions, 0),
+      cacheHits: delta.reduce((sum, row) => sum + row.cacheHits, 0),
+      cacheMisses: delta.reduce((sum, row) => sum + row.cacheMisses, 0),
+      rowsScanned: delta.reduce((sum, row) => sum + row.rowsScanned, 0),
+      rowsReturned: delta.reduce((sum, row) => sum + row.rowsReturned, 0),
+      budgetExceededCount: delta.reduce((sum, row) => sum + row.budgetExceededCount, 0),
+    };
+  }
+
+  return {
+    explain: {
+      physicalOptimizerAccessPath: String(explainRow.physicalOptimizerAccessPath ?? ""),
+      physicalOptimizerIndexStrategy: String(explainRow.physicalOptimizerIndexStrategy ?? ""),
+      physicalOptimizerCost: toFixed(toFiniteNumber(explainRow.physicalOptimizerCost)),
+      physicalAccessPath: String(explainRow.physicalAccessPath ?? ""),
+      physicalIndexStrategy: String(explainRow.physicalIndexStrategy ?? ""),
+      physicalCost: toFixed(toFiniteNumber(explainRow.physicalCost)),
+      physicalCandidates: String(explainRow.physicalCandidates ?? ""),
+      physicalJoinCount: Math.max(0, Math.floor(toFiniteNumber(explainRow.physicalJoinCount))),
+      physicalJoinAlgorithms: String(explainRow.physicalJoinAlgorithms ?? ""),
+      physicalJoinPlan: String(explainRow.physicalJoinPlan ?? ""),
+    },
+    performance: {
+      queryCount: measuredRounds,
+      totalDurationMs: toFixed(totalDurationMs),
+      throughputQps: toQps(measuredRounds, totalDurationMs),
+      avgLatencyMs: toFixed(avgLatencyMs),
+      minLatencyMs: toFixed(minLatencyMs),
+      p50LatencyMs: toFixed(p50LatencyMs),
+      p95LatencyMs: toFixed(p95LatencyMs),
+      p99LatencyMs: toFixed(p99LatencyMs),
+      maxLatencyMs: toFixed(maxLatencyMs),
+    },
+    execution: {
+      resultRows: Math.max(0, expectedResultRows),
+      totalRowsReturned,
+      rowsVisited: rowsVisitedDelta,
+      rowsVisitedPerQuery: toFixed(rowsVisitedDelta / Math.max(1, measuredRounds)),
+      lastRowsVisited: afterStats?.lastRowsVisited ?? 0,
+      pipelinedExecutions: Math.max(0, pipelinedAfter - pipelinedBefore),
+      materializedExecutions: Math.max(0, materializedAfter - materializedBefore),
+      earlyStopExecutions: Math.max(0, earlyStopAfter - earlyStopBefore),
+      joinSpillExecutions: Math.max(0, spillExecutionsAfter - spillExecutionsBefore),
+      joinSpillChunks: Math.max(0, spillChunksAfter - spillChunksBefore),
+      joinSpillRowsProcessed: Math.max(0, spillRowsProcessedAfter - spillRowsProcessedBefore),
+    },
+    observability: summarizeIndexObservability(db),
+    subquery,
   };
 }
 
@@ -951,6 +1205,233 @@ export async function runP3Bench003CboBenefitVsFixedRuleBaseline(
     },
     verdict: {
       cboPreferred,
+      reasons,
+    },
+  };
+}
+
+export async function runP3Bench004LargeDatasetComplexJoinSubqueryStress(
+  config?: Partial<P3Bench004LargeDatasetConfig>,
+): Promise<P3Bench004LargeDatasetReport> {
+  const customers = Math.max(1000, Math.floor(config?.customers ?? defaultP3Bench004Config.customers));
+  const ordersPerCustomer = Math.max(8, Math.floor(config?.ordersPerCustomer ?? defaultP3Bench004Config.ordersPerCustomer));
+  const shipmentDeliveredEveryNOrders = Math.max(
+    2,
+    Math.floor(config?.shipmentDeliveredEveryNOrders ?? defaultP3Bench004Config.shipmentDeliveredEveryNOrders),
+  );
+  const refundEveryNOrders = Math.max(3, Math.floor(config?.refundEveryNOrders ?? defaultP3Bench004Config.refundEveryNOrders));
+  const warmupRounds = Math.max(1, Math.floor(config?.warmupRounds ?? defaultP3Bench004Config.warmupRounds));
+  const measuredRounds = Math.max(6, Math.floor(config?.measuredRounds ?? defaultP3Bench004Config.measuredRounds));
+  const joinMemoryBudgetRows = Math.max(
+    4096,
+    Math.floor(config?.joinMemoryBudgetRows ?? defaultP3Bench004Config.joinMemoryBudgetRows),
+  );
+  const spillChunkCandidate = Math.floor(config?.joinSpillChunkRows ?? defaultP3Bench004Config.joinSpillChunkRows);
+  const joinSpillChunkRows = Math.max(1, Math.min(joinMemoryBudgetRows, spillChunkCandidate));
+
+  const c: P3Bench004LargeDatasetConfig = {
+    customers,
+    ordersPerCustomer,
+    shipmentDeliveredEveryNOrders,
+    refundEveryNOrders,
+    warmupRounds,
+    measuredRounds,
+    joinMemoryBudgetRows,
+    joinSpillChunkRows,
+  };
+
+  const db = new WalrusSqlClient({
+    packageId: "0x1",
+    network: "sui-testnet",
+    mode: "simulator",
+    readCache: { enabled: false },
+    joinExecution: {
+      memoryBudgetRows: c.joinMemoryBudgetRows,
+      spillChunkRows: c.joinSpillChunkRows,
+    },
+  });
+
+  await db.execute(
+    `CREATE TABLE ${BENCH4_TABLES.customers} (customer_id INT, customer_tier INT, customer_region TEXT)`,
+  );
+  await db.execute(
+    `CREATE TABLE ${BENCH4_TABLES.orders} (order_id INT, customer_id INT, order_amount INT, order_status TEXT)`,
+  );
+  await db.execute(
+    `CREATE TABLE ${BENCH4_TABLES.shipments} (shipment_id INT, order_id INT, delivered_flag INT)`,
+  );
+  await db.execute(
+    `CREATE TABLE ${BENCH4_TABLES.refunds} (refund_id INT, order_id INT, refund_amount INT)`,
+  );
+
+  const totalOrders = c.customers * c.ordersPerCustomer;
+  const customerRows = new Array<Record<string, number | string | null>>(c.customers);
+  const orderRows = new Array<Record<string, number | string | null>>(totalOrders);
+  const shipmentRows = new Array<Record<string, number | string | null>>(totalOrders);
+  const refundRows: Array<Record<string, number | string | null>> = [];
+
+  const regions = ["APAC", "EU", "LATAM", "MEA", "NA"] as const;
+  const nonPaidStatuses = ["draft", "pending", "cancelled"] as const;
+
+  let paidOrders = 0;
+  let shippedOrders = 0;
+  let orderId = 1;
+  let refundId = 1;
+  for (let customerId = 1; customerId <= c.customers; customerId += 1) {
+    customerRows[customerId - 1] = {
+      customer_id: customerId,
+      customer_tier: (customerId % 6) + 1,
+      customer_region: regions[customerId % regions.length] ?? "NA",
+    };
+
+    for (let i = 0; i < c.ordersPerCustomer; i += 1) {
+      const amount = 35 + ((customerId * 19 + i * 23 + orderId * 7) % 960);
+      const status =
+        orderId % 6 === 0
+          ? "paid"
+          : orderId % 5 === 0
+            ? "shipped"
+            : orderId % 11 === 0
+              ? "refunded"
+              : (nonPaidStatuses[(orderId + customerId + i) % nonPaidStatuses.length] ?? "draft");
+
+      if (status === "paid") paidOrders += 1;
+      if (status === "shipped") shippedOrders += 1;
+
+      orderRows[orderId - 1] = {
+        order_id: orderId,
+        customer_id: customerId,
+        order_amount: amount,
+        order_status: status,
+      };
+      shipmentRows[orderId - 1] = {
+        shipment_id: orderId,
+        order_id: orderId,
+        delivered_flag: orderId % c.shipmentDeliveredEveryNOrders === 0 ? 1 : 0,
+      };
+
+      if (orderId % c.refundEveryNOrders === 0) {
+        refundRows.push({
+          refund_id: refundId,
+          order_id: orderId,
+          refund_amount: Math.max(1, Math.floor(amount / 7)),
+        });
+        refundId += 1;
+      }
+
+      orderId += 1;
+    }
+  }
+
+  (db as unknown as InternalTableStore).tables.set(BENCH4_TABLES.customers, customerRows);
+  (db as unknown as InternalTableStore).tables.set(BENCH4_TABLES.orders, orderRows);
+  (db as unknown as InternalTableStore).tables.set(BENCH4_TABLES.shipments, shipmentRows);
+  (db as unknown as InternalTableStore).tables.set(BENCH4_TABLES.refunds, refundRows);
+
+  await db.execute(`CREATE INDEX idx_p3_bench4_customers_tier ON ${BENCH4_TABLES.customers}(customer_tier)`);
+  await db.execute(`CREATE INDEX idx_p3_bench4_orders_customer_id ON ${BENCH4_TABLES.orders}(customer_id)`);
+  await db.execute(`CREATE INDEX idx_p3_bench4_orders_status ON ${BENCH4_TABLES.orders}(order_status)`);
+  await db.execute(`CREATE INDEX idx_p3_bench4_shipments_order_id ON ${BENCH4_TABLES.shipments}(order_id)`);
+  await db.execute(`CREATE INDEX idx_p3_bench4_refunds_order_id ON ${BENCH4_TABLES.refunds}(order_id)`);
+
+  const joinSql =
+    "SELECT customer_region, SUM(order_amount) " +
+    `FROM ${BENCH4_TABLES.customers} ` +
+    `INNER JOIN ${BENCH4_TABLES.orders} ON ${BENCH4_TABLES.customers}.customer_id = ${BENCH4_TABLES.orders}.customer_id ` +
+    `INNER JOIN ${BENCH4_TABLES.shipments} ON ${BENCH4_TABLES.orders}.order_id = ${BENCH4_TABLES.shipments}.order_id ` +
+    `LEFT JOIN ${BENCH4_TABLES.refunds} ON ${BENCH4_TABLES.orders}.order_id = ${BENCH4_TABLES.refunds}.order_id ` +
+    "WHERE customer_tier <= 4 AND order_status IN ('paid','shipped') AND delivered_flag = 1 " +
+    "GROUP BY customer_region ORDER BY sum DESC, customer_region ASC LIMIT 8";
+
+  const inSubquery = `SELECT customer_id FROM ${BENCH4_TABLES.orders} WHERE order_status = 'paid'`;
+  const existsSubquery =
+    `SELECT 1 FROM ${BENCH4_TABLES.customers} ` +
+    `WHERE ${BENCH4_TABLES.customers}.customer_region = outer.customer_region AND customer_tier >= 4`;
+  const scalarSubquery =
+    `SELECT MAX(customer_id) FROM ${BENCH4_TABLES.customers} ` +
+    `WHERE ${BENCH4_TABLES.customers}.customer_region = outer.customer_region`;
+  const subquerySql =
+    "SELECT customer_id " +
+    `FROM ${BENCH4_TABLES.customers} ` +
+    "WHERE customer_tier <= 4 AND customer_id <= 80 " +
+    `AND customer_id IN (${inSubquery}) ` +
+    `AND EXISTS (${existsSubquery}) ` +
+    `AND customer_id < (${scalarSubquery}) ` +
+    "ORDER BY customer_id ASC LIMIT 150";
+
+  const joinStress = await runBench004Scenario(
+    db,
+    joinSql,
+    c.warmupRounds,
+    c.measuredRounds,
+    "P3-BENCH-004 join",
+  );
+  const subqueryStress = await runBench004Scenario(
+    db,
+    subquerySql,
+    c.warmupRounds,
+    c.measuredRounds,
+    "P3-BENCH-004 subquery",
+    [inSubquery, existsSubquery, scalarSubquery],
+  );
+
+  if (joinStress.execution.resultRows <= 0) {
+    throw new Error("P3-BENCH-004 join workload returned no rows");
+  }
+  if (subqueryStress.execution.resultRows <= 0) {
+    throw new Error("P3-BENCH-004 subquery workload returned no rows");
+  }
+
+  const largeDataset = orderRows.length >= 20_000;
+  const complexJoinObserved =
+    joinStress.explain.physicalJoinCount >= 2 && joinStress.explain.physicalJoinAlgorithms.length > 0;
+  const complexSubqueryObserved =
+    (subqueryStress.subquery?.executions ?? 0) >= c.measuredRounds
+    && (subqueryStress.subquery?.correlatedExecutions ?? 0) > 0;
+  const stableResultRows = joinStress.execution.resultRows > 0 && subqueryStress.execution.resultRows > 0;
+
+  const reasons: string[] = [];
+  if (largeDataset) reasons.push(`large dataset rows=${orderRows.length}`);
+  if (complexJoinObserved) reasons.push(`join plan=${joinStress.explain.physicalJoinAlgorithms}`);
+  if (complexSubqueryObserved) {
+    reasons.push(
+      `subquery executions=${subqueryStress.subquery?.executions ?? 0}, correlated=${subqueryStress.subquery?.correlatedExecutions ?? 0}`,
+    );
+  }
+  if (joinStress.execution.rowsVisited > 0 && subqueryStress.execution.rowsVisited > 0) {
+    reasons.push("both workloads captured non-zero rowsVisited");
+  }
+
+  return {
+    benchmark: "p3-bench-004-large-dataset-complex-join-subquery-stress",
+    at: new Date().toISOString(),
+    config: c,
+    dataset: {
+      customers: customerRows.length,
+      orders: orderRows.length,
+      shipments: shipmentRows.length,
+      refunds: refundRows.length,
+      paidOrders,
+      shippedOrders,
+    },
+    query: {
+      joinSql,
+      subquerySql,
+      warmupRounds: c.warmupRounds,
+      measuredRounds: c.measuredRounds,
+      subqueryFragments: {
+        inSubquery,
+        existsSubquery,
+        scalarSubquery,
+      },
+    },
+    joinStress,
+    subqueryStress,
+    verdict: {
+      largeDataset,
+      complexJoinObserved,
+      complexSubqueryObserved,
+      stableResultRows,
       reasons,
     },
   };
