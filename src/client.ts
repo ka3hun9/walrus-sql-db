@@ -223,7 +223,8 @@ type LogicalRewriteRule =
   | "RULE_CANONICALIZE_JOIN_CHAIN"
   | "RULE_PREFER_AST_PREDICATE"
   | "RULE_NORMALIZE_ORDER_BY_DIRECTION"
-  | "RULE_COST_BASED_JOIN_REORDER";
+  | "RULE_COST_BASED_JOIN_REORDER"
+  | "RULE_UNNEST_UNCORRELATED_SUBQUERY";
 
 type SelectJoinStep = NonNullable<ParsedSelect["joins"]>[number];
 
@@ -530,12 +531,17 @@ type SubqueryExecutionStats = {
   budgetExceededCount: number;
 };
 
+type SubqueryUnnestCacheEntry =
+  | { kind: "VALUES"; values: SqlPrimitive[] }
+  | { kind: "EXISTS"; exists: boolean };
+
 type SubqueryRuntimeState = {
   depth: number;
   costUnits: number;
   costBudget: number;
   planCache: Map<string, ParsedSubqueryPlan>;
   resultCache: Map<string, SqlRow[]>;
+  unnestCache: Map<string, SubqueryUnnestCacheEntry>;
 };
 
 type OptimizerHistogramBucket = {
@@ -2911,6 +2917,7 @@ export class WalrusSqlClient {
         costBudget: CORRELATED_SUBQUERY_COST_BUDGET,
         planCache: new Map<string, ParsedSubqueryPlan>(),
         resultCache: new Map<string, SqlRow[]>(),
+        unnestCache: new Map<string, SubqueryUnnestCacheEntry>(),
       };
     }
     this.subqueryRuntime.depth += 1;
@@ -3871,6 +3878,9 @@ export class WalrusSqlClient {
       : "NONE";
     if (predicateSource === "AST" && (parsed.whereTree || parsed.whereClauses.length > 0)) {
       rewriteRules.push("RULE_PREFER_AST_PREDICATE");
+    }
+    if (this.hasUnnestableUncorrelatedSubquery(parsed.whereClauses)) {
+      rewriteRules.push("RULE_UNNEST_UNCORRELATED_SUBQUERY");
     }
 
     return {
@@ -9805,6 +9815,65 @@ export class WalrusSqlClient {
     return rows.map((r) => r[key] ?? null);
   }
 
+  private tryGetUncorrelatedSubqueryPlan(subquerySql: string): ParsedSubqueryPlan | null {
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    if (!normalized) return null;
+    try {
+      const plan = this.getParsedSubqueryPlan(normalized);
+      if (plan.outerRefs.length > 0) return null;
+      return plan;
+    } catch {
+      return null;
+    }
+  }
+
+  private tryUnnestUncorrelatedSubqueryValues(subquerySql: string): SqlPrimitive[] | null {
+    if (!this.subqueryRuntime) return null;
+    const plan = this.tryGetUncorrelatedSubqueryPlan(subquerySql);
+    if (!plan) return null;
+
+    const cacheKey = `${plan.normalizedSql}::UNNEST_VALUES`;
+    const cached = this.subqueryRuntime.unnestCache.get(cacheKey);
+    if (cached?.kind === "VALUES") return [...cached.values];
+
+    const values = this.parseSubqueryValues(plan.normalizedSql, undefined, undefined);
+    this.subqueryRuntime.unnestCache.set(cacheKey, { kind: "VALUES", values: [...values] });
+    return values;
+  }
+
+  private tryUnnestUncorrelatedSubqueryExists(subquerySql: string): boolean | null {
+    if (!this.subqueryRuntime) return null;
+    const plan = this.tryGetUncorrelatedSubqueryPlan(subquerySql);
+    if (!plan) return null;
+
+    const cacheKey = `${plan.normalizedSql}::UNNEST_EXISTS`;
+    const cached = this.subqueryRuntime.unnestCache.get(cacheKey);
+    if (cached?.kind === "EXISTS") return cached.exists;
+
+    const exists = this.parseSubqueryExistsValue(plan.normalizedSql, undefined);
+    this.subqueryRuntime.unnestCache.set(cacheKey, { kind: "EXISTS", exists });
+    return exists;
+  }
+
+  private hasUnnestableUncorrelatedSubquery(whereClauses: WhereClause[]): boolean {
+    for (const clause of whereClauses) {
+      const subquerySql = clause.subquerySql ?? (typeof clause.value === "string" ? clause.value : undefined);
+      if (!subquerySql) continue;
+      if (
+        clause.op !== "IN_SUBQUERY"
+        && clause.op !== "NOT_IN_SUBQUERY"
+        && clause.op !== "EXISTS"
+        && clause.op !== "NOT_EXISTS"
+        && clause.op !== "ANY"
+        && clause.op !== "ALL"
+      ) {
+        continue;
+      }
+      if (this.tryGetUncorrelatedSubqueryPlan(subquerySql)) return true;
+    }
+    return false;
+  }
+
   private parseScalarSubqueryValue(subquerySql: string, outerRow?: SqlRow): SqlPrimitive {
     const rows = this.parseSubquerySelect(subquerySql, outerRow);
     if (!rows.length) return null;
@@ -10301,7 +10370,8 @@ export class WalrusSqlClient {
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
-      const exists = this.parseSubqueryExistsValue(subquerySql, row);
+      const unnestExists = this.tryUnnestUncorrelatedSubqueryExists(subquerySql);
+      const exists = unnestExists ?? this.parseSubqueryExistsValue(subquerySql, row);
       const tv: TruthValue = exists ? "TRUE" : "FALSE";
       return clause.op === "EXISTS" ? tv : this.tvNot(tv);
     }
@@ -10310,7 +10380,7 @@ export class WalrusSqlClient {
 
     if (clause.op === "ANY" || clause.op === "ALL") {
       const subquerySql = String(clause.value ?? "");
-      const values = this.parseSubqueryValues(subquerySql, undefined, row);
+      const values = this.tryUnnestUncorrelatedSubqueryValues(subquerySql) ?? this.parseSubqueryValues(subquerySql, undefined, row);
       const cmp = clause.compareOp ?? "=";
 
       if (!values.length) {
@@ -10337,7 +10407,8 @@ export class WalrusSqlClient {
     }
 
     if (clause.op === "IN_SUBQUERY" || clause.op === "NOT_IN_SUBQUERY") {
-      const values = this.parseSubqueryValues(clause.subquerySql ?? "", undefined, row);
+      const values = this.tryUnnestUncorrelatedSubqueryValues(clause.subquerySql ?? "")
+        ?? this.parseSubqueryValues(clause.subquerySql ?? "", undefined, row);
       let hasUnknown = false;
       for (const v of values) {
         const t = this.compareByOp(left, v, "=");

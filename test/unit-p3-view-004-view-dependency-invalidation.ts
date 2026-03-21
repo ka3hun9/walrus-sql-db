@@ -11,9 +11,14 @@ import { WalrusSqlClient } from "../src/client.js";
 
   {
     const base = db.getViewCatalog("v_users_base")[0];
+    const chained = db.getViewCatalog("v_users_chain")[0];
     assert.equal(base?.status, "ACTIVE");
     assert.deepEqual(base?.dependencies, [
       { source: "VIEW_DEP_USERS", columns: ["EMAIL", "ID"] },
+    ]);
+    assert.equal(chained?.status, "ACTIVE");
+    assert.deepEqual(chained?.dependencies, [
+      { source: "V_USERS_BASE", columns: ["EMAIL", "ID"] },
     ]);
   }
 
