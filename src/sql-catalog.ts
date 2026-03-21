@@ -35,6 +35,33 @@ export type TableSchema = {
   foreignKeys?: ForeignKeySpec[];
 };
 
+export type IndexCatalogType = "HASH" | "BTREE";
+export type IndexCatalogStatus = "ACTIVE" | "BUILDING" | "DROPPED";
+export type ViewCatalogStatus = "ACTIVE" | "INVALID";
+
+export type IndexCatalogEntry = {
+  name: string;
+  table: string;
+  columns: string[];
+  type: IndexCatalogType;
+  unique: boolean;
+  status: IndexCatalogStatus;
+};
+
+export type ViewCatalogEntry = {
+  name: string;
+  querySql: string;
+  status: ViewCatalogStatus;
+  dependencies: ViewDependencyEntry[];
+  invalidReason?: string;
+  invalidatedAt?: number;
+};
+
+export type ViewDependencyEntry = {
+  source: string;
+  columns: string[];
+};
+
 export type ConstraintIndexCostStats = {
   insertOps: number;
   updateOps: number;

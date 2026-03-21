@@ -3,65 +3,56 @@ import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { WalrusSqlClient } from "./client.js";
 
-export interface TpccLikeBenchmarkConfig {
+export interface P2TpccMiniConfig {
   warehouses: number;
-  customersPerWarehouse: number;
-  transactions: number;
-  conflictEvery: number;
-  amountStep: number;
+  districtsPerWarehouse: number;
+  customersPerDistrict: number;
+  ordersPerDistrict: number;
+  linesPerOrder: number;
 }
 
-export interface TpccLikeBenchmarkReport {
-  generatedAt: string;
-  nodeVersion: string;
-  config: TpccLikeBenchmarkConfig;
-  attemptedTransactions: number;
-  committedTransactions: number;
-  abortedTransactions: number;
-  abortRatio: number;
-  conflictsDetected: number;
-  throughputTps: number;
-  latencyMs: {
-    avg: number;
-    p95: number;
-    max: number;
-  };
-  consistencyErrors: string[];
+export interface P2ConflictBenchConfig {
+  rounds: number;
 }
 
-export interface TpccLikeSoakConfig {
+export interface P2LongRunConfig {
   durationMs: number;
-  runConfig?: Partial<TpccLikeBenchmarkConfig>;
+  writeEveryMs: number;
 }
 
-export interface TpccLikeSoakReport {
-  generatedAt: string;
-  nodeVersion: string;
+export interface P2BenchSample {
+  name: string;
+  operations: number;
   durationMs: number;
-  runs: number;
-  totalAttempted: number;
-  totalCommitted: number;
-  totalAborted: number;
-  totalConflicts: number;
-  consistencyErrors: string[];
+  opsPerSec: number;
+  avgLatencyMs?: number;
+  conflicts?: number;
 }
 
-const DEFAULT_CONFIG: TpccLikeBenchmarkConfig = {
+export interface P2BenchReport {
+  generatedAt: string;
+  samples: P2BenchSample[];
+  notes?: string[];
+}
+
+const defaultTpccMiniConfig: P2TpccMiniConfig = {
   warehouses: 1,
-  customersPerWarehouse: 200,
-  transactions: 400,
-  conflictEvery: 5,
-  amountStep: 5,
+  districtsPerWarehouse: 2,
+  customersPerDistrict: 20,
+  ordersPerDistrict: 30,
+  linesPerOrder: 3,
 };
 
-function percentile(sorted: number[], p: number): number {
-  if (sorted.length === 0) return 0;
-  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
-  return Number(sorted[idx]!.toFixed(3));
+const defaultConflictConfig: P2ConflictBenchConfig = { rounds: 40 };
+const defaultLongRunConfig: P2LongRunConfig = { durationMs: 8_000, writeEveryMs: 30 };
+
+function mkClient(): WalrusSqlClient {
+  return new WalrusSqlClient({ packageId: "0x1", network: "sui-testnet", mode: "simulator", isolationLevel: "read_committed" });
 }
 
-function round(value: number): number {
-  return Number(value.toFixed(3));
+function toOpsPerSec(operations: number, durationMs: number): number {
+  if (durationMs <= 0) return 0;
+  return Number(((operations * 1000) / durationMs).toFixed(2));
 }
 
 function shareCommittedStore(source: WalrusSqlClient, target: WalrusSqlClient): void {
@@ -73,214 +64,211 @@ function shareCommittedStore(source: WalrusSqlClient, target: WalrusSqlClient): 
   dst.uniqueGroupsCache = src.uniqueGroupsCache;
   dst.constraintCost = src.constraintCost;
   dst.rowVersions = src.rowVersions;
-  dst.tableVersionObjects = src.tableVersionObjects;
 }
 
-function mergeConfig(config?: Partial<TpccLikeBenchmarkConfig>): TpccLikeBenchmarkConfig {
-  return {
-    warehouses: Math.max(1, Math.floor(config?.warehouses ?? DEFAULT_CONFIG.warehouses)),
-    customersPerWarehouse: Math.max(1, Math.floor(config?.customersPerWarehouse ?? DEFAULT_CONFIG.customersPerWarehouse)),
-    transactions: Math.max(1, Math.floor(config?.transactions ?? DEFAULT_CONFIG.transactions)),
-    conflictEvery: Math.max(0, Math.floor(config?.conflictEvery ?? DEFAULT_CONFIG.conflictEvery)),
-    amountStep: Math.max(1, Math.floor(config?.amountStep ?? DEFAULT_CONFIG.amountStep)),
+export async function runP2TpccMiniBenchmark(config?: Partial<P2TpccMiniConfig>): Promise<P2BenchReport> {
+  const c: P2TpccMiniConfig = {
+    warehouses: Math.max(1, config?.warehouses ?? defaultTpccMiniConfig.warehouses),
+    districtsPerWarehouse: Math.max(1, config?.districtsPerWarehouse ?? defaultTpccMiniConfig.districtsPerWarehouse),
+    customersPerDistrict: Math.max(1, config?.customersPerDistrict ?? defaultTpccMiniConfig.customersPerDistrict),
+    ordersPerDistrict: Math.max(1, config?.ordersPerDistrict ?? defaultTpccMiniConfig.ordersPerDistrict),
+    linesPerOrder: Math.max(1, config?.linesPerOrder ?? defaultTpccMiniConfig.linesPerOrder),
   };
-}
 
-export async function runTpccLikeBenchmark(
-  config?: Partial<TpccLikeBenchmarkConfig>,
-): Promise<TpccLikeBenchmarkReport> {
-  const merged = mergeConfig(config);
-  const primary = new WalrusSqlClient({
-    packageId: "0x1",
-    network: "sui-testnet",
-    mode: "simulator",
-    isolationLevel: "read_committed",
-    readCache: { enabled: false },
-  });
-  const racer = new WalrusSqlClient({
-    packageId: "0x1",
-    network: "sui-testnet",
-    mode: "simulator",
-    isolationLevel: "read_committed",
-    readCache: { enabled: false },
-  });
-  shareCommittedStore(primary, racer);
+  const db = mkClient();
+  await db.execute("CREATE TABLE wh (w_id INT PRIMARY KEY, w_name TEXT)");
+  await db.execute("CREATE TABLE dist (d_id INT PRIMARY KEY, w_id INT, next_o_id INT)");
+  await db.execute("CREATE TABLE cust (c_id INT PRIMARY KEY, d_id INT, balance INT)");
+  await db.execute("CREATE TABLE ord (o_id INT PRIMARY KEY, d_id INT, c_id INT, total INT)");
+  await db.execute("CREATE TABLE ord_line (ol_id INT PRIMARY KEY, o_id INT, amount INT)");
 
-  await primary.execute("CREATE TABLE tpcc_wh (id INT PRIMARY KEY, ytd INT)");
-  await primary.execute("CREATE TABLE tpcc_cust (id INT PRIMARY KEY, wh_id INT, balance INT)");
-  await primary.execute("CREATE TABLE tpcc_ord (id INT PRIMARY KEY, cust_id INT, amount INT)");
-
-  for (let wid = 1; wid <= merged.warehouses; wid++) {
-    await primary.execute(`INSERT INTO tpcc_wh (id, ytd) VALUES (${wid}, 0)`);
-    for (let c = 1; c <= merged.customersPerWarehouse; c++) {
-      const custId = ((wid - 1) * merged.customersPerWarehouse) + c;
-      await primary.execute(`INSERT INTO tpcc_cust (id, wh_id, balance) VALUES (${custId}, ${wid}, 0)`);
+  let districtId = 1;
+  let customerId = 1;
+  for (let w = 1; w <= c.warehouses; w++) {
+    await db.execute(`INSERT INTO wh (w_id, w_name) VALUES (${w}, 'W${w}')`);
+    for (let d = 1; d <= c.districtsPerWarehouse; d++) {
+      await db.execute(`INSERT INTO dist (d_id, w_id, next_o_id) VALUES (${districtId}, ${w}, 1)`);
+      for (let i = 0; i < c.customersPerDistrict; i++) {
+        await db.execute(`INSERT INTO cust (c_id, d_id, balance) VALUES (${customerId}, ${districtId}, 0)`);
+        customerId += 1;
+      }
+      districtId += 1;
     }
   }
 
+  let orderId = 1;
+  let lineId = 1;
   const latencies: number[] = [];
-  let attempted = 0;
-  let committed = 0;
-  let aborted = 0;
-  let conflicts = 0;
-  let nextOrderId = 1;
-  const overallStart = performance.now();
+  const txOps = c.warehouses * c.districtsPerWarehouse * c.ordersPerDistrict;
+  const t0 = performance.now();
 
-  const runNormalTx = async (txNo: number): Promise<void> => {
-    const start = performance.now();
-    const whId = ((txNo - 1) % merged.warehouses) + 1;
-    const localCustomer = ((txNo - 1) % merged.customersPerWarehouse) + 1;
-    const custId = ((whId - 1) * merged.customersPerWarehouse) + localCustomer;
-    const amount = ((txNo % 7) + 1) * merged.amountStep;
-    const balRow = await primary.query(`SELECT balance FROM tpcc_cust WHERE id = ${custId}`);
-    const whRow = await primary.query(`SELECT ytd FROM tpcc_wh WHERE id = ${whId}`);
-    const nextBalance = Number(balRow.rows[0]?.balance ?? 0) + amount;
-    const nextYtd = Number(whRow.rows[0]?.ytd ?? 0) + amount;
-
-    attempted += 1;
-    await primary.execute("BEGIN");
-    try {
-      await primary.execute(`UPDATE tpcc_cust SET balance = ${nextBalance} WHERE id = ${custId}`);
-      await primary.execute(`UPDATE tpcc_wh SET ytd = ${nextYtd} WHERE id = ${whId}`);
-      await primary.execute(`INSERT INTO tpcc_ord (id, cust_id, amount) VALUES (${nextOrderId}, ${custId}, ${amount})`);
-      nextOrderId += 1;
-      await primary.execute("COMMIT");
-      committed += 1;
-    } catch {
-      aborted += 1;
-      try {
-        await primary.execute("ROLLBACK");
-      } catch {
-        // no-op
+  for (let d = 1; d <= c.warehouses * c.districtsPerWarehouse; d++) {
+    for (let i = 0; i < c.ordersPerDistrict; i++) {
+      const cId = ((d - 1) * c.customersPerDistrict) + ((i % c.customersPerDistrict) + 1);
+      const txStart = performance.now();
+      await db.execute("BEGIN");
+      const nextOrderIdRow = await db.query(`SELECT next_o_id FROM dist WHERE d_id = ${d}`);
+      const nextOrderId = Number(nextOrderIdRow.rows[0]?.next_o_id ?? 1);
+      await db.execute(`UPDATE dist SET next_o_id = ${nextOrderId + 1} WHERE d_id = ${d}`);
+      let total = 0;
+      for (let l = 1; l <= c.linesPerOrder; l++) {
+        const amount = ((i + l) % 17) + 1;
+        total += amount;
+        await db.execute(`INSERT INTO ord_line (ol_id, o_id, amount) VALUES (${lineId}, ${orderId}, ${amount})`);
+        lineId += 1;
       }
+      await db.execute(`INSERT INTO ord (o_id, d_id, c_id, total) VALUES (${orderId}, ${d}, ${cId}, ${total})`);
+      const balanceRow = await db.query(`SELECT balance FROM cust WHERE c_id = ${cId}`);
+      const balance = Number(balanceRow.rows[0]?.balance ?? 0);
+      await db.execute(`UPDATE cust SET balance = ${balance + total} WHERE c_id = ${cId}`);
+      await db.execute("COMMIT");
+      latencies.push(performance.now() - txStart);
+      orderId += 1;
     }
-    latencies.push(round(performance.now() - start));
+  }
+
+  const t1 = performance.now();
+  const countOrders = await db.query("SELECT COUNT(*) FROM ord");
+  const countLines = await db.query("SELECT COUNT(*) FROM ord_line");
+
+  const avgLatencyMs = Number((latencies.reduce((a, b) => a + b, 0) / Math.max(1, latencies.length)).toFixed(3));
+  const durationMs = Number((t1 - t0).toFixed(3));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    samples: [
+      {
+        name: "p2_tpcc_mini_new_order",
+        operations: txOps,
+        durationMs,
+        opsPerSec: toOpsPerSec(txOps, durationMs),
+        avgLatencyMs,
+      },
+    ],
+    notes: [
+      `orders=${countOrders.rows[0]?.count ?? 0}`,
+      `order_lines=${countLines.rows[0]?.count ?? 0}`,
+      `expected_order_lines=${txOps * c.linesPerOrder}`,
+    ],
   };
+}
 
-  const runConflictTx = async (txNo: number): Promise<void> => {
-    const start = performance.now();
-    const whId = ((txNo - 1) % merged.warehouses) + 1;
-    const targetCust = ((whId - 1) * merged.customersPerWarehouse) + 1;
-    const amount = ((txNo % 5) + 1) * merged.amountStep;
-    const balRow = await primary.query(`SELECT balance FROM tpcc_cust WHERE id = ${targetCust}`);
-    const whRow = await primary.query(`SELECT ytd FROM tpcc_wh WHERE id = ${whId}`);
-    const baseBalance = Number(balRow.rows[0]?.balance ?? 0);
-    const baseYtd = Number(whRow.rows[0]?.ytd ?? 0);
+export async function runP2ConflictBenchmark(config?: Partial<P2ConflictBenchConfig>): Promise<P2BenchReport> {
+  const c: P2ConflictBenchConfig = { rounds: Math.max(1, config?.rounds ?? defaultConflictConfig.rounds) };
+  const s1 = mkClient();
+  const s2 = mkClient();
+  shareCommittedStore(s1, s2);
 
-    attempted += 2;
-    await primary.execute("BEGIN");
-    await racer.execute("BEGIN");
+  await s1.execute("CREATE TABLE tx_conf (id INT PRIMARY KEY, v INT)");
+  await s1.execute("INSERT INTO tx_conf (id, v) VALUES (1, 0)");
 
+  let conflicts = 0;
+  const latencies: number[] = [];
+  const t0 = performance.now();
+
+  for (let i = 1; i <= c.rounds; i++) {
+    await s1.execute("BEGIN");
+    await s2.execute("BEGIN");
+    await s1.execute(`UPDATE tx_conf SET v = ${i} WHERE id = 1`);
+    await s2.execute(`UPDATE tx_conf SET v = ${i + 1000} WHERE id = 1`);
+
+    const c1 = performance.now();
+    await s1.execute("COMMIT");
+    latencies.push(performance.now() - c1);
+
+    const c2 = performance.now();
     try {
-      await primary.execute(`UPDATE tpcc_cust SET balance = ${baseBalance + amount} WHERE id = ${targetCust}`);
-      await primary.execute(`UPDATE tpcc_wh SET ytd = ${baseYtd + amount} WHERE id = ${whId}`);
-      await primary.execute(`INSERT INTO tpcc_ord (id, cust_id, amount) VALUES (${nextOrderId}, ${targetCust}, ${amount})`);
-      nextOrderId += 1;
-
-      await racer.execute(`UPDATE tpcc_cust SET balance = ${baseBalance + amount + 1} WHERE id = ${targetCust}`);
-      await primary.execute("COMMIT");
-      committed += 1;
-      await racer.execute("COMMIT");
-      committed += 1;
+      await s2.execute("COMMIT");
     } catch {
       conflicts += 1;
-      aborted += 1;
       try {
-        await racer.execute("ROLLBACK");
+        await s2.execute("ROLLBACK");
       } catch {
-        // no-op
+        // noop
       }
-    } finally {
-      latencies.push(round(performance.now() - start));
     }
-  };
-
-  for (let i = 1; i <= merged.transactions; i++) {
-    const shouldConflict = merged.conflictEvery > 0 && (i % merged.conflictEvery) === 0;
-    if (shouldConflict) await runConflictTx(i);
-    else await runNormalTx(i);
+    latencies.push(performance.now() - c2);
   }
 
-  const totalDurationMs = Math.max(1, performance.now() - overallStart);
-  const throughputTps = round((committed * 1_000) / totalDurationMs);
-  const sortedLatencies = [...latencies].sort((a, b) => a - b);
-
-  const consistencyErrors: string[] = [];
-  const whRows = await primary.query("SELECT ytd FROM tpcc_wh");
-  const custRows = await primary.query("SELECT balance FROM tpcc_cust");
-  const ordRows = await primary.query("SELECT amount FROM tpcc_ord");
-  const ytdTotal = whRows.rows.reduce((sum, row) => sum + Number((row.ytd ?? 0) as number), 0);
-  const custTotal = custRows.rows.reduce((sum, row) => sum + Number((row.balance ?? 0) as number), 0);
-  const orderTotal = ordRows.rows.reduce((sum, row) => sum + Number((row.amount ?? 0) as number), 0);
-  const orderCount = ordRows.rows.length;
-
-  if (ytdTotal !== custTotal) consistencyErrors.push(`warehouse ytd total mismatch: ytd=${ytdTotal}, cust=${custTotal}`);
-  if (ytdTotal !== orderTotal) consistencyErrors.push(`warehouse ytd vs order sum mismatch: ytd=${ytdTotal}, orders=${orderTotal}`);
-  if (orderCount !== committed) consistencyErrors.push(`order count mismatch: orders=${orderCount}, committed=${committed}`);
+  const t1 = performance.now();
+  const durationMs = Number((t1 - t0).toFixed(3));
+  const avgLatencyMs = Number((latencies.reduce((a, b) => a + b, 0) / Math.max(1, latencies.length)).toFixed(3));
 
   return {
     generatedAt: new Date().toISOString(),
-    nodeVersion: process.version,
-    config: merged,
-    attemptedTransactions: attempted,
-    committedTransactions: committed,
-    abortedTransactions: aborted,
-    abortRatio: attempted > 0 ? round(aborted / attempted) : 0,
-    conflictsDetected: conflicts,
-    throughputTps,
-    latencyMs: {
-      avg: latencies.length > 0 ? round(latencies.reduce((sum, ms) => sum + ms, 0) / latencies.length) : 0,
-      p95: percentile(sortedLatencies, 95),
-      max: sortedLatencies.length > 0 ? sortedLatencies[sortedLatencies.length - 1]! : 0,
-    },
-    consistencyErrors,
+    samples: [
+      {
+        name: "p2_tx_conflict_commit",
+        operations: c.rounds * 2,
+        durationMs,
+        opsPerSec: toOpsPerSec(c.rounds * 2, durationMs),
+        avgLatencyMs,
+        conflicts,
+      },
+    ],
+    notes: [`rounds=${c.rounds}`, `conflicts=${conflicts}`],
   };
 }
 
-export async function writeTpccLikeBenchmarkReport(
-  outputPath: string,
-  report: TpccLikeBenchmarkReport,
-): Promise<void> {
-  await fs.mkdir(dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-}
+export async function runP2LongRunStability(config?: Partial<P2LongRunConfig>): Promise<P2BenchReport> {
+  const c: P2LongRunConfig = {
+    durationMs: Math.max(2000, config?.durationMs ?? defaultLongRunConfig.durationMs),
+    writeEveryMs: Math.max(5, config?.writeEveryMs ?? defaultLongRunConfig.writeEveryMs),
+  };
 
-export async function runTpccLikeSoakBenchmark(config?: Partial<TpccLikeSoakConfig>): Promise<TpccLikeSoakReport> {
-  const durationMs = Math.max(1, Math.floor(config?.durationMs ?? 60_000));
-  const startedAt = Date.now();
-  let runs = 0;
-  let totalAttempted = 0;
-  let totalCommitted = 0;
-  let totalAborted = 0;
-  let totalConflicts = 0;
-  const consistencyErrors: string[] = [];
+  const db = mkClient();
+  await db.execute("CREATE TABLE long_run (id INT PRIMARY KEY, v INT)");
 
-  while ((Date.now() - startedAt) < durationMs) {
-    const report = await runTpccLikeBenchmark(config?.runConfig);
-    runs += 1;
-    totalAttempted += report.attemptedTransactions;
-    totalCommitted += report.committedTransactions;
-    totalAborted += report.abortedTransactions;
-    totalConflicts += report.conflictsDetected;
-    if (report.consistencyErrors.length > 0) {
-      consistencyErrors.push(`run#${runs}: ${report.consistencyErrors.join("; ")}`);
+  const start = performance.now();
+  let nextId = 1;
+  let writes = 0;
+  let consistencyChecks = 0;
+  let errors = 0;
+
+  while (performance.now() - start < c.durationMs) {
+    try {
+      await db.execute("BEGIN");
+      await db.execute(`INSERT INTO long_run (id, v) VALUES (${nextId}, ${nextId * 10})`);
+      await db.execute("COMMIT");
+      writes += 1;
+      nextId += 1;
+
+      if (writes % 10 === 0) {
+        const out = await db.query("SELECT COUNT(*) FROM long_run");
+        const count = Number(out.rows[0]?.count ?? -1);
+        if (count !== writes) throw new Error(`count mismatch: expected=${writes} actual=${count}`);
+        consistencyChecks += 1;
+      }
+    } catch {
+      errors += 1;
+      try {
+        await db.execute("ROLLBACK");
+      } catch {
+        // noop
+      }
+    }
+
+    if (c.writeEveryMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, c.writeEveryMs));
     }
   }
 
+  const durationMs = Number((performance.now() - start).toFixed(3));
   return {
     generatedAt: new Date().toISOString(),
-    nodeVersion: process.version,
-    durationMs,
-    runs,
-    totalAttempted,
-    totalCommitted,
-    totalAborted,
-    totalConflicts,
-    consistencyErrors,
+    samples: [
+      {
+        name: "p2_long_run_stability",
+        operations: writes,
+        durationMs,
+        opsPerSec: toOpsPerSec(writes, durationMs),
+      },
+    ],
+    notes: [`consistency_checks=${consistencyChecks}`, `errors=${errors}`],
   };
 }
 
-export async function writeTpccLikeSoakReport(outputPath: string, report: TpccLikeSoakReport): Promise<void> {
-  await fs.mkdir(dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+export async function writeP2BenchReport(path: string, report: P2BenchReport): Promise<void> {
+  await fs.mkdir(dirname(path), { recursive: true });
+  await fs.writeFile(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }

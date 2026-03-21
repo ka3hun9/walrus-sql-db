@@ -1,4 +1,4 @@
-import { randomUUID, createHash } from "node:crypto";
+﻿import { randomUUID, createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
@@ -33,6 +33,7 @@ import type {
   TransactionLogRecord,
   TransactionLogWriteEntry,
   TransactionLogWriteOperation,
+  IndexVersionedStorageObject,
   VersionedStorageObject,
   WalrusSqlClientOptions,
 } from "./types.js";
@@ -40,7 +41,16 @@ import { buildMoveCall } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
-import type { ExprAst, SelectStatementAst, SqlTransactionAction } from "./sql-ast.js";
+import type {
+  CreateIndexStatementAst,
+  CreateViewStatementAst,
+  DropIndexStatementAst,
+  DropViewStatementAst,
+  ExprAst,
+  SqlAstStatement,
+  SelectStatementAst,
+  SqlTransactionAction,
+} from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
 import { ClientErrorCodeEnum, ConstraintViolationKindEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -50,8 +60,11 @@ import {
   type ColumnTypeSpec,
   type ConstraintIndexCostStats,
   type ForeignKeySpec,
+  type IndexCatalogEntry,
   type SqlTypeName,
   type TableSchema,
+  type ViewDependencyEntry,
+  type ViewCatalogEntry,
 } from "./sql-catalog.js";
 
 type CompareOp =
@@ -91,10 +104,63 @@ const BIGINT_MAX_BOUND = 9223372036854775807n;
 const MIN_SAFE_INTEGER_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MAX_FK_CASCADE_DEPTH = 16;
+const VIEW_DEPENDENCY_WILDCARD = "*";
+const VIEW_DEPENDENCY_KEYWORDS = new Set<string>([
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "GROUP",
+  "BY",
+  "HAVING",
+  "ORDER",
+  "LIMIT",
+  "OFFSET",
+  "FETCH",
+  "FIRST",
+  "NEXT",
+  "ROWS",
+  "ROW",
+  "ONLY",
+  "AS",
+  "AND",
+  "OR",
+  "NOT",
+  "ON",
+  "INNER",
+  "LEFT",
+  "RIGHT",
+  "FULL",
+  "OUTER",
+  "JOIN",
+  "UNION",
+  "INTERSECT",
+  "EXCEPT",
+  "ALL",
+  "DISTINCT",
+  "CASE",
+  "WHEN",
+  "THEN",
+  "ELSE",
+  "END",
+  "IN",
+  "IS",
+  "NULL",
+  "TRUE",
+  "FALSE",
+  "EXISTS",
+  "ANY",
+  "SOME",
+  "BETWEEN",
+  "LIKE",
+  "ESCAPE",
+  "CAST",
+  "TOP",
+]);
 
 type TruthValue = "TRUE" | "FALSE" | "UNKNOWN";
 
 type ComparePredicate = "=" | "!=" | "<>" | ">" | "<" | ">=" | "<=";
+type ViewPolicyAction = "CREATE" | "DROP" | "SELECT";
 
 type WhereClause = {
   logic?: LogicOp;
@@ -149,6 +215,133 @@ type ParsedSelect = {
     partitionBy: string[];
     orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
   };
+};
+
+type LogicalPredicateSource = "AST" | "TREE" | "CLAUSES" | "NONE";
+
+type LogicalRewriteRule =
+  | "RULE_CANONICALIZE_JOIN_CHAIN"
+  | "RULE_PREFER_AST_PREDICATE"
+  | "RULE_NORMALIZE_ORDER_BY_DIRECTION"
+  | "RULE_COST_BASED_JOIN_REORDER"
+  | "RULE_UNNEST_UNCORRELATED_SUBQUERY";
+
+type SelectJoinStep = NonNullable<ParsedSelect["joins"]>[number];
+
+type LogicalJoinReorderInfo = {
+  applied: boolean;
+  algorithm: "NONE" | "GREEDY_CBO";
+  estimatedCost: number | null;
+  originalJoinOrder: string[];
+  finalJoinOrder: string[];
+};
+
+type LogicalSelectPlan = {
+  table: string;
+  fields: string[] | ["*"];
+  joins: SelectJoinStep[];
+  joinReorder: LogicalJoinReorderInfo;
+  predicateSource: LogicalPredicateSource;
+  where?: string;
+  having?: string;
+  groupBy?: string[];
+  aggregate?: ParsedSelect["aggregate"];
+  aggregateField?: string;
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  limit?: number;
+  offset?: number;
+  rowNumberAlias?: string;
+  rowNumberSpec?: ParsedSelect["rowNumberSpec"];
+  rewriteRules: LogicalRewriteRule[];
+};
+
+type PhysicalAccessPathMethod =
+  | "TABLE_SCAN"
+  | "HASH_INDEX_LOOKUP"
+  | "BTREE_INDEX_LOOKUP"
+  | "BTREE_ORDERED_SCAN";
+
+type PhysicalIndexAccessStrategy = "FULL_TABLE_SCAN" | "INDEX_SCAN" | "INDEX_BACK_TABLE";
+
+type PlanStabilityReason = "NONE" | "PLAN_STABILITY_PIN" | "BAD_PLAN_FALLBACK_PIN";
+type JoinExecutionAlgorithm = "NESTED_LOOP" | "HASH_JOIN" | "SORT_MERGE_JOIN";
+
+type PhysicalSelectAccessPath = {
+  method: PhysicalAccessPathMethod;
+  indexStrategy: PhysicalIndexAccessStrategy;
+  estimatedCost: number;
+  estimatedRows: number;
+  orderSatisfied: boolean;
+  indexName?: string;
+  indexColumn?: string;
+};
+
+type PhysicalSelectRuntimePath = PhysicalSelectAccessPath & {
+  rows: SqlRow[];
+};
+
+type PhysicalJoinPlanStep = {
+  algorithm: JoinExecutionAlgorithm;
+  estimatedCost: number;
+  estimatedOutputRows: number;
+  leftRows: number;
+  rightRows: number;
+  estimatedMemoryRows: number;
+  memoryBudgetRows: number;
+  memoryBudgetConstrained: boolean;
+};
+
+type PhysicalSelectPlan = {
+  optimizerChosen: PhysicalSelectAccessPath;
+  chosen: PhysicalSelectAccessPath;
+  candidates: PhysicalSelectAccessPath[];
+  joinAlgorithms: PhysicalJoinPlanStep[];
+  stabilityReason: PlanStabilityReason;
+  stabilityPinned: boolean;
+};
+
+type SelectExecutionPlan = {
+  logical: LogicalSelectPlan;
+  physical: PhysicalSelectPlan;
+  scannedRows: SqlRow[];
+  orderSatisfied: boolean;
+};
+
+type SelectExecutionMode = "PIPELINED" | "MATERIALIZED";
+
+type SelectPipelineBlocker =
+  | "JOIN_CHAIN"
+  | "GROUP_BY"
+  | "AGGREGATE"
+  | "ROW_NUMBER"
+  | "ORDER_BY_SORT";
+
+type SelectExecutionPipelineStats = {
+  executions: number;
+  pipelinedExecutions: number;
+  materializedExecutions: number;
+  earlyStopExecutions: number;
+  rowsVisited: number;
+  rowsReturned: number;
+  maxBufferedRows: number;
+  joinSpillExecutions: number;
+  joinSpillChunks: number;
+  joinSpillRowsProcessed: number;
+  lastMode: SelectExecutionMode;
+  lastRowsVisited: number;
+  lastRowsReturned: number;
+  lastBufferedRows: number;
+  lastEarlyStop: boolean;
+  lastJoinSpillSteps: number;
+  lastJoinSpillChunks: number;
+  lastJoinSpillRowsProcessed: number;
+  lastBlockers: SelectPipelineBlocker[];
+};
+
+type JoinSpillRuntimeStats = {
+  steps: number;
+  chunks: number;
+  rowsProcessed: number;
 };
 
 type DmlPlan = {
@@ -209,11 +402,48 @@ type QueryCacheEntry = {
   writeVersion: number;
 };
 
+type BtreeIndexLeafEntry = {
+  key: SqlPrimitive;
+  rows: Set<SqlRow>;
+};
+
+type BtreeRuntimeIndex = {
+  column: string;
+  entries: BtreeIndexLeafEntry[];
+};
+
+type BtreeRuntimeIndexMap = Map<string, BtreeRuntimeIndex>;
+
+type BtreeRangeBound = {
+  value: SqlPrimitive;
+  inclusive: boolean;
+};
+
+type BtreePrefixPredicate = {
+  prefix: string;
+  exact: boolean;
+  caseInsensitive: boolean;
+};
+
+type BtreeRangePredicate = {
+  lower?: BtreeRangeBound;
+  upper?: BtreeRangeBound;
+  prefix?: BtreePrefixPredicate;
+};
+
 type TransactionTableCommitSnapshot = {
   hadTableRows: boolean;
   rows?: SqlRow[];
   hadUniqueIndexes: boolean;
   uniqueIndexes?: Map<string, Map<string, SqlRow>>;
+  hadHashIndexes: boolean;
+  hashIndexes?: Map<string, Map<string, Set<SqlRow>>>;
+  hadHashIndexStats: boolean;
+  hashIndexStats?: { keys: number; rowsIndexed: number };
+  hadBtreeIndexes: boolean;
+  btreeIndexes?: BtreeRuntimeIndexMap;
+  hadBtreeIndexStats: boolean;
+  btreeIndexStats?: { keys: number; rowsIndexed: number };
 };
 
 type TransactionCommitRuntimeSnapshot = {
@@ -222,6 +452,9 @@ type TransactionCommitRuntimeSnapshot = {
   storageWriteLog: StorageWriteEvent[];
   rowVersions: Map<string, Map<string, number>>;
   tableVersionObjects: Map<string, VersionedStorageObject[]>;
+  indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
+  optimizerStatsVersionObjects: Map<string, OptimizerStatsVersionedStorageObject[]>;
+  indexObservability: Map<string, IndexObservabilityStats>;
   writeVersion: number;
   queryCache: Map<string, QueryCacheEntry>;
 };
@@ -255,6 +488,127 @@ type TransactionObservabilityAccumulator = {
   lockWaitEvents: number;
 };
 
+type IndexObservabilityStats = {
+  lookupCount: number;
+  lookupHits: number;
+  lookupMisses: number;
+  maintenanceInsertOps: number;
+  maintenanceUpdateOps: number;
+  maintenanceDeleteOps: number;
+  maintenanceRebuildOps: number;
+  maintenanceRows: number;
+};
+
+type SelectPlanStabilityState = {
+  preferredMethod: PhysicalAccessPathMethod;
+  preferredIndexName?: string;
+  preferredIndexColumn?: string;
+  badPlanFallbackRemaining: number;
+  badPlanFallbackCount: number;
+  stablePinCount: number;
+  planSwitchCount: number;
+  executions: number;
+  lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+};
+
+type ParsedSubqueryPlan = {
+  normalizedSql: string;
+  fieldExpr: string;
+  table: string;
+  tableAlias?: string;
+  where?: string;
+  whereTree?: WhereExprNode;
+  outerRefs: string[];
+};
+
+type SubqueryExecutionStats = {
+  executions: number;
+  correlatedExecutions: number;
+  cacheHits: number;
+  cacheMisses: number;
+  rowsScanned: number;
+  rowsReturned: number;
+  budgetExceededCount: number;
+};
+
+type SubqueryUnnestCacheEntry =
+  | { kind: "VALUES"; values: SqlPrimitive[] }
+  | { kind: "EXISTS"; exists: boolean };
+
+type SubqueryRuntimeState = {
+  depth: number;
+  costUnits: number;
+  costBudget: number;
+  planCache: Map<string, ParsedSubqueryPlan>;
+  resultCache: Map<string, SqlRow[]>;
+  unnestCache: Map<string, SubqueryUnnestCacheEntry>;
+};
+
+type OptimizerHistogramBucket = {
+  lowerBound: SqlPrimitive;
+  upperBound: SqlPrimitive;
+  rowCount: number;
+  ndv: number;
+};
+
+type OptimizerColumnStatistics = {
+  column: string;
+  rowCount: number;
+  ndv: number;
+  nullCount: number;
+  nullRatio: number;
+  histogram: OptimizerHistogramBucket[];
+};
+
+type OptimizerTableStatistics = {
+  table: string;
+  rowCount: number;
+  analyzedAt: number;
+  columns: OptimizerColumnStatistics[];
+};
+
+type OptimizerStatsVersionedStorageObject = {
+  table: string;
+  objectId: string;
+  version: number;
+  prevVersion: number | null;
+  currentVersion: number;
+  commitDigest: string;
+  createdAt: number;
+  analyzedAt: number;
+  confirmationStatus: "pending" | "confirmed";
+  immutable: true;
+  statistics: OptimizerTableStatistics;
+};
+
+type OptimizerStatisticsReadOptions = {
+  source?: "live" | "versioned";
+  visibility?: "pending" | "confirmed";
+  version?: number;
+};
+
+type OptimizerStatisticsVersionDiffColumn = {
+  column: string;
+  rowCountDelta: number;
+  ndvDelta: number;
+  nullCountDelta: number;
+  nullRatioDelta: number;
+  histogramBucketDelta: number;
+  histogramRowCountDelta: number;
+  histogramNdvDelta: number;
+};
+
+type OptimizerStatisticsVersionDiff = {
+  table: string;
+  fromVersion: number;
+  toVersion: number;
+  rowCountDelta: number;
+  analyzedAtDeltaMs: number;
+  addedColumns: string[];
+  removedColumns: string[];
+  changedColumns: OptimizerStatisticsVersionDiffColumn[];
+};
+
 const SESSION_TRANSACTION_TRANSITIONS: Record<
   SessionTransactionState,
   Partial<Record<SessionTransactionEvent, SessionTransactionState>>
@@ -277,11 +631,38 @@ const SESSION_TRANSACTION_TRANSITIONS: Record<
   },
 };
 
+const SELECT_PLAN_STABILITY_SWITCH_RATIO = 0.85;
+const BAD_PLAN_FALLBACK_SCAN_RATIO = 0.85;
+const BAD_PLAN_FALLBACK_RESULT_RATIO = 0.8;
+const BAD_PLAN_FALLBACK_MIN_TABLE_ROWS = 32;
+const BAD_PLAN_FALLBACK_COOLDOWN = 3;
+const OPTIMIZER_HISTOGRAM_MAX_BUCKETS = 8;
+const INDEX_BACK_TABLE_FETCH_RATIO = 1.1;
+const DEFAULT_PREDICATE_SELECTIVITY = 0.25;
+const DEFAULT_EQUALITY_SELECTIVITY = 0.1;
+const DEFAULT_RANGE_SELECTIVITY = 1 / 3;
+const DEFAULT_LIKE_SELECTIVITY = 0.2;
+const DEFAULT_JOIN_SELECTIVITY = 0.1;
+const HASH_JOIN_STARTUP_COST = 8;
+const HASH_JOIN_BUILD_ROW_THRESHOLD = 64;
+const HASH_JOIN_SPILL_PENALTY_FACTOR = 4;
+const SORT_MERGE_SORT_WORK_FACTOR = 0.2;
+const SORT_MERGE_JOIN_STARTUP_COST = 12;
+const DEFAULT_JOIN_MEMORY_BUDGET_ROWS = 4096;
+const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
+const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
+
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly isolationLevel: "read_committed";
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
+  private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
+  private readonly viewCatalog = new Map<string, ViewCatalogEntry>();
+  private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
+  private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
+  private readonly btreeIndexes = new Map<string, BtreeRuntimeIndexMap>();
+  private readonly btreeIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly uniqueIndexes = new Map<string, Map<string, Map<string, SqlRow>>>();
   private readonly uniqueGroupsCache = new Map<string, string[][]>();
   private readonly constraintCost = new Map<string, ConstraintIndexCostStats>();
@@ -290,6 +671,12 @@ export class WalrusSqlClient {
   private readonly storageWriteLog: StorageWriteEvent[] = [];
   private readonly rowVersions = new Map<string, Map<string, number>>();
   private readonly tableVersionObjects = new Map<string, VersionedStorageObject[]>();
+  private readonly indexVersionObjects = new Map<string, IndexVersionedStorageObject[]>();
+  private readonly optimizerStatsVersionObjects = new Map<string, OptimizerStatsVersionedStorageObject[]>();
+  private readonly indexObservability = new Map<string, IndexObservabilityStats>();
+  private readonly selectPlanStability = new Map<string, SelectPlanStabilityState>();
+  private readonly selectExecutionPipelineStats = new Map<string, SelectExecutionPipelineStats>();
+  private readonly subqueryExecutionStats = new Map<string, SubqueryExecutionStats>();
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
@@ -305,6 +692,8 @@ export class WalrusSqlClient {
     lockWaitEvents: 0,
   };
   private writeVersion = 0;
+  private subqueryRuntime: SubqueryRuntimeState | null = null;
+  private readonly activeViewResolutionStack: string[] = [];
 
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
@@ -825,6 +1214,435 @@ export class WalrusSqlClient {
     return this.cloneVersionObject(confirmed);
   }
 
+  private cloneIndexVersionObjectPayload(
+    payload: IndexVersionedStorageObject["payload"],
+  ): IndexVersionedStorageObject["payload"] {
+    if (payload.indexType === "HASH") {
+      return {
+        indexType: "HASH",
+        buckets: payload.buckets.map((bucket) => ({
+          encodedKey: bucket.encodedKey,
+          rowKeys: [...bucket.rowKeys],
+        })),
+      };
+    }
+
+    return {
+      indexType: "BTREE",
+      entries: payload.entries.map((entry) => ({
+        key: entry.key,
+        rowKeys: [...entry.rowKeys],
+      })),
+    };
+  }
+
+  private toImmutableIndexVersionObjectPayload(
+    payload: IndexVersionedStorageObject["payload"],
+  ): IndexVersionedStorageObject["payload"] {
+    const cloned = this.cloneIndexVersionObjectPayload(payload);
+    if (cloned.indexType === "HASH") {
+      return Object.freeze({
+        indexType: "HASH" as const,
+        buckets: Object.freeze(cloned.buckets.map((bucket) => Object.freeze({
+          encodedKey: bucket.encodedKey,
+          rowKeys: Object.freeze([...bucket.rowKeys]),
+        }))),
+      });
+    }
+
+    return Object.freeze({
+      indexType: "BTREE" as const,
+      entries: Object.freeze(cloned.entries.map((entry) => Object.freeze({
+        key: entry.key,
+        rowKeys: Object.freeze([...entry.rowKeys]),
+      }))),
+    });
+  }
+
+  private cloneIndexVersionObject(object: IndexVersionedStorageObject): IndexVersionedStorageObject {
+    return {
+      ...object,
+      payload: this.cloneIndexVersionObjectPayload(object.payload),
+    };
+  }
+
+  private encodeIndexRowRefKey(table: string, row: SqlRow): string {
+    return this.encodeRowVersionKey(this.buildTransactionRowKey(table, row));
+  }
+
+  private getActiveIndexEntriesForTable(table: string): IndexCatalogEntry[] {
+    const upper = table.toUpperCase();
+    return [...this.indexCatalog.values()]
+      .filter((entry) =>
+        entry.table.toUpperCase() === upper
+          && entry.status === "ACTIVE"
+          && entry.columns.length === 1
+          && (entry.type === "HASH" || entry.type === "BTREE"))
+      .sort((a, b) => this.textOrder(a.name, b.name));
+  }
+
+  private recordImmutableIndexVersionObject(entry: IndexCatalogEntry): void {
+    const indexName = this.normalizeIndexName(entry.name);
+    const table = entry.table;
+    const column = entry.columns[0]!;
+    const history = this.indexVersionObjects.get(indexName) ?? [];
+    const prevVersion = history[history.length - 1]?.currentVersion ?? null;
+    const currentVersion = (prevVersion ?? 0) + 1;
+    const version = currentVersion;
+    const createdAt = Date.now();
+
+    let keyCount = 0;
+    let rowCount = 0;
+    let payload: IndexVersionedStorageObject["payload"];
+
+    if (entry.type === "HASH") {
+      const buckets = this.hashIndexes.get(table)?.get(indexName);
+      const serializedBuckets = [...(buckets?.entries() ?? [])]
+        .map(([encodedKey, rows]) => {
+          const rowKeys = [...new Set(
+            [...rows].map((row) => this.encodeIndexRowRefKey(table, row)),
+          )].sort();
+          return { encodedKey, rowKeys };
+        })
+        .sort((a, b) => this.textOrder(a.encodedKey, b.encodedKey));
+      keyCount = serializedBuckets.length;
+      rowCount = serializedBuckets.reduce((sum, bucket) => sum + bucket.rowKeys.length, 0);
+      payload = this.toImmutableIndexVersionObjectPayload({
+        indexType: "HASH",
+        buckets: serializedBuckets,
+      });
+    } else {
+      const runtime = this.btreeIndexes.get(table)?.get(indexName);
+      const serializedEntries = (runtime?.entries ?? [])
+        .map((leaf) => {
+          const rowKeys = [...new Set(
+            [...leaf.rows].map((row) => this.encodeIndexRowRefKey(table, row)),
+          )].sort();
+          return { key: leaf.key, rowKeys };
+        });
+      keyCount = serializedEntries.length;
+      rowCount = serializedEntries.reduce((sum, leaf) => sum + leaf.rowKeys.length, 0);
+      payload = this.toImmutableIndexVersionObjectPayload({
+        indexType: "BTREE",
+        entries: serializedEntries,
+      });
+    }
+
+    const digestPayload = this.cloneIndexVersionObjectPayload(payload);
+    const commitDigest = createHash("sha256")
+      .update(JSON.stringify({
+        table,
+        indexName,
+        indexType: entry.type,
+        column,
+        prevVersion,
+        currentVersion,
+        createdAt,
+        payload: digestPayload,
+      }))
+      .digest("hex");
+    const objectId = `0x${commitDigest.slice(0, 40)}`;
+
+    const object = Object.freeze({
+      table,
+      indexName,
+      column,
+      indexType: entry.type,
+      objectId,
+      version,
+      prevVersion,
+      currentVersion,
+      commitDigest,
+      createdAt,
+      confirmationStatus: this.opts.transactionCommitExecutor ? "pending" as const : "confirmed" as const,
+      immutable: true as const,
+      keyCount,
+      rowCount,
+      payload,
+    }) as IndexVersionedStorageObject;
+
+    history.push(object);
+    this.indexVersionObjects.set(indexName, history);
+  }
+
+  private recordImmutableIndexVersionObjectsForTable(table: string): void {
+    for (const entry of this.getActiveIndexEntriesForTable(table)) {
+      this.recordImmutableIndexVersionObject(entry);
+    }
+  }
+
+  getIndexVersionObjects(indexName?: string): IndexVersionedStorageObject[] | Record<string, IndexVersionedStorageObject[]> {
+    if (indexName) {
+      const normalized = this.normalizeIndexName(indexName);
+      return (this.indexVersionObjects.get(normalized) ?? []).map((object) => this.cloneIndexVersionObject(object));
+    }
+
+    const out: Record<string, IndexVersionedStorageObject[]> = {};
+    for (const [name, history] of this.indexVersionObjects.entries()) {
+      out[name] = history.map((object) => this.cloneIndexVersionObject(object));
+    }
+    return out;
+  }
+
+  confirmIndexVersionObject(indexName: string, version?: number): IndexVersionedStorageObject | null {
+    const normalized = this.normalizeIndexName(indexName);
+    const history = this.indexVersionObjects.get(normalized);
+    if (!history || history.length === 0) return null;
+    const targetVersion = version ?? history[history.length - 1]!.currentVersion;
+    const idx = history.findIndex((object) => object.currentVersion === targetVersion);
+    if (idx < 0) return null;
+
+    const current = history[idx]!;
+    if (current.confirmationStatus === "confirmed") return this.cloneIndexVersionObject(current);
+
+    const confirmed = Object.freeze({
+      ...current,
+      confirmationStatus: "confirmed" as const,
+    }) as IndexVersionedStorageObject;
+    history[idx] = confirmed;
+    return this.cloneIndexVersionObject(confirmed);
+  }
+
+  private cloneOptimizerHistogramBucket(bucket: OptimizerHistogramBucket): OptimizerHistogramBucket {
+    return {
+      lowerBound: bucket.lowerBound,
+      upperBound: bucket.upperBound,
+      rowCount: bucket.rowCount,
+      ndv: bucket.ndv,
+    };
+  }
+
+  private cloneOptimizerColumnStatistics(column: OptimizerColumnStatistics): OptimizerColumnStatistics {
+    return {
+      column: column.column,
+      rowCount: column.rowCount,
+      ndv: column.ndv,
+      nullCount: column.nullCount,
+      nullRatio: column.nullRatio,
+      histogram: column.histogram.map((bucket) => this.cloneOptimizerHistogramBucket(bucket)),
+    };
+  }
+
+  private cloneOptimizerTableStatistics(stats: OptimizerTableStatistics): OptimizerTableStatistics {
+    return {
+      table: stats.table,
+      rowCount: stats.rowCount,
+      analyzedAt: stats.analyzedAt,
+      columns: stats.columns.map((column) => this.cloneOptimizerColumnStatistics(column)),
+    };
+  }
+
+  private toImmutableOptimizerTableStatistics(stats: OptimizerTableStatistics): OptimizerTableStatistics {
+    const cloned = this.cloneOptimizerTableStatistics(stats);
+    return Object.freeze({
+      table: cloned.table,
+      rowCount: cloned.rowCount,
+      analyzedAt: cloned.analyzedAt,
+      columns: Object.freeze(
+        cloned.columns.map((column) =>
+          Object.freeze({
+            column: column.column,
+            rowCount: column.rowCount,
+            ndv: column.ndv,
+            nullCount: column.nullCount,
+            nullRatio: column.nullRatio,
+            histogram: Object.freeze(
+              column.histogram.map((bucket) =>
+                Object.freeze({
+                  lowerBound: bucket.lowerBound,
+                  upperBound: bucket.upperBound,
+                  rowCount: bucket.rowCount,
+                  ndv: bucket.ndv,
+                }),
+              ),
+            ),
+          }),
+        ),
+      ),
+    }) as OptimizerTableStatistics;
+  }
+
+  private cloneOptimizerStatsVersionObject(
+    object: OptimizerStatsVersionedStorageObject,
+  ): OptimizerStatsVersionedStorageObject {
+    return {
+      ...object,
+      statistics: this.cloneOptimizerTableStatistics(object.statistics),
+    };
+  }
+
+  private recordImmutableOptimizerStatsVersionObject(table: string, options?: { confirmationStatus?: "pending" | "confirmed" }): void {
+    const stats = this.collectOptimizerStatisticsForTable(table);
+    if (!stats) return;
+
+    const history = this.optimizerStatsVersionObjects.get(table) ?? [];
+    const prevVersion = history[history.length - 1]?.currentVersion ?? null;
+    const currentVersion = (prevVersion ?? 0) + 1;
+    const version = currentVersion;
+    const createdAt = Date.now();
+    const statistics = this.toImmutableOptimizerTableStatistics(stats);
+    const commitDigest = createHash("sha256")
+      .update(JSON.stringify({
+        table,
+        prevVersion,
+        currentVersion,
+        createdAt,
+        statistics,
+      }))
+      .digest("hex");
+    const objectId = `0x${commitDigest.slice(0, 40)}`;
+
+    const confirmationStatus = options?.confirmationStatus
+      ?? (this.opts.transactionCommitExecutor ? "pending" as const : "confirmed" as const);
+
+    const object = Object.freeze({
+      table,
+      objectId,
+      version,
+      prevVersion,
+      currentVersion,
+      commitDigest,
+      createdAt,
+      analyzedAt: statistics.analyzedAt,
+      confirmationStatus,
+      immutable: true as const,
+      statistics,
+    }) as OptimizerStatsVersionedStorageObject;
+
+    history.push(object);
+    this.optimizerStatsVersionObjects.set(table, history);
+  }
+
+  private resolveCanonicalOptimizerStatsTableName(table: string): string | null {
+    const canonicalSchemaTable = this.resolveCanonicalTableName(table);
+    if (canonicalSchemaTable) return canonicalSchemaTable;
+
+    const target = table.trim().toUpperCase();
+    if (!target) return null;
+    for (const tableName of this.optimizerStatsVersionObjects.keys()) {
+      if (tableName.toUpperCase() === target) return tableName;
+    }
+    return null;
+  }
+
+  private pickOptimizerStatsVersionObject(
+    table: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): OptimizerStatsVersionedStorageObject | undefined {
+    const history = this.optimizerStatsVersionObjects.get(table) ?? [];
+    if (history.length === 0) return undefined;
+
+    if (options?.version !== undefined) {
+      return history.find((object) => object.currentVersion === options.version);
+    }
+
+    const visibility = options?.visibility ?? "pending";
+    if (visibility === "pending") return history[history.length - 1];
+    return [...history].reverse().find((object) => object.confirmationStatus === "confirmed");
+  }
+
+  getOptimizerStatsVersionObjects(
+    table?: string,
+  ): OptimizerStatsVersionedStorageObject[] | Record<string, OptimizerStatsVersionedStorageObject[]> {
+    if (table) {
+      const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+      if (!canonical) return [];
+      return (this.optimizerStatsVersionObjects.get(canonical) ?? [])
+        .map((object) => this.cloneOptimizerStatsVersionObject(object));
+    }
+
+    const out: Record<string, OptimizerStatsVersionedStorageObject[]> = {};
+    for (const [name, history] of this.optimizerStatsVersionObjects.entries()) {
+      out[name] = history.map((object) => this.cloneOptimizerStatsVersionObject(object));
+    }
+    return out;
+  }
+
+  confirmOptimizerStatsVersionObject(table: string, version?: number): OptimizerStatsVersionedStorageObject | null {
+    const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+    if (!canonical) return null;
+
+    const history = this.optimizerStatsVersionObjects.get(canonical);
+    if (!history || history.length === 0) return null;
+
+    const targetVersion = version ?? history[history.length - 1]!.currentVersion;
+    const idx = history.findIndex((object) => object.currentVersion === targetVersion);
+    if (idx < 0) return null;
+
+    const current = history[idx]!;
+    if (current.confirmationStatus === "confirmed") return this.cloneOptimizerStatsVersionObject(current);
+
+    const confirmed = Object.freeze({
+      ...current,
+      confirmationStatus: "confirmed" as const,
+    }) as OptimizerStatsVersionedStorageObject;
+    history[idx] = confirmed;
+    return this.cloneOptimizerStatsVersionObject(confirmed);
+  }
+
+  private pruneIndexVersionObjectsForTable(table: string): void {
+    const upper = table.toUpperCase();
+    const activeNames = new Set(
+      this.getActiveIndexEntriesForTable(table).map((entry) => this.normalizeIndexName(entry.name)),
+    );
+    for (const [indexName, history] of this.indexVersionObjects.entries()) {
+      if (!history.length) continue;
+      if (history[0]!.table.toUpperCase() !== upper) continue;
+      if (activeNames.has(indexName)) continue;
+      this.indexVersionObjects.delete(indexName);
+    }
+  }
+
+  private cloneIndexCatalogEntry(entry: IndexCatalogEntry): IndexCatalogEntry {
+    return {
+      name: entry.name,
+      table: entry.table,
+      columns: [...entry.columns],
+      type: entry.type,
+      unique: entry.unique,
+      status: entry.status,
+    };
+  }
+
+  private pickIndexVersionObject(
+    indexName: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): IndexVersionedStorageObject | undefined {
+    const normalized = this.normalizeIndexName(indexName);
+    const history = this.indexVersionObjects.get(normalized) ?? [];
+    if (history.length === 0) return undefined;
+
+    if (options?.version !== undefined) {
+      return history.find((object) => object.currentVersion === options.version);
+    }
+
+    const visibility = options?.visibility ?? "pending";
+    if (visibility === "pending") return history[history.length - 1];
+    return [...history].reverse().find((object) => object.confirmationStatus === "confirmed");
+  }
+
+  private buildSnapshotIndexCatalog(visibility: "pending" | "confirmed"): Map<string, IndexCatalogEntry> {
+    const snapshot = new Map<string, IndexCatalogEntry>();
+    for (const [indexName, entry] of this.indexCatalog.entries()) {
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+      if (entry.type !== "HASH" && entry.type !== "BTREE") continue;
+
+      const history = this.indexVersionObjects.get(indexName) ?? [];
+      const selected = this.pickIndexVersionObject(indexName, { visibility });
+
+      if (history.length > 0 && !selected) continue;
+      if (selected) {
+        if (selected.table.toUpperCase() !== entry.table.toUpperCase()) continue;
+        if (selected.indexType !== entry.type) continue;
+        if (selected.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) continue;
+      }
+
+      snapshot.set(indexName, this.cloneIndexCatalogEntry(entry));
+    }
+    return snapshot;
+  }
+
   private buildLatestCommittedSnapshotTables(visibility: "pending" | "confirmed"): Map<string, SqlRow[]> {
     const snapshot = new Map<string, SqlRow[]>();
     const allTables = new Set<string>([...this.tables.keys(), ...this.tableVersionObjects.keys()]);
@@ -846,7 +1664,23 @@ export class WalrusSqlClient {
     return snapshot;
   }
 
-  private async queryAgainstSnapshotTables(sql: string, tables: Map<string, SqlRow[]>): Promise<QueryResult> {
+  private buildQueryByConfirmationSnapshot(visibility: "pending" | "confirmed"): {
+    tables: Map<string, SqlRow[]>;
+    indexCatalog: Map<string, IndexCatalogEntry>;
+  } {
+    return {
+      tables: this.buildLatestCommittedSnapshotTables(visibility),
+      indexCatalog: this.buildSnapshotIndexCatalog(visibility),
+    };
+  }
+
+  private async queryAgainstSnapshotTables(
+    sql: string,
+    snapshot: {
+      tables: Map<string, SqlRow[]>;
+      indexCatalog: Map<string, IndexCatalogEntry>;
+    },
+  ): Promise<QueryResult> {
     const snapshotClient = new WalrusSqlClient({
       ...this.opts,
       mode: "simulator",
@@ -860,25 +1694,49 @@ export class WalrusSqlClient {
     const internals = snapshotClient as unknown as {
       tables: Map<string, SqlRow[]>;
       schemas: Map<string, TableSchema>;
+      indexCatalog: Map<string, IndexCatalogEntry>;
+      hashIndexes: Map<string, Map<string, Map<string, Set<SqlRow>>>>;
+      hashIndexStats: Map<string, { keys: number; rowsIndexed: number }>;
+      btreeIndexes: Map<string, BtreeRuntimeIndexMap>;
+      btreeIndexStats: Map<string, { keys: number; rowsIndexed: number }>;
       uniqueIndexes: Map<string, Map<string, Map<string, SqlRow>>>;
       uniqueGroupsCache: Map<string, string[][]>;
       constraintCost: Map<string, ConstraintIndexCostStats>;
       rowVersions: Map<string, Map<string, number>>;
       tableVersionObjects: Map<string, VersionedStorageObject[]>;
+      indexVersionObjects: Map<string, IndexVersionedStorageObject[]>;
+      optimizerStatsVersionObjects: Map<string, OptimizerStatsVersionedStorageObject[]>;
     };
 
     internals.tables.clear();
-    for (const [table, rows] of tables.entries()) {
+    for (const [table, rows] of snapshot.tables.entries()) {
       internals.tables.set(table, rows);
     }
 
     internals.schemas.clear();
     for (const [table, schema] of this.schemas.entries()) internals.schemas.set(table, schema);
+    internals.indexCatalog.clear();
+    for (const [indexName, entry] of snapshot.indexCatalog.entries()) {
+      internals.indexCatalog.set(indexName, this.cloneIndexCatalogEntry(entry));
+    }
+    internals.hashIndexes.clear();
+    internals.hashIndexStats.clear();
+    internals.btreeIndexes.clear();
+    internals.btreeIndexStats.clear();
     internals.uniqueIndexes.clear();
     internals.uniqueGroupsCache.clear();
     internals.constraintCost.clear();
     internals.rowVersions.clear();
     internals.tableVersionObjects.clear();
+    internals.indexVersionObjects.clear();
+    internals.optimizerStatsVersionObjects.clear();
+
+    const indexedTables = new Set<string>();
+    for (const entry of snapshot.indexCatalog.values()) indexedTables.add(entry.table);
+    const snapshotRuntime = snapshotClient as unknown as {
+      rebuildSecondaryIndexesForTable: (table: string) => void;
+    };
+    for (const table of indexedTables.values()) snapshotRuntime.rebuildSecondaryIndexesForTable(table);
 
     return snapshotClient.query(sql);
   }
@@ -888,7 +1746,7 @@ export class WalrusSqlClient {
   }
 
   async queryByConfirmation(sql: string, visibility: "pending" | "confirmed" = "confirmed"): Promise<QueryResult> {
-    const snapshot = this.buildLatestCommittedSnapshotTables(visibility);
+    const snapshot = this.buildQueryByConfirmationSnapshot(visibility);
     return this.queryAgainstSnapshotTables(sql, snapshot);
   }
 
@@ -969,6 +1827,55 @@ export class WalrusSqlClient {
     };
   }
 
+  private cloneTransactionLogWriteEntry(entry: TransactionLogWriteEntry): TransactionLogWriteEntry {
+    return {
+      table: entry.table,
+      op: entry.op,
+      key: { ...entry.key },
+      preImage: entry.preImage ? { ...entry.preImage } : null,
+      postImage: entry.postImage ? { ...entry.postImage } : null,
+    };
+  }
+
+  private buildTransactionWriteSetFromLogRecord(record: TransactionLogRecord): TransactionWriteSet {
+    const staged = this.createEmptyTransactionWriteSet();
+    staged.logEntries = record.writeSet.map((entry) => this.cloneTransactionLogWriteEntry(entry));
+    if (staged.logEntries.length === 0) return staged;
+
+    const tableStats = new Map<string, TransactionTableWriteStats>();
+    for (const entry of staged.logEntries) {
+      if (!this.tables.has(entry.table) || !this.schemas.has(entry.table)) {
+        throw sqlError("ERR_TABLE_NOT_FOUND", entry.table);
+      }
+
+      const stats = tableStats.get(entry.table) ?? { insertRows: 0, updateRows: 0, deleteRows: 0 };
+      if (entry.op === "INSERT") stats.insertRows += 1;
+      else if (entry.op === "UPDATE") stats.updateRows += 1;
+      else stats.deleteRows += 1;
+      tableStats.set(entry.table, stats);
+    }
+
+    const snapshotTables = this.buildConstraintRevalidationSnapshot(staged);
+    for (const [table, stats] of tableStats.entries()) {
+      const snapshotRows = snapshotTables.get(table) ?? [];
+      const rows = this.deepCloneRows(snapshotRows);
+      staged.tables.set(table, {
+        rows,
+        uniqueIndexes: this.buildUniqueIndexSnapshot(table, rows),
+        stats,
+      });
+    }
+
+    return staged;
+  }
+
+  private applyRecoveredPreparedTransactionRecord(record: TransactionLogRecord): void {
+    const staged = this.buildTransactionWriteSetFromLogRecord(record);
+    if (staged.tables.size === 0) return;
+    this.assertCommitConstraintRevalidation(staged);
+    this.applyTransactionWriteSetOnCommit(staged);
+  }
+
   private async executeTransactionCommitBatch(payload: TransactionCommitBatchPayload): Promise<void> {
     if (!this.opts.transactionCommitExecutor) return;
     await this.opts.transactionCommitExecutor(payload);
@@ -1001,7 +1908,9 @@ export class WalrusSqlClient {
 
     for (const record of pending) {
       try {
-        await this.processPreparedTransactionRecord(record);
+        await this.processPreparedTransactionRecord(record, {
+          applyLocalWriteSet: () => this.applyRecoveredPreparedTransactionRecord(record),
+        });
         replayedTxnIds.push(record.txnId);
       } catch (err) {
         this.logger.warn("WAL replay failed", {
@@ -1029,6 +1938,114 @@ export class WalrusSqlClient {
     return rolledBackTxnIds;
   }
 
+  private buildRowLookupByEncodedKey(table: string, rows: SqlRow[]): Map<string, SqlRow> {
+    const lookup = new Map<string, SqlRow>();
+    for (const row of rows) {
+      lookup.set(this.encodeIndexRowRefKey(table, row), row);
+    }
+    return lookup;
+  }
+
+  private restoreSecondaryIndexesFromVersionObjectsForTable(table: string, rows: SqlRow[]): void {
+    const activeEntries = this.getActiveIndexEntriesForTable(table);
+    if (activeEntries.length === 0) {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    const rowLookup = this.buildRowLookupByEncodedKey(table, rows);
+    const restoredHashIndexes = new Map<string, Map<string, Set<SqlRow>>>();
+    const restoredBtreeIndexes: BtreeRuntimeIndexMap = new Map();
+
+    for (const entry of activeEntries) {
+      const indexName = this.normalizeIndexName(entry.name);
+      const history = this.indexVersionObjects.get(indexName) ?? [];
+      const latest = history[history.length - 1];
+      if (!latest) {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+      if (latest.indexType !== entry.type || latest.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+
+      if (entry.type === "HASH") {
+        if (latest.payload.indexType !== "HASH") {
+          this.rebuildSecondaryIndexesForTable(table);
+          return;
+        }
+
+        const buckets = new Map<string, Set<SqlRow>>();
+        for (const bucket of latest.payload.buckets) {
+          const restoredRows = bucket.rowKeys
+            .map((rowKey) => rowLookup.get(rowKey))
+            .filter((row): row is SqlRow => Boolean(row));
+          if (restoredRows.length === 0) continue;
+          buckets.set(bucket.encodedKey, new Set(restoredRows));
+        }
+
+        if (buckets.size > 0) restoredHashIndexes.set(indexName, buckets);
+        continue;
+      }
+
+      if (latest.payload.indexType !== "BTREE") {
+        this.rebuildSecondaryIndexesForTable(table);
+        return;
+      }
+
+      const entries: BtreeIndexLeafEntry[] = [];
+      for (const leaf of latest.payload.entries) {
+        const restoredRows = leaf.rowKeys
+          .map((rowKey) => rowLookup.get(rowKey))
+          .filter((row): row is SqlRow => Boolean(row));
+        if (restoredRows.length === 0) continue;
+        entries.push({
+          key: leaf.key,
+          rows: new Set(restoredRows),
+        });
+      }
+
+      if (entries.length > 0) {
+        restoredBtreeIndexes.set(indexName, {
+          column: latest.column,
+          entries: entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC")),
+        });
+      }
+    }
+
+    if (restoredHashIndexes.size > 0) {
+      let keys = 0;
+      let rowsIndexed = 0;
+      for (const buckets of restoredHashIndexes.values()) {
+        keys += buckets.size;
+        for (const bucketRows of buckets.values()) rowsIndexed += bucketRows.size;
+      }
+      this.hashIndexes.set(table, restoredHashIndexes);
+      this.hashIndexStats.set(table, { keys, rowsIndexed });
+    } else {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+    }
+
+    if (restoredBtreeIndexes.size > 0) {
+      let keys = 0;
+      let rowsIndexed = 0;
+      for (const runtime of restoredBtreeIndexes.values()) {
+        keys += runtime.entries.length;
+        for (const leaf of runtime.entries) rowsIndexed += leaf.rows.size;
+      }
+      this.btreeIndexes.set(table, restoredBtreeIndexes);
+      this.btreeIndexStats.set(table, { keys, rowsIndexed });
+    } else {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+    }
+  }
+
   async recoverConsistentStateFromWalAndVersionChain(
     options?: { pendingStrategy?: "rollback" | "replay" },
   ): Promise<DurabilityRecoverySummary> {
@@ -1042,6 +2059,7 @@ export class WalrusSqlClient {
       const restoredRows = latest.rows.map((row) => ({ ...row }));
       this.tables.set(table, restoredRows);
       this.uniqueIndexes.set(table, this.buildUniqueIndexSnapshot(table, restoredRows));
+      this.restoreSecondaryIndexesFromVersionObjectsForTable(table, restoredRows);
 
       const versions = new Map<string, number>();
       for (const row of restoredRows) {
@@ -1081,6 +2099,60 @@ export class WalrusSqlClient {
     this.uniqueIndexes.set(table, tableStage.uniqueIndexes);
   }
 
+  private findCommittedRowByVersionKey(table: string, encodedVersionKey: string): SqlRow | null {
+    const rows = this.tables.get(table);
+    if (!rows || rows.length === 0) return null;
+    for (const row of rows) {
+      if (this.encodeIndexRowRefKey(table, row) === encodedVersionKey) return row;
+    }
+    return null;
+  }
+
+  private resolveCommittedPostImageRow(
+    table: string,
+    postImage: SqlRow | null,
+    fallbackKey: Record<string, SqlPrimitive>,
+  ): SqlRow | null {
+    if (postImage) {
+      const encodedByPost = this.encodeIndexRowRefKey(table, postImage);
+      const byPost = this.findCommittedRowByVersionKey(table, encodedByPost);
+      if (byPost) return byPost;
+    }
+    return this.findCommittedRowByVersionKey(table, this.encodeRowVersionKey(fallbackKey));
+  }
+
+  private applyCommittedSecondaryIndexDeltas(staged: TransactionWriteSet): void {
+    const touchedTables = new Set<string>();
+
+    for (const entry of staged.logEntries) {
+      const table = entry.table;
+      if (!this.tables.has(table)) continue;
+
+      if (entry.op === "DELETE") {
+        if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
+        this.bumpIndexMaintenanceStats(table, "DELETE", 1);
+        touchedTables.add(table);
+        continue;
+      }
+
+      if (entry.op === "INSERT") {
+        const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
+        if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
+        touchedTables.add(table);
+        continue;
+      }
+
+      if (entry.preImage) this.removeRowFromSecondaryIndexes(table, entry.preImage, { recomputeStats: false });
+      const row = this.resolveCommittedPostImageRow(table, entry.postImage, entry.key);
+      if (row) this.addRowToSecondaryIndexes(table, row, { recomputeStats: false });
+      this.bumpIndexMaintenanceStats(table, "UPDATE", 1);
+      touchedTables.add(table);
+    }
+
+    for (const table of touchedTables.values()) this.recomputeSecondaryIndexStatsForTable(table);
+  }
+
   private takeTransactionCommitRuntimeSnapshot(staged: TransactionWriteSet): TransactionCommitRuntimeSnapshot {
     const tableSnapshots = new Map<string, TransactionTableCommitSnapshot>();
     for (const table of staged.tables.keys()) {
@@ -1089,6 +2161,14 @@ export class WalrusSqlClient {
         rows: this.tables.get(table),
         hadUniqueIndexes: this.uniqueIndexes.has(table),
         uniqueIndexes: this.uniqueIndexes.get(table),
+        hadHashIndexes: this.hashIndexes.has(table),
+        hashIndexes: this.hashIndexes.get(table),
+        hadHashIndexStats: this.hashIndexStats.has(table),
+        hashIndexStats: this.hashIndexStats.get(table),
+        hadBtreeIndexes: this.btreeIndexes.has(table),
+        btreeIndexes: this.btreeIndexes.get(table),
+        hadBtreeIndexStats: this.btreeIndexStats.has(table),
+        btreeIndexStats: this.btreeIndexStats.get(table),
       });
     }
 
@@ -1101,6 +2181,15 @@ export class WalrusSqlClient {
       ),
       tableVersionObjects: new Map(
         [...this.tableVersionObjects.entries()].map(([table, history]) => [table, [...history]] as const),
+      ),
+      indexVersionObjects: new Map(
+        [...this.indexVersionObjects.entries()].map(([indexName, history]) => [indexName, [...history]] as const),
+      ),
+      optimizerStatsVersionObjects: new Map(
+        [...this.optimizerStatsVersionObjects.entries()].map(([table, history]) => [table, [...history]] as const),
+      ),
+      indexObservability: new Map(
+        [...this.indexObservability.entries()].map(([table, stats]) => [table, { ...stats }] as const),
       ),
       writeVersion: this.writeVersion,
       queryCache: new Map(this.queryCache),
@@ -1116,6 +2205,29 @@ export class WalrusSqlClient {
         this.uniqueIndexes.set(table, tableSnapshot.uniqueIndexes ?? new Map<string, Map<string, SqlRow>>());
       }
       else this.uniqueIndexes.delete(table);
+
+      if (tableSnapshot.hadHashIndexes) {
+        this.hashIndexes.set(table, tableSnapshot.hashIndexes ?? new Map<string, Map<string, Set<SqlRow>>>());
+      }
+      else this.hashIndexes.delete(table);
+
+      if (tableSnapshot.hadHashIndexStats) {
+        this.hashIndexStats.set(table, tableSnapshot.hashIndexStats ?? { keys: 0, rowsIndexed: 0 });
+      }
+      else this.hashIndexStats.delete(table);
+
+      if (tableSnapshot.hadBtreeIndexes) {
+        this.btreeIndexes.set(
+          table,
+          tableSnapshot.btreeIndexes ?? new Map<string, BtreeRuntimeIndex>(),
+        );
+      }
+      else this.btreeIndexes.delete(table);
+
+      if (tableSnapshot.hadBtreeIndexStats) {
+        this.btreeIndexStats.set(table, tableSnapshot.btreeIndexStats ?? { keys: 0, rowsIndexed: 0 });
+      }
+      else this.btreeIndexStats.delete(table);
     }
 
     this.dirtyTables.clear();
@@ -1132,6 +2244,21 @@ export class WalrusSqlClient {
     this.tableVersionObjects.clear();
     for (const [table, history] of snapshot.tableVersionObjects.entries()) {
       this.tableVersionObjects.set(table, [...history]);
+    }
+
+    this.indexVersionObjects.clear();
+    for (const [indexName, history] of snapshot.indexVersionObjects.entries()) {
+      this.indexVersionObjects.set(indexName, [...history]);
+    }
+
+    this.optimizerStatsVersionObjects.clear();
+    for (const [table, history] of snapshot.optimizerStatsVersionObjects.entries()) {
+      this.optimizerStatsVersionObjects.set(table, [...history]);
+    }
+
+    this.indexObservability.clear();
+    for (const [table, stats] of snapshot.indexObservability.entries()) {
+      this.indexObservability.set(table, { ...stats });
     }
 
     this.writeVersion = snapshot.writeVersion;
@@ -1274,8 +2401,8 @@ export class WalrusSqlClient {
     }
   }
 
-  private applyTransactionWriteSetOnCommit(): void {
-    const staged = this.transactionWriteSet;
+  private applyTransactionWriteSetOnCommit(stagedOverride?: TransactionWriteSet): void {
+    const staged = stagedOverride ?? this.transactionWriteSet;
     if (!staged || staged.tables.size === 0) return;
 
     const snapshot = this.takeTransactionCommitRuntimeSnapshot(staged);
@@ -1292,13 +2419,18 @@ export class WalrusSqlClient {
             table,
             stats: { insertRows, updateRows, deleteRows },
           });
-          this.recordImmutableVersionObject(table, tableStage.rows);
           committedRows += insertRows + updateRows + deleteRows;
         }
       }
 
+      this.applyCommittedSecondaryIndexDeltas(staged);
+
       for (const effect of sideEffects) {
         const { table, stats } = effect;
+        const committedRowsForTable = this.tables.get(table) ?? [];
+        this.recordImmutableVersionObject(table, committedRowsForTable);
+        this.recordImmutableIndexVersionObjectsForTable(table);
+        this.recordImmutableOptimizerStatsVersionObject(table);
         this.dirtyTables.add(table);
         if (stats.insertRows > 0) this.recordStorageWrite(table, "INSERT_ROW", stats.insertRows, "simulator");
         if (stats.updateRows > 0) this.recordStorageWrite(table, "UPDATE_ROW", stats.updateRows, "simulator");
@@ -1402,38 +2534,43 @@ export class WalrusSqlClient {
         return result;
       }
 
-      this.assertTransactionNotTimedOut(normalized);
-      this.assertStatementAllowedDuringTransaction(normalized);
+      this.enterSubqueryRuntimeScope();
       try {
-        this.assertDdlTransactionPolicy(normalized);
-      } catch (err) {
-        this.transitionTransactionToAbortedOnError(normalized);
-        throw err;
-      }
+        this.assertTransactionNotTimedOut(normalized);
+        this.assertStatementAllowedDuringTransaction(normalized);
+        try {
+          this.assertDdlTransactionPolicy(normalized);
+        } catch (err) {
+          this.transitionTransactionToAbortedOnError(normalized);
+          throw err;
+        }
 
-      let result: ExecuteResult;
-      if ((this.opts.mode ?? "simulator") === "onchain") {
-        try {
-          result = await this.executeOnchain(sql);
-        } catch (err) {
-          this.transitionTransactionToAbortedOnError(normalized);
-          throw err;
+        let result: ExecuteResult;
+        if ((this.opts.mode ?? "simulator") === "onchain") {
+          try {
+            result = await this.executeOnchain(sql);
+          } catch (err) {
+            this.transitionTransactionToAbortedOnError(normalized);
+            throw err;
+          }
+        } else {
+          try {
+            result = await this.executeSimulator(sql);
+          } catch (err) {
+            this.transitionTransactionToAbortedOnError(normalized);
+            throw err;
+          }
         }
-      } else {
-        try {
-          result = await this.executeSimulator(sql);
-        } catch (err) {
-          this.transitionTransactionToAbortedOnError(normalized);
-          throw err;
-        }
+        this.logger.debug("execute success", {
+          sql: normalized,
+          statementType: result.statementType,
+          affectedRows: result.affectedRows ?? 0,
+          transactionState: this.transactionState,
+        });
+        return result;
+      } finally {
+        this.leaveSubqueryRuntimeScope();
       }
-      this.logger.debug("execute success", {
-        sql: normalized,
-        statementType: result.statementType,
-        affectedRows: result.affectedRows ?? 0,
-        transactionState: this.transactionState,
-      });
-      return result;
     } catch (err) {
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.ExecutionFailed, "execute() failed");
       this.logger.error("execute failed", { sql: normalized, error: wrapped.message });
@@ -1460,6 +2597,20 @@ export class WalrusSqlClient {
     return out;
   }
 
+  getIndexCatalog(table?: string): IndexCatalogEntry[] {
+    const out = [...this.indexCatalog.values()]
+      .filter((entry) => (table ? entry.table.toUpperCase() === table.toUpperCase() : true))
+      .map((entry) => ({ ...entry, columns: [...entry.columns] }));
+
+    out.sort((a, b) => {
+      const byTable = this.textOrder(a.table, b.table);
+      if (byTable !== 0) return byTable;
+      return this.textOrder(a.name, b.name);
+    });
+
+    return out;
+  }
+
   getDirtyTables(): string[] {
     return [...this.dirtyTables.values()].sort();
   }
@@ -1479,6 +2630,210 @@ export class WalrusSqlClient {
       return;
     }
     this.constraintCost.clear();
+  }
+
+  private emptyIndexObservabilityStats(): IndexObservabilityStats {
+    return {
+      lookupCount: 0,
+      lookupHits: 0,
+      lookupMisses: 0,
+      maintenanceInsertOps: 0,
+      maintenanceUpdateOps: 0,
+      maintenanceDeleteOps: 0,
+      maintenanceRebuildOps: 0,
+      maintenanceRows: 0,
+    };
+  }
+
+  private getOrCreateIndexObservabilityStats(table: string): IndexObservabilityStats {
+    const existing = this.indexObservability.get(table);
+    if (existing) return existing;
+    const created = this.emptyIndexObservabilityStats();
+    this.indexObservability.set(table, created);
+    return created;
+  }
+
+  private bumpIndexLookupStats(table: string, hit: boolean): void {
+    if (!this.getActiveIndexEntriesForTable(table).length) return;
+    const stats = this.getOrCreateIndexObservabilityStats(table);
+    stats.lookupCount += 1;
+    if (hit) stats.lookupHits += 1;
+    else stats.lookupMisses += 1;
+  }
+
+  private bumpIndexMaintenanceStats(table: string, op: "INSERT" | "UPDATE" | "DELETE" | "REBUILD", rows: number): void {
+    if (!this.getActiveIndexEntriesForTable(table).length) return;
+    const stats = this.getOrCreateIndexObservabilityStats(table);
+    if (op === "INSERT") stats.maintenanceInsertOps += 1;
+    else if (op === "UPDATE") stats.maintenanceUpdateOps += 1;
+    else if (op === "DELETE") stats.maintenanceDeleteOps += 1;
+    else stats.maintenanceRebuildOps += 1;
+    stats.maintenanceRows += Math.max(0, rows);
+  }
+
+  getIndexObservability(table?: string): Array<{
+    table: string;
+    lookupCount: number;
+    lookupHits: number;
+    lookupMisses: number;
+    hitRate: number;
+    failureRate: number;
+    maintenanceInsertOps: number;
+    maintenanceUpdateOps: number;
+    maintenanceDeleteOps: number;
+    maintenanceRebuildOps: number;
+    maintenanceRows: number;
+  }> {
+    const out: Array<{
+      table: string;
+      lookupCount: number;
+      lookupHits: number;
+      lookupMisses: number;
+      hitRate: number;
+      failureRate: number;
+      maintenanceInsertOps: number;
+      maintenanceUpdateOps: number;
+      maintenanceDeleteOps: number;
+      maintenanceRebuildOps: number;
+      maintenanceRows: number;
+    }> = [];
+    for (const [tableName, stats] of this.indexObservability.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      const hitRate = stats.lookupCount > 0 ? stats.lookupHits / stats.lookupCount : 0;
+      const failureRate = stats.lookupCount > 0 ? stats.lookupMisses / stats.lookupCount : 0;
+      out.push({
+        table: tableName,
+        lookupCount: stats.lookupCount,
+        lookupHits: stats.lookupHits,
+        lookupMisses: stats.lookupMisses,
+        hitRate,
+        failureRate,
+        maintenanceInsertOps: stats.maintenanceInsertOps,
+        maintenanceUpdateOps: stats.maintenanceUpdateOps,
+        maintenanceDeleteOps: stats.maintenanceDeleteOps,
+        maintenanceRebuildOps: stats.maintenanceRebuildOps,
+        maintenanceRows: stats.maintenanceRows,
+      });
+    }
+    out.sort((a, b) => this.textOrder(a.table, b.table));
+    return out;
+  }
+
+  getViewCatalog(viewName?: string): ViewCatalogEntry[] {
+    const out = [...this.viewCatalog.values()]
+      .filter((entry) => (viewName ? entry.name.toUpperCase() === viewName.toUpperCase() : true))
+      .map((entry) => ({
+        ...entry,
+        dependencies: entry.dependencies.map((dependency) => ({
+          source: dependency.source,
+          columns: [...dependency.columns],
+        })),
+      }));
+    out.sort((a, b) => this.textOrder(a.name, b.name));
+    return out;
+  }
+
+  private getSelectJoinSteps(parsed: ParsedSelect): SelectJoinStep[] {
+    if (parsed.joins?.length) return parsed.joins;
+    return parsed.join ? [parsed.join] : [];
+  }
+
+  private collectSelectSourceTables(parsed: ParsedSelect): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (tableName: string): void => {
+      const normalized = tableName.trim();
+      if (!normalized) return;
+      const key = normalized.toUpperCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(normalized);
+    };
+
+    push(parsed.table);
+    for (const join of this.getSelectJoinSteps(parsed)) {
+      push(join.table);
+    }
+    return out;
+  }
+
+  private async materializeViewRows(viewEntry: ViewCatalogEntry): Promise<SqlRow[]> {
+    const viewName = this.normalizeViewName(viewEntry.name);
+    this.assertViewPermission("SELECT", viewName);
+    if (viewEntry.status !== "ACTIVE") {
+      const detail = viewEntry.invalidReason
+        ? `view is invalid: ${viewEntry.name} (${viewEntry.invalidReason})`
+        : `view is invalid: ${viewEntry.name}`;
+      throw sqlError("ERR_UNSUPPORTED_SELECT", detail);
+    }
+    const cycleStart = this.activeViewResolutionStack.indexOf(viewName);
+    if (cycleStart >= 0) {
+      const cyclePath = [...this.activeViewResolutionStack.slice(cycleStart), viewName].join(" -> ");
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `cyclic view reference detected: ${cyclePath}`);
+    }
+
+    this.activeViewResolutionStack.push(viewName);
+    try {
+      const result = await this.query(viewEntry.querySql);
+      return this.normalizeMaterializedViewRows(result.rows);
+    } finally {
+      this.activeViewResolutionStack.pop();
+    }
+  }
+
+  private normalizeMaterializedViewRows(rows: SqlRow[]): SqlRow[] {
+    return rows.map((row) => {
+      const out: SqlRow = {};
+      const usedKeys = new Set<string>();
+      for (const [column, value] of Object.entries(row)) {
+        const mapped = this.normalizeMaterializedViewColumnName(column, usedKeys);
+        out[mapped] = value as SqlPrimitive;
+      }
+      return out;
+    });
+  }
+
+  private normalizeMaterializedViewColumnName(column: string, usedKeys: Set<string>): string {
+    const trimmed = column.trim();
+    const leaf = trimmed.includes(".") ? (trimmed.split(".").at(-1) ?? trimmed).trim() : trimmed;
+    const base = leaf || trimmed || "col";
+    const normalizedBase = base.toUpperCase();
+    if (!usedKeys.has(normalizedBase)) {
+      usedKeys.add(normalizedBase);
+      return base;
+    }
+
+    const fallback = trimmed || base;
+    const normalizedFallback = fallback.toUpperCase();
+    if (!usedKeys.has(normalizedFallback)) {
+      usedKeys.add(normalizedFallback);
+      return fallback;
+    }
+
+    let suffix = 2;
+    while (usedKeys.has(`${normalizedFallback}_${suffix}`)) suffix += 1;
+    const deduped = `${fallback}_${suffix}`;
+    usedKeys.add(deduped.toUpperCase());
+    return deduped;
+  }
+
+  private async materializeSelectViewSources(parsed: ParsedSelect): Promise<string[]> {
+    const materialized: string[] = [];
+    for (const sourceTable of this.collectSelectSourceTables(parsed)) {
+      if (this.tables.has(sourceTable)) continue;
+      const viewEntry = this.viewCatalog.get(this.normalizeViewName(sourceTable));
+      if (!viewEntry) continue;
+      const rows = await this.materializeViewRows(viewEntry);
+      this.tables.set(sourceTable, rows);
+      materialized.push(sourceTable);
+    }
+    return materialized;
+  }
+
+  private cleanupMaterializedSelectViewSources(materializedTableNames: string[]): void {
+    for (let i = materializedTableNames.length - 1; i >= 0; i--) {
+      this.tables.delete(materializedTableNames[i]!);
+    }
   }
 
   getStorageWriteLog(table?: string): StorageWriteEvent[] {
@@ -1519,6 +2874,17 @@ export class WalrusSqlClient {
     });
   }
 
+  private recordIndexMaintenance(table: string, op: "INDEX_REBUILD", affectedRows: number): void {
+    this.storageWriteLog.push({
+      table,
+      op,
+      affectedRows,
+      mode: "simulator",
+      at: Date.now(),
+    });
+    this.bumpIndexMaintenanceStats(table, "REBUILD", affectedRows);
+  }
+
   private bumpConstraintCost(table: string, patch: Partial<ConstraintIndexCostStats>): void {
     const curr = this.constraintCost.get(table) ?? emptyConstraintCostStats();
     this.constraintCost.set(table, {
@@ -1541,6 +2907,138 @@ export class WalrusSqlClient {
 
   private deepCloneRows(rows: SqlRow[]): SqlRow[] {
     return rows.map((r) => ({ ...r }));
+  }
+
+  private enterSubqueryRuntimeScope(): void {
+    if (!this.subqueryRuntime) {
+      this.subqueryRuntime = {
+        depth: 0,
+        costUnits: 0,
+        costBudget: CORRELATED_SUBQUERY_COST_BUDGET,
+        planCache: new Map<string, ParsedSubqueryPlan>(),
+        resultCache: new Map<string, SqlRow[]>(),
+        unnestCache: new Map<string, SubqueryUnnestCacheEntry>(),
+      };
+    }
+    this.subqueryRuntime.depth += 1;
+  }
+
+  private leaveSubqueryRuntimeScope(): void {
+    if (!this.subqueryRuntime) return;
+    this.subqueryRuntime.depth = Math.max(0, this.subqueryRuntime.depth - 1);
+    if (this.subqueryRuntime.depth === 0) {
+      this.subqueryRuntime = null;
+    }
+  }
+
+  private getOrCreateSubqueryStats(normalizedSubquerySql: string): SubqueryExecutionStats {
+    let stats = this.subqueryExecutionStats.get(normalizedSubquerySql);
+    if (!stats) {
+      stats = {
+        executions: 0,
+        correlatedExecutions: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
+        rowsScanned: 0,
+        rowsReturned: 0,
+        budgetExceededCount: 0,
+      };
+      this.subqueryExecutionStats.set(normalizedSubquerySql, stats);
+    }
+    return stats;
+  }
+
+  private collectOuterReferences(expr: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const re = /\bouter\.([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\b/gi;
+
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(expr)) !== null) {
+      const ref = m[1]!;
+      const key = ref.toUpperCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(ref);
+    }
+    return out.sort((a, b) => this.textOrder(a, b));
+  }
+
+  private getParsedSubqueryPlan(normalizedSubquerySql: string): ParsedSubqueryPlan {
+    const cached = this.subqueryRuntime?.planCache.get(normalizedSubquerySql);
+    if (cached) return cached;
+
+    const m = normalizedSubquerySql.match(
+      /^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+WHERE\s+(.+))?$/i,
+    );
+    if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", normalizedSubquerySql);
+
+    const fieldExpr = m[1]!.trim();
+    const table = m[2]!.trim();
+    const tableAlias = m[3]?.trim();
+    const where = m[4]?.trim();
+    const outerRefs = this.collectOuterReferences(`${fieldExpr} ${where ?? ""}`);
+
+    const plan: ParsedSubqueryPlan = {
+      normalizedSql: normalizedSubquerySql,
+      fieldExpr,
+      table,
+      tableAlias,
+      where,
+      whereTree: where ? this.parseWhereTree(where) : undefined,
+      outerRefs,
+    };
+    this.subqueryRuntime?.planCache.set(normalizedSubquerySql, plan);
+    return plan;
+  }
+
+  private buildSubqueryResultCacheKey(plan: ParsedSubqueryPlan, outerRow?: SqlRow): string {
+    if (!plan.outerRefs.length || !outerRow) return `${plan.normalizedSql}::GLOBAL`;
+
+    const bindings = plan.outerRefs.map((ref) => {
+      const value = resolveIdentifierValue(outerRow, ref, "strict");
+      const encoded = this.encodeTypedKey((value ?? null) as SqlPrimitive, `subquery.outerRef:${ref}`);
+      return `${ref}=${encoded}`;
+    });
+    return `${plan.normalizedSql}::${bindings.join("|")}`;
+  }
+
+  private storeSubqueryResultCache(cacheKey: string, rows: SqlRow[]): void {
+    if (!this.subqueryRuntime) return;
+    if (this.subqueryRuntime.resultCache.has(cacheKey)) {
+      this.subqueryRuntime.resultCache.delete(cacheKey);
+    }
+    this.subqueryRuntime.resultCache.set(cacheKey, this.deepCloneRows(rows));
+
+    while (this.subqueryRuntime.resultCache.size > CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT) {
+      const oldest = this.subqueryRuntime.resultCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.subqueryRuntime.resultCache.delete(oldest);
+    }
+  }
+
+  private consumeSubqueryCost(stats: SubqueryExecutionStats, correlated: boolean, subquerySql: string): void {
+    stats.rowsScanned += 1;
+    if (!correlated || !this.subqueryRuntime) return;
+    this.subqueryRuntime.costUnits += 1;
+    if (this.subqueryRuntime.costUnits <= this.subqueryRuntime.costBudget) return;
+    stats.budgetExceededCount += 1;
+    throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Correlated subquery cost budget exceeded: ${subquerySql}`);
+  }
+
+  private buildSubqueryEvalRow(innerRow: SqlRow, table: string, tableAlias?: string, outerRow?: SqlRow): SqlRow {
+    const evalRow: SqlRow = {};
+    for (const [k, v] of Object.entries(innerRow)) {
+      evalRow[k] = v;
+      evalRow[`${table}.${k}`] = v;
+      if (tableAlias) evalRow[`${tableAlias}.${k}`] = v;
+    }
+
+    if (!outerRow) return evalRow;
+    for (const [k, v] of Object.entries(outerRow)) {
+      evalRow[`outer.${k}`] = v;
+    }
+    return evalRow;
   }
 
   private getCachedQuery(sql: string): SqlRow[] | null {
@@ -1701,18 +3199,30 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("CREATE TABLE")) {
       const schema = this.parseCreateTableSchema(normalized);
+      if (this.viewCatalog.has(this.normalizeViewName(schema.name))) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `name conflict with existing view: ${schema.name}`);
+      }
       if (this.tables.has(schema.name) || this.schemas.has(schema.name)) {
         throw sqlError("ERR_UNSUPPORTED_DDL", `table already exists: ${schema.name}`);
       }
       this.assertNoCascadeCycle(schema);
       this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      this.indexCatalog.forEach((entry, indexName) => {
+        if (entry.table.toUpperCase() === schema.name.toUpperCase()) this.indexCatalog.delete(indexName);
+      });
+      this.hashIndexes.delete(schema.name);
+      this.hashIndexStats.delete(schema.name);
+      this.btreeIndexes.delete(schema.name);
+      this.btreeIndexStats.delete(schema.name);
       this.uniqueIndexes.delete(schema.name);
       this.uniqueGroupsCache.set(schema.name, this.collectUniqueGroups(schema));
       this.ensureUniqueIndexMaps(schema.name);
+      this.syncConstraintIndexesToCatalog(schema.name);
       this.constraintCost.set(schema.name, emptyConstraintCostStats());
       this.rowVersions.delete(schema.name);
       this.tableVersionObjects.delete(schema.name);
+      this.optimizerStatsVersionObjects.delete(schema.name);
       this.dirtyTables.add(schema.name);
       this.recordStorageWrite(schema.name, "CREATE_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -1721,6 +3231,58 @@ export class WalrusSqlClient {
         statementType: "CREATE",
         tableObjectId: `0x${randomUUID().replace(/-/g, "")}`,
         affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("CREATE INDEX") || upper.startsWith("CREATE UNIQUE INDEX")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_index") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const table = this.executeCreateIndexStatement(ast);
+      this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("CREATE VIEW")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_view") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      this.executeCreateViewStatement(ast);
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("DROP INDEX")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_index") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const table = this.executeDropIndexStatement(ast);
+      if (table) {
+        this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: table ? 1 : 0,
+      };
+    }
+
+    if (upper.startsWith("DROP VIEW")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_view") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const viewName = this.executeDropViewStatement(ast);
+      if (viewName) this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: viewName ? 1 : 0,
       };
     }
 
@@ -1737,13 +3299,28 @@ export class WalrusSqlClient {
           { token: table, clause: "DROP TABLE" },
         );
       }
+      this.invalidateViewsForDroppedTable(table);
       this.tables.delete(table);
       this.schemas.delete(table);
+      this.indexCatalog.forEach((entry, indexName) => {
+        if (entry.table.toUpperCase() === table.toUpperCase()) this.indexCatalog.delete(indexName);
+      });
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
       this.uniqueIndexes.delete(table);
       this.uniqueGroupsCache.delete(table);
       this.constraintCost.delete(table);
+      this.indexObservability.delete(table);
       this.rowVersions.delete(table);
       this.tableVersionObjects.delete(table);
+      this.optimizerStatsVersionObjects.delete(table);
+      for (const [indexName, history] of [...this.indexVersionObjects.entries()]) {
+        if (!history.length) continue;
+        if (history[0]!.table.toUpperCase() !== table.toUpperCase()) continue;
+        this.indexVersionObjects.delete(indexName);
+      }
       this.dirtyTables.delete(table);
       this.recordStorageWrite(table, "DROP_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
@@ -1757,6 +3334,7 @@ export class WalrusSqlClient {
     if (upper.startsWith("ALTER TABLE")) {
       const table = this.extractTableName(normalized, /ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.applyAlterTable(normalized);
+      this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
       this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
       this.invalidateReadCacheOnWrite();
       return {
@@ -1768,6 +3346,7 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      this.assertUpdatableViewDeferred("INSERT", table, "target");
       const parsedInsert = this.parseInsert(normalized);
       const bucket = this.requireWritableTableForDml(table);
       const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
@@ -1777,8 +3356,11 @@ export class WalrusSqlClient {
         this.recordTransactionLogWrite(table, "INSERT", coerced, null, coerced);
         this.bumpTableWriteStats(table, { insertRows: 1 });
       } else {
+        this.addRowToSecondaryIndexes(table, coerced);
+        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
         this.dirtyTables.add(table);
         this.applyImmediateRowVersion(table, "INSERT", coerced);
+        this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
         this.invalidateReadCacheOnWrite();
       }
@@ -1791,6 +3373,8 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("UPDATE")) {
       const plan = this.planUpdate(normalized);
+      this.assertUpdatableViewDeferred("UPDATE", plan.table, "target");
+      if (plan.join) this.assertUpdatableViewDeferred("UPDATE", plan.join.table, "source");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -1891,6 +3475,7 @@ export class WalrusSqlClient {
       } else {
         for (const [table, count] of updateCounts.entries()) {
           if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
           if (count > 0) this.recordStorageWrite(table, "UPDATE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
@@ -1904,6 +3489,8 @@ export class WalrusSqlClient {
 
     if (upper.startsWith("DELETE")) {
       const plan = this.planDelete(normalized);
+      this.assertUpdatableViewDeferred("DELETE", plan.table, "target");
+      if (plan.join) this.assertUpdatableViewDeferred("DELETE", plan.join.table, "source");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -1978,6 +3565,7 @@ export class WalrusSqlClient {
       } else {
         for (const [table, count] of deleteCounts.entries()) {
           if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
           if (count > 0) this.recordStorageWrite(table, "DELETE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
@@ -1996,6 +3584,1739 @@ export class WalrusSqlClient {
     };
   }
 
+  private resolveJoinReorderFieldRef(
+    field: string,
+    knownTables: Map<string, string>,
+  ): { table: string; column: string } | null {
+    const trimmed = field.trim();
+    if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+    const parts = trimmed.split(".");
+    if (parts.length < 2) return null;
+    const tableToken = parts[0]!;
+    const column = parts.at(-1)!;
+    const table = knownTables.get(tableToken.toUpperCase());
+    if (!table) return null;
+    return { table, column };
+  }
+
+  private estimateJoinReorderTableSelectivity(
+    parsed: Pick<ParsedSelect, "table" | "whereClauses">,
+    table: string,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    if (parsed.whereClauses.length === 0) return 1;
+    const target = table.toUpperCase();
+    const base = parsed.table.toUpperCase();
+
+    const relevantClauses: WhereClause[] = [];
+    for (const clause of parsed.whereClauses) {
+      const field = clause.field?.trim();
+      if (!field) continue;
+      const parts = field.split(".");
+      const hasQualifier = parts.length >= 2;
+      if (hasQualifier) {
+        const qualifier = parts[0]!.toUpperCase();
+        if (qualifier !== target) continue;
+      } else if (target !== base) {
+        // Unqualified columns are assumed to belong to the base table in join planning.
+        continue;
+      }
+      relevantClauses.push(clause);
+    }
+
+    if (relevantClauses.length === 0) return 1;
+    return this.estimateWhereClausesSelectivity(relevantClauses, tableRowCount, stats);
+  }
+
+  private pickJoinReorderColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    column: string,
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats) return undefined;
+    return stats.columns.find((entry) => entry.column.toUpperCase() === column.toUpperCase());
+  }
+
+  private estimateJoinReorderSelectivity(
+    leftStats: OptimizerTableStatistics | undefined,
+    leftColumn: string,
+    rightStats: OptimizerTableStatistics | undefined,
+    rightColumn: string,
+  ): number {
+    const leftColumnStats = this.pickJoinReorderColumnStats(leftStats, leftColumn);
+    const rightColumnStats = this.pickJoinReorderColumnStats(rightStats, rightColumn);
+
+    const leftNonNull = this.clampSelectivity(1 - (leftColumnStats?.nullRatio ?? 0));
+    const rightNonNull = this.clampSelectivity(1 - (rightColumnStats?.nullRatio ?? 0));
+    const ndvLeft = leftColumnStats?.ndv ?? 0;
+    const ndvRight = rightColumnStats?.ndv ?? 0;
+    const denom = Math.max(ndvLeft, ndvRight);
+
+    if (denom <= 0) {
+      return this.clampSelectivity(leftNonNull * rightNonNull * DEFAULT_JOIN_SELECTIVITY);
+    }
+    return this.clampSelectivity((leftNonNull * rightNonNull) / denom);
+  }
+
+  private tryCostBasedJoinReorder(
+    baseTable: string,
+    joins: SelectJoinStep[],
+    parsed: Pick<ParsedSelect, "table" | "whereClauses">,
+  ): { joins: SelectJoinStep[]; joinReorder: LogicalJoinReorderInfo } {
+    const originalJoinOrder = joins.map((join) => join.table);
+    const baseJoinReorder: LogicalJoinReorderInfo = {
+      applied: false,
+      algorithm: "NONE",
+      estimatedCost: null,
+      originalJoinOrder,
+      finalJoinOrder: originalJoinOrder,
+    };
+
+    if (joins.length < 2) return { joins, joinReorder: baseJoinReorder };
+    if (joins.some((join) => join.type !== "INNER")) return { joins, joinReorder: baseJoinReorder };
+
+    const tableByUpper = new Map<string, string>();
+    const allTables = [baseTable, ...joins.map((join) => join.table)];
+    for (const table of allTables) {
+      const upper = table.toUpperCase();
+      if (tableByUpper.has(upper)) return { joins, joinReorder: baseJoinReorder };
+      tableByUpper.set(upper, table);
+    }
+
+    type JoinEdge = {
+      id: number;
+      leftTable: string;
+      leftColumn: string;
+      rightTable: string;
+      rightColumn: string;
+    };
+
+    const edges: JoinEdge[] = [];
+    for (let i = 0; i < joins.length; i++) {
+      const join = joins[i]!;
+      const leftRef = this.resolveJoinReorderFieldRef(join.leftField, tableByUpper);
+      const rightRef = this.resolveJoinReorderFieldRef(join.rightField, tableByUpper);
+      if (!leftRef || !rightRef) return { joins, joinReorder: baseJoinReorder };
+      if (leftRef.table.toUpperCase() === rightRef.table.toUpperCase()) return { joins, joinReorder: baseJoinReorder };
+
+      const joinTableUpper = join.table.toUpperCase();
+      if (joinTableUpper !== leftRef.table.toUpperCase() && joinTableUpper !== rightRef.table.toUpperCase()) {
+        return { joins, joinReorder: baseJoinReorder };
+      }
+
+      edges.push({
+        id: i,
+        leftTable: leftRef.table,
+        leftColumn: leftRef.column,
+        rightTable: rightRef.table,
+        rightColumn: rightRef.column,
+      });
+    }
+
+    const tableRuntime = new Map<string, {
+      rows: number;
+      filteredRows: number;
+      stats: OptimizerTableStatistics | undefined;
+    }>();
+    for (const table of tableByUpper.values()) {
+      const stats = this.getOptimizerStatistics(table)[0];
+      const rowCount = Math.max(0, stats?.rowCount ?? this.tables.get(table)?.length ?? 0);
+      const selectivity = this.estimateJoinReorderTableSelectivity(parsed, table, rowCount, stats);
+      const filteredRows = Math.max(0, Math.ceil(rowCount * selectivity));
+      tableRuntime.set(table, { rows: rowCount, filteredRows, stats });
+    }
+
+    const visitedTables = new Set<string>([baseTable.toUpperCase()]);
+    const usedEdges = new Set<number>();
+    const reorderedJoins: SelectJoinStep[] = [];
+
+    let runningRows = tableRuntime.get(baseTable)?.filteredRows ?? 0;
+    let totalCost = Math.max(1, runningRows);
+
+    while (reorderedJoins.length < joins.length) {
+      let bestCandidate: {
+        edgeId: number;
+        leftTable: string;
+        leftColumn: string;
+        rightTable: string;
+        rightColumn: string;
+        outputRows: number;
+        stepCost: number;
+      } | null = null;
+
+      for (const edge of edges) {
+        if (usedEdges.has(edge.id)) continue;
+        const leftVisited = visitedTables.has(edge.leftTable.toUpperCase());
+        const rightVisited = visitedTables.has(edge.rightTable.toUpperCase());
+        if (leftVisited === rightVisited) continue;
+
+        const leftTable = leftVisited ? edge.leftTable : edge.rightTable;
+        const rightTable = leftVisited ? edge.rightTable : edge.leftTable;
+        const leftColumn = leftVisited ? edge.leftColumn : edge.rightColumn;
+        const rightColumn = leftVisited ? edge.rightColumn : edge.leftColumn;
+
+        const rightRows = tableRuntime.get(rightTable)?.filteredRows ?? 0;
+        const joinSelectivity = this.estimateJoinReorderSelectivity(
+          tableRuntime.get(leftTable)?.stats,
+          leftColumn,
+          tableRuntime.get(rightTable)?.stats,
+          rightColumn,
+        );
+
+        const outputRows = Math.max(0, Math.ceil(runningRows * rightRows * joinSelectivity));
+        const stepCost = runningRows + rightRows + outputRows;
+
+        if (!bestCandidate) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (stepCost < bestCandidate.stepCost) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (stepCost > bestCandidate.stepCost) continue;
+        if (outputRows < bestCandidate.outputRows) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+          continue;
+        }
+        if (outputRows > bestCandidate.outputRows) continue;
+        if (this.textOrder(rightTable, bestCandidate.rightTable) < 0) {
+          bestCandidate = { edgeId: edge.id, leftTable, leftColumn, rightTable, rightColumn, outputRows, stepCost };
+        }
+      }
+
+      if (!bestCandidate) {
+        return { joins, joinReorder: baseJoinReorder };
+      }
+
+      usedEdges.add(bestCandidate.edgeId);
+      visitedTables.add(bestCandidate.rightTable.toUpperCase());
+      runningRows = bestCandidate.outputRows;
+      totalCost += bestCandidate.stepCost;
+
+      reorderedJoins.push({
+        type: "INNER",
+        table: bestCandidate.rightTable,
+        leftField: `${bestCandidate.leftTable}.${bestCandidate.leftColumn}`,
+        rightField: `${bestCandidate.rightTable}.${bestCandidate.rightColumn}`,
+      });
+    }
+
+    const finalJoinOrder = reorderedJoins.map((join) => join.table);
+    const applied = finalJoinOrder.some(
+      (table, idx) => table.toUpperCase() !== (originalJoinOrder[idx] ?? "").toUpperCase(),
+    );
+    if (!applied) {
+      return {
+        joins,
+        joinReorder: {
+          ...baseJoinReorder,
+          estimatedCost: Math.max(1, Math.ceil(totalCost)),
+        },
+      };
+    }
+
+    return {
+      joins: reorderedJoins,
+      joinReorder: {
+        applied: true,
+        algorithm: "GREEDY_CBO",
+        estimatedCost: Math.max(1, Math.ceil(totalCost)),
+        originalJoinOrder,
+        finalJoinOrder,
+      },
+    };
+  }
+
+  private buildLogicalSelectPlan(parsed: ParsedSelect): LogicalSelectPlan {
+    const rewriteRules: LogicalRewriteRule[] = [];
+
+    const rawJoins = parsed.joins?.length
+      ? parsed.joins.map((j) => ({
+          type: j.type,
+          table: j.table,
+          leftField: j.leftField,
+          rightField: j.rightField,
+        }))
+      : parsed.join
+      ? [{
+          type: parsed.join.type,
+          table: parsed.join.table,
+          leftField: parsed.join.leftField,
+          rightField: parsed.join.rightField,
+        }]
+      : [];
+    if (rawJoins.length > 0) rewriteRules.push("RULE_CANONICALIZE_JOIN_CHAIN");
+
+    const reorderedJoinPlan = this.tryCostBasedJoinReorder(parsed.table, rawJoins, {
+      table: parsed.table,
+      whereClauses: parsed.whereClauses,
+    });
+    const joins = reorderedJoinPlan.joins;
+    const joinReorder = reorderedJoinPlan.joinReorder;
+    if (joinReorder.applied) rewriteRules.push("RULE_COST_BASED_JOIN_REORDER");
+
+    const orderByList = parsed.orderByList?.map((order) => ({
+      field: order.field.trim(),
+      direction: (order.direction === "DESC" ? "DESC" : "ASC") as "ASC" | "DESC",
+    }));
+    const orderChanged = Boolean(
+      orderByList?.some((order, idx) => {
+        const source = parsed.orderByList?.[idx];
+        if (!source) return false;
+        return source.field !== order.field || source.direction !== order.direction;
+      }),
+    );
+    if (orderChanged) rewriteRules.push("RULE_NORMALIZE_ORDER_BY_DIRECTION");
+
+    const predicateSource: LogicalPredicateSource = parsed.whereAst
+      ? "AST"
+      : parsed.whereTree
+      ? "TREE"
+      : parsed.whereClauses.length
+      ? "CLAUSES"
+      : "NONE";
+    if (predicateSource === "AST" && (parsed.whereTree || parsed.whereClauses.length > 0)) {
+      rewriteRules.push("RULE_PREFER_AST_PREDICATE");
+    }
+    if (this.hasUnnestableUncorrelatedSubquery(parsed.whereClauses)) {
+      rewriteRules.push("RULE_UNNEST_UNCORRELATED_SUBQUERY");
+    }
+
+    return {
+      table: parsed.table,
+      fields: parsed.fields,
+      joins,
+      joinReorder,
+      predicateSource,
+      where: parsed.where,
+      having: parsed.having,
+      groupBy: parsed.groupBy,
+      aggregate: parsed.aggregate,
+      aggregateField: parsed.aggregateField,
+      orderByList,
+      limit: parsed.limit,
+      offset: parsed.offset,
+      rowNumberAlias: parsed.rowNumberAlias,
+      rowNumberSpec: parsed.rowNumberSpec,
+      rewriteRules,
+    };
+  }
+
+  private estimateSortWork(rows: number, orderByCount: number): number {
+    if (rows <= 1 || orderByCount <= 0) return 0;
+    const logFactor = Math.max(1, Math.ceil(Math.log2(rows + 1)));
+    return rows * logFactor * orderByCount;
+  }
+
+  private estimateJoinSortWork(rows: number): number {
+    if (rows <= 1) return rows;
+    return Math.max(1, Math.ceil(this.estimateSortWork(rows, 1) * SORT_MERGE_SORT_WORK_FACTOR));
+  }
+
+  private getJoinMemoryBudgetRows(): number {
+    const configured = this.opts.joinExecution?.memoryBudgetRows;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.max(1, Math.floor(configured));
+    }
+    return DEFAULT_JOIN_MEMORY_BUDGET_ROWS;
+  }
+
+  private getJoinSpillChunkRows(): number {
+    const budgetRows = this.getJoinMemoryBudgetRows();
+    const configured = this.opts.joinExecution?.spillChunkRows;
+    if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+      return Math.max(1, Math.min(Math.floor(configured), budgetRows));
+    }
+    return budgetRows;
+  }
+
+  private estimateJoinAlgorithmMemoryRows(
+    algorithm: JoinExecutionAlgorithm,
+    leftRows: number,
+    rightRows: number,
+  ): number {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    if (algorithm === "HASH_JOIN") {
+      return Math.max(1, Math.min(left, right));
+    }
+    if (algorithm === "SORT_MERGE_JOIN") {
+      return Math.max(1, left + right);
+    }
+    return 1;
+  }
+
+  private estimateJoinStepSelectivity(join: SelectJoinStep): number {
+    const parseRef = (field: string): { table: string; column: string } | null => {
+      const trimmed = field.trim();
+      if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+      const parts = trimmed.split(".");
+      if (parts.length < 2) return null;
+      return { table: parts[0]!, column: parts.at(-1)! };
+    };
+
+    const leftRef = parseRef(join.leftField);
+    const rightRef = parseRef(join.rightField);
+    if (!leftRef || !rightRef) return DEFAULT_JOIN_SELECTIVITY;
+
+    const leftStats = this.getOptimizerStatistics(leftRef.table)[0];
+    const rightStats = this.getOptimizerStatistics(rightRef.table)[0];
+    if (!leftStats || !rightStats) return DEFAULT_JOIN_SELECTIVITY;
+
+    return this.estimateJoinReorderSelectivity(leftStats, leftRef.column, rightStats, rightRef.column);
+  }
+
+  private estimateJoinOutputRows(
+    leftRows: number,
+    rightRows: number,
+    join: SelectJoinStep,
+  ): number {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    const selectivity = this.clampSelectivity(this.estimateJoinStepSelectivity(join));
+    const matchedRows = Math.max(0, Math.ceil(left * right * selectivity));
+
+    if (join.type === "LEFT") return Math.max(left, matchedRows);
+    if (join.type === "RIGHT") return Math.max(right, matchedRows);
+    if (join.type === "FULL") return Math.max(Math.max(left, right), matchedRows);
+    return matchedRows;
+  }
+
+  private chooseJoinExecutionAlgorithm(leftRows: number, rightRows: number): {
+    algorithm: JoinExecutionAlgorithm;
+    estimatedCost: number;
+    estimatedMemoryRows: number;
+    memoryBudgetRows: number;
+    memoryBudgetConstrained: boolean;
+  } {
+    const left = Math.max(0, leftRows);
+    const right = Math.max(0, rightRows);
+    const memoryBudgetRows = this.getJoinMemoryBudgetRows();
+    const buildRows = Math.min(left, right);
+    const probeRows = Math.max(left, right);
+    const hashSpillPenalty = buildRows > HASH_JOIN_BUILD_ROW_THRESHOLD
+      ? Math.ceil(buildRows * HASH_JOIN_SPILL_PENALTY_FACTOR)
+      : 0;
+
+    const costs: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: Math.max(1, left * right),
+      HASH_JOIN: Math.max(1, buildRows + probeRows + HASH_JOIN_STARTUP_COST + hashSpillPenalty),
+      SORT_MERGE_JOIN: Math.max(
+        1,
+        this.estimateJoinSortWork(left) + this.estimateJoinSortWork(right) + left + right + SORT_MERGE_JOIN_STARTUP_COST,
+      ),
+    };
+    const memoryRows: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: this.estimateJoinAlgorithmMemoryRows("NESTED_LOOP", left, right),
+      HASH_JOIN: this.estimateJoinAlgorithmMemoryRows("HASH_JOIN", left, right),
+      SORT_MERGE_JOIN: this.estimateJoinAlgorithmMemoryRows("SORT_MERGE_JOIN", left, right),
+    };
+    const availableCandidates = (["NESTED_LOOP", "HASH_JOIN", "SORT_MERGE_JOIN"] as JoinExecutionAlgorithm[])
+      .filter((algorithm) => memoryRows[algorithm] <= memoryBudgetRows);
+    const candidates = availableCandidates.length
+      ? availableCandidates
+      : (["NESTED_LOOP"] as JoinExecutionAlgorithm[]);
+
+    const rank: Record<JoinExecutionAlgorithm, number> = {
+      NESTED_LOOP: 0,
+      HASH_JOIN: 1,
+      SORT_MERGE_JOIN: 2,
+    };
+
+    let bestAlgorithm = candidates[0]!;
+    for (const candidate of candidates.slice(1)) {
+      const candidateCost = costs[candidate];
+      const bestCost = costs[bestAlgorithm];
+      if (candidateCost < bestCost || (candidateCost === bestCost && rank[candidate] < rank[bestAlgorithm])) {
+        bestAlgorithm = candidate;
+      }
+    }
+
+    return {
+      algorithm: bestAlgorithm,
+      estimatedCost: costs[bestAlgorithm],
+      estimatedMemoryRows: memoryRows[bestAlgorithm],
+      memoryBudgetRows,
+      memoryBudgetConstrained: candidates.length < 3,
+    };
+  }
+
+  private buildPhysicalJoinPlan(baseRows: number, joins: SelectJoinStep[]): PhysicalJoinPlanStep[] {
+    const out: PhysicalJoinPlanStep[] = [];
+    let runningRows = Math.max(0, baseRows);
+
+    for (const join of joins) {
+      const rightRows = Math.max(0, this.requireTable(join.table).length);
+      const chosen = this.chooseJoinExecutionAlgorithm(runningRows, rightRows);
+      const estimatedOutputRows = this.estimateJoinOutputRows(runningRows, rightRows, join);
+
+      out.push({
+        algorithm: chosen.algorithm,
+        estimatedCost: chosen.estimatedCost,
+        estimatedOutputRows,
+        leftRows: runningRows,
+        rightRows,
+        estimatedMemoryRows: chosen.estimatedMemoryRows,
+        memoryBudgetRows: chosen.memoryBudgetRows,
+        memoryBudgetConstrained: chosen.memoryBudgetConstrained,
+      });
+      runningRows = estimatedOutputRows;
+    }
+
+    return out;
+  }
+
+  private toUnqualifiedColumnName(field: string): string | null {
+    const trimmed = field.trim();
+    if (!trimmed) return null;
+    if (!/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return null;
+    return trimmed.includes(".") ? (trimmed.split(".").at(-1) ?? null) : trimmed;
+  }
+
+  private isCoveringIndexAccess(parsed: ParsedSelect, indexColumn: string): boolean {
+    if (parsed.joins?.length) return false;
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias || parsed.rowNumberSpec) {
+      return false;
+    }
+    if (parsed.fields.length === 1 && parsed.fields[0] === "*") return false;
+
+    const requiredColumns = new Set<string>();
+    for (const field of parsed.fields) {
+      const column = this.toUnqualifiedColumnName(field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    for (const clause of parsed.whereClauses) {
+      if (!clause.field) continue;
+      const column = this.toUnqualifiedColumnName(clause.field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    for (const order of parsed.orderByList ?? []) {
+      const column = this.toUnqualifiedColumnName(order.field);
+      if (!column) return false;
+      requiredColumns.add(column.toUpperCase());
+    }
+
+    if (requiredColumns.size === 0) return false;
+    const targetColumn = indexColumn.toUpperCase();
+    for (const column of requiredColumns) {
+      if (column !== targetColumn) return false;
+    }
+    return true;
+  }
+
+  private resolvePhysicalIndexAccessStrategy(
+    parsed: ParsedSelect,
+    method: PhysicalAccessPathMethod,
+    indexColumn?: string,
+  ): PhysicalIndexAccessStrategy {
+    if (method === "TABLE_SCAN") return "FULL_TABLE_SCAN";
+    if (!indexColumn) return "INDEX_BACK_TABLE";
+    return this.isCoveringIndexAccess(parsed, indexColumn) ? "INDEX_SCAN" : "INDEX_BACK_TABLE";
+  }
+
+  private estimatePhysicalAccessPathCost(
+    parsed: ParsedSelect,
+    tableRows: number,
+    method: PhysicalAccessPathMethod,
+    scannedRows: number,
+    estimatedRows: number,
+    orderSatisfied: boolean,
+    indexStrategy: PhysicalIndexAccessStrategy,
+  ): number {
+    let cost = Math.max(1, scannedRows);
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    const hasOrder = Boolean(parsed.orderByList?.length);
+
+    if (hasPredicate) {
+      cost += Math.max(1, Math.ceil(scannedRows * 0.15));
+    }
+    if (!orderSatisfied) {
+      cost += this.estimateSortWork(Math.max(1, estimatedRows), parsed.orderByList?.length ?? 0);
+    }
+    if (parsed.groupBy?.length || parsed.aggregate || parsed.having || parsed.rowNumberAlias) {
+      cost += Math.max(1, Math.ceil(Math.max(1, estimatedRows) * 0.5));
+    }
+
+    switch (method) {
+      case "TABLE_SCAN":
+        cost += Math.max(1, Math.ceil(tableRows * 0.25));
+        if (hasPredicate) cost += Math.max(2, Math.ceil(tableRows * 0.75));
+        if (hasOrder) cost += Math.max(1, Math.ceil(tableRows * 0.25));
+        break;
+      case "HASH_INDEX_LOOKUP":
+        cost += 3;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
+        break;
+      case "BTREE_INDEX_LOOKUP":
+        cost += 4;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
+        break;
+      case "BTREE_ORDERED_SCAN":
+        cost += 2;
+        if (indexStrategy === "INDEX_BACK_TABLE") {
+          cost += Math.max(1, Math.ceil(scannedRows * INDEX_BACK_TABLE_FETCH_RATIO));
+        }
+        break;
+      default:
+        break;
+    }
+
+    return cost;
+  }
+
+  private physicalMethodRank(method: PhysicalAccessPathMethod): number {
+    switch (method) {
+      case "BTREE_ORDERED_SCAN":
+        return 0;
+      case "HASH_INDEX_LOOKUP":
+        return 1;
+      case "BTREE_INDEX_LOOKUP":
+        return 2;
+      case "TABLE_SCAN":
+      default:
+        return 3;
+    }
+  }
+
+  private pickBestPhysicalAccessPath(candidates: PhysicalSelectRuntimePath[]): PhysicalSelectRuntimePath {
+    let best = candidates[0]!;
+    for (let i = 1; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      if (candidate.estimatedCost < best.estimatedCost) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.estimatedCost > best.estimatedCost) continue;
+
+      if (candidate.orderSatisfied && !best.orderSatisfied) {
+        best = candidate;
+        continue;
+      }
+      if (!candidate.orderSatisfied && best.orderSatisfied) continue;
+
+      if (candidate.estimatedRows < best.estimatedRows) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.estimatedRows > best.estimatedRows) continue;
+
+      if (this.physicalMethodRank(candidate.method) < this.physicalMethodRank(best.method)) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  private samePhysicalAccessPath(
+    left: Pick<PhysicalSelectAccessPath, "method" | "indexName" | "indexColumn">,
+    right: Pick<PhysicalSelectAccessPath, "method" | "indexName" | "indexColumn">,
+  ): boolean {
+    return (
+      left.method === right.method
+      && (left.indexName ?? null) === (right.indexName ?? null)
+      && (left.indexColumn ?? null) === (right.indexColumn ?? null)
+    );
+  }
+
+  private findPreferredRuntimePath(
+    candidates: PhysicalSelectRuntimePath[],
+    state: SelectPlanStabilityState,
+  ): PhysicalSelectRuntimePath | null {
+    const preferredIndexName = state.preferredIndexName?.toUpperCase();
+    const preferredIndexColumn = state.preferredIndexColumn?.toUpperCase();
+    for (const candidate of candidates) {
+      if (candidate.method !== state.preferredMethod) continue;
+      if (preferredIndexName && candidate.indexName?.toUpperCase() !== preferredIndexName) continue;
+      if (preferredIndexColumn && candidate.indexColumn?.toUpperCase() !== preferredIndexColumn) continue;
+      return candidate;
+    }
+    return candidates.find((candidate) => candidate.method === state.preferredMethod) ?? null;
+  }
+
+  private applySelectPlanStabilityPolicy(
+    stabilityKey: string | undefined,
+    optimizerChoice: PhysicalSelectRuntimePath,
+    candidates: PhysicalSelectRuntimePath[],
+  ): { chosen: PhysicalSelectRuntimePath; reason: PlanStabilityReason } {
+    if (!stabilityKey) return { chosen: optimizerChoice, reason: "NONE" };
+    const state = this.selectPlanStability.get(stabilityKey);
+    if (!state) return { chosen: optimizerChoice, reason: "NONE" };
+
+    const tableScan = candidates.find((candidate) => candidate.method === "TABLE_SCAN");
+    if (state.badPlanFallbackRemaining > 0 && tableScan) {
+      return { chosen: tableScan, reason: "BAD_PLAN_FALLBACK_PIN" };
+    }
+
+    const preferred = this.findPreferredRuntimePath(candidates, state);
+    if (!preferred) return { chosen: optimizerChoice, reason: "NONE" };
+    if (this.samePhysicalAccessPath(preferred, optimizerChoice)) {
+      return { chosen: optimizerChoice, reason: "NONE" };
+    }
+
+    if (optimizerChoice.estimatedCost <= preferred.estimatedCost * SELECT_PLAN_STABILITY_SWITCH_RATIO) {
+      return { chosen: optimizerChoice, reason: "NONE" };
+    }
+
+    return { chosen: preferred, reason: "PLAN_STABILITY_PIN" };
+  }
+
+  private shouldTriggerBadPlanFallback(
+    parsed: ParsedSelect,
+    chosen: PhysicalSelectAccessPath,
+    scannedRows: number,
+    tableRows: number,
+    resultRows: number,
+  ): boolean {
+    if (chosen.method !== "HASH_INDEX_LOOKUP" && chosen.method !== "BTREE_INDEX_LOOKUP") return false;
+    if (chosen.indexStrategy !== "INDEX_BACK_TABLE") return false;
+    if (tableRows < BAD_PLAN_FALLBACK_MIN_TABLE_ROWS) return false;
+    if (chosen.orderSatisfied) return false;
+
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    if (!hasPredicate) return false;
+
+    const normalizedScannedRows = Math.max(1, scannedRows);
+    const scanRatio = normalizedScannedRows / Math.max(1, tableRows);
+    if (scanRatio < BAD_PLAN_FALLBACK_SCAN_RATIO) return false;
+
+    const rowRetention = resultRows / normalizedScannedRows;
+    if (rowRetention < BAD_PLAN_FALLBACK_RESULT_RATIO) return false;
+    return true;
+  }
+
+  private recordSelectPlanFeedback(
+    stabilityKey: string | undefined,
+    parsed: ParsedSelect,
+    plan: SelectExecutionPlan,
+    resultRows: number,
+    tableRows: number,
+  ): void {
+    if (!stabilityKey) return;
+
+    const chosen = plan.physical.chosen;
+    const state: SelectPlanStabilityState = this.selectPlanStability.get(stabilityKey) ?? {
+      preferredMethod: chosen.method,
+      preferredIndexName: chosen.indexName,
+      preferredIndexColumn: chosen.indexColumn,
+      badPlanFallbackRemaining: 0,
+      badPlanFallbackCount: 0,
+      stablePinCount: 0,
+      planSwitchCount: 0,
+      executions: 0,
+      lastReason: "NONE",
+    };
+
+    state.executions += 1;
+    if (plan.physical.stabilityReason === "PLAN_STABILITY_PIN") state.stablePinCount += 1;
+    if (plan.physical.stabilityReason === "BAD_PLAN_FALLBACK_PIN" && state.badPlanFallbackRemaining > 0) {
+      state.badPlanFallbackRemaining = Math.max(0, state.badPlanFallbackRemaining - 1);
+    }
+
+    if (this.shouldTriggerBadPlanFallback(parsed, chosen, plan.scannedRows.length, tableRows, resultRows)) {
+      state.badPlanFallbackCount += 1;
+      state.badPlanFallbackRemaining = Math.max(state.badPlanFallbackRemaining, BAD_PLAN_FALLBACK_COOLDOWN);
+      state.preferredMethod = "TABLE_SCAN";
+      state.preferredIndexName = undefined;
+      state.preferredIndexColumn = undefined;
+      state.lastReason = "BAD_PLAN_TRIGGER";
+      this.selectPlanStability.set(stabilityKey, state);
+      return;
+    }
+
+    if (
+      state.preferredMethod !== chosen.method
+      || (state.preferredIndexName ?? null) !== (chosen.indexName ?? null)
+      || (state.preferredIndexColumn ?? null) !== (chosen.indexColumn ?? null)
+    ) {
+      state.planSwitchCount += 1;
+      state.preferredMethod = chosen.method;
+      state.preferredIndexName = chosen.indexName;
+      state.preferredIndexColumn = chosen.indexColumn;
+    }
+
+    state.lastReason = plan.physical.stabilityReason;
+    this.selectPlanStability.set(stabilityKey, state);
+  }
+
+  private getOrCreateSelectExecutionPipelineStats(key: string): SelectExecutionPipelineStats {
+    const existing = this.selectExecutionPipelineStats.get(key);
+    if (existing) return existing;
+    const created: SelectExecutionPipelineStats = {
+      executions: 0,
+      pipelinedExecutions: 0,
+      materializedExecutions: 0,
+      earlyStopExecutions: 0,
+      rowsVisited: 0,
+      rowsReturned: 0,
+      maxBufferedRows: 0,
+      joinSpillExecutions: 0,
+      joinSpillChunks: 0,
+      joinSpillRowsProcessed: 0,
+      lastMode: "MATERIALIZED",
+      lastRowsVisited: 0,
+      lastRowsReturned: 0,
+      lastBufferedRows: 0,
+      lastEarlyStop: false,
+      lastJoinSpillSteps: 0,
+      lastJoinSpillChunks: 0,
+      lastJoinSpillRowsProcessed: 0,
+      lastBlockers: [],
+    };
+    this.selectExecutionPipelineStats.set(key, created);
+    return created;
+  }
+
+  private getSelectPipelineBlockers(
+    logicalPlan: LogicalSelectPlan,
+    orderSatisfied: boolean,
+  ): SelectPipelineBlocker[] {
+    const blockers: SelectPipelineBlocker[] = [];
+    if (logicalPlan.joins.length > 0) blockers.push("JOIN_CHAIN");
+    if (logicalPlan.groupBy?.length) blockers.push("GROUP_BY");
+    if (logicalPlan.aggregate) blockers.push("AGGREGATE");
+    if (logicalPlan.rowNumberAlias) blockers.push("ROW_NUMBER");
+    if (logicalPlan.orderByList?.length && !orderSatisfied) blockers.push("ORDER_BY_SORT");
+    return blockers;
+  }
+
+  private resolveSelectExecutionMode(
+    logicalPlan: LogicalSelectPlan,
+    orderSatisfied: boolean,
+  ): { mode: SelectExecutionMode; blockers: SelectPipelineBlocker[] } {
+    const blockers = this.getSelectPipelineBlockers(logicalPlan, orderSatisfied);
+    return {
+      mode: blockers.length === 0 ? "PIPELINED" : "MATERIALIZED",
+      blockers,
+    };
+  }
+
+  private recordSelectExecutionPipelineStats(
+    key: string,
+    mode: SelectExecutionMode,
+    rowsVisited: number,
+    rowsReturned: number,
+    bufferedRows: number,
+    earlyStop: boolean,
+    blockers: SelectPipelineBlocker[],
+    joinSpill?: JoinSpillRuntimeStats,
+  ): void {
+    const stats = this.getOrCreateSelectExecutionPipelineStats(key);
+    stats.executions += 1;
+    if (mode === "PIPELINED") stats.pipelinedExecutions += 1;
+    else stats.materializedExecutions += 1;
+    if (earlyStop) stats.earlyStopExecutions += 1;
+    stats.rowsVisited += rowsVisited;
+    stats.rowsReturned += rowsReturned;
+    stats.maxBufferedRows = Math.max(stats.maxBufferedRows, bufferedRows);
+    stats.lastMode = mode;
+    stats.lastRowsVisited = rowsVisited;
+    stats.lastRowsReturned = rowsReturned;
+    stats.lastBufferedRows = bufferedRows;
+    stats.lastEarlyStop = earlyStop;
+    const joinSpillSteps = joinSpill?.steps ?? 0;
+    const joinSpillChunks = joinSpill?.chunks ?? 0;
+    const joinSpillRowsProcessed = joinSpill?.rowsProcessed ?? 0;
+    if (joinSpillSteps > 0) stats.joinSpillExecutions += 1;
+    stats.joinSpillChunks += joinSpillChunks;
+    stats.joinSpillRowsProcessed += joinSpillRowsProcessed;
+    stats.lastJoinSpillSteps = joinSpillSteps;
+    stats.lastJoinSpillChunks = joinSpillChunks;
+    stats.lastJoinSpillRowsProcessed = joinSpillRowsProcessed;
+    stats.lastBlockers = [...blockers];
+  }
+
+  private resolveCanonicalTableName(table: string): string | null {
+    const target = table.trim().toUpperCase();
+    if (!target) return null;
+    for (const tableName of this.schemas.keys()) {
+      if (tableName.toUpperCase() === target) return tableName;
+    }
+    return null;
+  }
+
+  private buildOptimizerHistogram(values: SqlPrimitive[]): OptimizerHistogramBucket[] {
+    if (values.length === 0) return [];
+
+    const frequencies = new Map<string, { value: SqlPrimitive; rowCount: number }>();
+    for (const value of values) {
+      const key = this.encodeTypedKey(value, "optimizer.stats.histogram");
+      const existing = frequencies.get(key);
+      if (existing) existing.rowCount += 1;
+      else frequencies.set(key, { value, rowCount: 1 });
+    }
+
+    const sorted = [...frequencies.values()].sort((a, b) => this.compareForOrder(a.value, b.value, "ASC"));
+    if (sorted.length === 0) return [];
+
+    const bucketCap = Math.min(OPTIMIZER_HISTOGRAM_MAX_BUCKETS, sorted.length);
+    const targetRowsPerBucket = Math.max(1, Math.ceil(values.length / bucketCap));
+    const out: OptimizerHistogramBucket[] = [];
+
+    let lowerBound = sorted[0]!.value;
+    let upperBound = sorted[0]!.value;
+    let rowCount = 0;
+    let ndv = 0;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const entry = sorted[i]!;
+      if (ndv === 0) lowerBound = entry.value;
+      upperBound = entry.value;
+      rowCount += entry.rowCount;
+      ndv += 1;
+
+      const isLastEntry = i === sorted.length - 1;
+      const remainingEntries = sorted.length - i - 1;
+      const remainingBuckets = bucketCap - out.length - 1;
+      const reachedTarget = rowCount >= targetRowsPerBucket;
+      const atBucketCapacity = out.length + 1 >= bucketCap;
+      const shouldClose = isLastEntry || (!atBucketCapacity && reachedTarget && remainingEntries >= remainingBuckets);
+
+      if (!shouldClose) continue;
+      out.push({ lowerBound, upperBound, rowCount, ndv });
+      rowCount = 0;
+      ndv = 0;
+    }
+
+    return out;
+  }
+
+  private collectOptimizerStatisticsForTable(table: string): OptimizerTableStatistics | null {
+    const schema = this.schemas.get(table);
+    const rows = this.tables.get(table);
+    if (!schema || !rows) return null;
+
+    const rowCount = rows.length;
+    const columns: OptimizerColumnStatistics[] = schema.columns.map((column) => {
+      let nullCount = 0;
+      const distinct = new Set<string>();
+      const nonNullValues: SqlPrimitive[] = [];
+
+      for (const row of rows) {
+        const rawValue = this.resolveRowValue(row, column.name);
+        if (rawValue === null || rawValue === undefined) {
+          nullCount += 1;
+          continue;
+        }
+
+        const value = rawValue as SqlPrimitive;
+        distinct.add(this.encodeTypedKey(value, `optimizer.stats.ndv:${table}.${column.name}`));
+        nonNullValues.push(value);
+      }
+
+      return {
+        column: column.name,
+        rowCount,
+        ndv: distinct.size,
+        nullCount,
+        nullRatio: rowCount > 0 ? nullCount / rowCount : 0,
+        histogram: this.buildOptimizerHistogram(nonNullValues),
+      };
+    });
+
+    return {
+      table,
+      rowCount,
+      analyzedAt: Date.now(),
+      columns,
+    };
+  }
+
+  private pickPredicateColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    whereClauses: WhereClause[],
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats || whereClauses.length === 0) return undefined;
+    for (const clause of whereClauses) {
+      const field = clause.field?.trim();
+      if (!field) continue;
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(field)) continue;
+      const hit = stats.columns.find((columnStats) => columnStats.column.toUpperCase() === field.toUpperCase());
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  private clampSelectivity(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    if (value <= 0) return 0;
+    if (value >= 1) return 1;
+    return value;
+  }
+
+  private parseSelectivityLiteral(
+    rawExpr: string,
+  ): { parsed: false; value: undefined } | { parsed: true; value: SqlPrimitive } {
+    const trimmed = rawExpr.trim();
+    if (!trimmed) return { parsed: false, value: undefined };
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return { parsed: false, value: undefined };
+
+    const isQuoted = (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      || (trimmed.startsWith("\"") && trimmed.endsWith("\""));
+    const isSimpleNumber = /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed);
+    const isSimpleBooleanOrNull = /^(TRUE|FALSE|NULL)$/i.test(trimmed);
+    if (!isQuoted && !isSimpleNumber && !isSimpleBooleanOrNull) {
+      return { parsed: false, value: undefined };
+    }
+
+    return { parsed: true, value: this.castValue(trimmed) as SqlPrimitive };
+  }
+
+  private resolveSelectivityColumnStats(
+    stats: OptimizerTableStatistics | undefined,
+    clause: WhereClause,
+  ): OptimizerColumnStatistics | undefined {
+    if (!stats) return undefined;
+
+    if (clause.valueExpr && !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(clause.valueExpr.trim())) {
+      return undefined;
+    }
+
+    const rawField = clause.field?.trim();
+    if (!rawField || !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(rawField)) return undefined;
+    const normalized = rawField.includes(".") ? rawField.split(".").at(-1) ?? rawField : rawField;
+    return stats.columns.find((columnStats) => columnStats.column.toUpperCase() === normalized.toUpperCase());
+  }
+
+  private estimateEqualitySelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literal: SqlPrimitive,
+  ): number {
+    if (literal === null || literal === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (!columnStats) return this.clampSelectivity(nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY);
+
+    if (tableRowCount > 0 && columnStats.histogram.length > 0) {
+      for (const bucket of columnStats.histogram) {
+        const geLower = this.compareByOp(literal, bucket.lowerBound, ">=");
+        const leUpper = this.compareByOp(literal, bucket.upperBound, "<=");
+        if (geLower !== "TRUE" || leUpper !== "TRUE") continue;
+
+        const bucketRatio = this.clampSelectivity(bucket.rowCount / tableRowCount);
+        if (bucket.ndv > 0) return this.clampSelectivity(bucketRatio / bucket.ndv);
+        break;
+      }
+    }
+
+    if (columnStats.ndv > 0) return this.clampSelectivity(nonNullRatio / columnStats.ndv);
+    return this.clampSelectivity(nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY);
+  }
+
+  private estimateLessThanSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literal: SqlPrimitive,
+    inclusive: boolean,
+  ): number {
+    if (literal === null || literal === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (!columnStats) return this.clampSelectivity(nonNullRatio * DEFAULT_RANGE_SELECTIVITY);
+    if (tableRowCount <= 0 || columnStats.histogram.length === 0) {
+      return this.clampSelectivity(nonNullRatio * DEFAULT_RANGE_SELECTIVITY);
+    }
+
+    let matchedRatio = 0;
+    for (const bucket of columnStats.histogram) {
+      const bucketRatio = this.clampSelectivity(bucket.rowCount / tableRowCount);
+      const fullyMatched = this.compareByOp(bucket.upperBound, literal, inclusive ? "<=" : "<");
+      if (fullyMatched === "TRUE") {
+        matchedRatio += bucketRatio;
+        continue;
+      }
+
+      const noMatch = this.compareByOp(bucket.lowerBound, literal, inclusive ? ">" : ">=");
+      if (noMatch === "TRUE") continue;
+
+      matchedRatio += bucketRatio * 0.5;
+    }
+    return this.clampSelectivity(Math.min(nonNullRatio, matchedRatio));
+  }
+
+  private estimateComparisonSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    op: ComparePredicate,
+    literal: SqlPrimitive,
+  ): number {
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+
+    if (literal === null || literal === undefined) return 0;
+
+    switch (op) {
+      case "=":
+        return this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+      case "!=":
+      case "<>": {
+        const eq = this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+        return this.clampSelectivity(nonNullRatio - eq);
+      }
+      case "<":
+        return this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, false);
+      case "<=":
+        return this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, true);
+      case ">": {
+        const le = this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, true);
+        return this.clampSelectivity(nonNullRatio - le);
+      }
+      case ">=": {
+        const lt = this.estimateLessThanSelectivity(tableRowCount, columnStats, literal, false);
+        return this.clampSelectivity(nonNullRatio - lt);
+      }
+      default:
+        return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+    }
+  }
+
+  private estimateInListSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    literals: SqlPrimitive[],
+    unresolvedValueCount = 0,
+  ): number {
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    if (literals.length === 0 && unresolvedValueCount <= 0) return 0;
+
+    const unique = new Set<string>();
+    let matched = 0;
+    for (const literal of literals) {
+      if (literal === null || literal === undefined) continue;
+      const key = this.encodeTypedKey(literal, "optimizer.selectivity.in");
+      if (unique.has(key)) continue;
+      unique.add(key);
+      matched += this.estimateEqualitySelectivity(tableRowCount, columnStats, literal);
+    }
+    if (unresolvedValueCount > 0) {
+      matched += nonNullRatio * DEFAULT_EQUALITY_SELECTIVITY * unresolvedValueCount;
+    }
+    return this.clampSelectivity(Math.min(nonNullRatio, matched));
+  }
+
+  private estimateLikeSelectivity(
+    tableRowCount: number,
+    columnStats: OptimizerColumnStatistics | undefined,
+    rawPattern: SqlPrimitive,
+  ): number {
+    if (rawPattern === null || rawPattern === undefined) return 0;
+
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+    const pattern = String(rawPattern);
+
+    if (!pattern.includes("%") && !pattern.includes("_")) {
+      return this.estimateEqualitySelectivity(tableRowCount, columnStats, pattern);
+    }
+
+    if (/^[^%_]+%$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.1);
+    if (/^%[^%_]+$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.12);
+    if (/^%[^%_]+%$/.test(pattern)) return this.clampSelectivity(nonNullRatio * 0.25);
+    if (pattern.includes("_")) return this.clampSelectivity(nonNullRatio * 0.2);
+    return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+  }
+
+  private estimateClauseSelectivity(
+    clause: WhereClause,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    const columnStats = this.resolveSelectivityColumnStats(stats, clause);
+    const nullRatio = this.clampSelectivity(columnStats?.nullRatio ?? 0);
+    const nonNullRatio = this.clampSelectivity(1 - nullRatio);
+
+    switch (clause.op) {
+      case "IS_NULL":
+        return columnStats ? this.clampSelectivity(columnStats.nullRatio) : 0.1;
+      case "IS_NOT_NULL":
+        return columnStats ? nonNullRatio : 0.9;
+      case "=":
+      case "!=":
+      case "<>":
+      case ">":
+      case "<":
+      case ">=":
+      case "<=": {
+        const raw = clause.valueExprs?.[0];
+        if (!raw) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        const parsedLiteral = this.parseSelectivityLiteral(raw);
+        if (!parsedLiteral.parsed) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        return this.estimateComparisonSelectivity(
+          tableRowCount,
+          columnStats,
+          clause.op as ComparePredicate,
+          parsedLiteral.value as SqlPrimitive,
+        );
+      }
+      case "BETWEEN":
+      case "NOT_BETWEEN": {
+        const lowerRaw = clause.valueExprs?.[0];
+        const upperRaw = clause.valueExprs?.[1];
+        if (!lowerRaw || !upperRaw) return this.clampSelectivity(DEFAULT_RANGE_SELECTIVITY * nonNullRatio);
+
+        const lower = this.parseSelectivityLiteral(lowerRaw);
+        const upper = this.parseSelectivityLiteral(upperRaw);
+        if (!lower.parsed || !upper.parsed) return this.clampSelectivity(DEFAULT_RANGE_SELECTIVITY * nonNullRatio);
+        if (lower.value === null || upper.value === null) return 0;
+        const lowerValue = lower.value;
+        const upperValue = upper.value;
+
+        const invalidRange = this.compareByOp(lowerValue, upperValue, ">") === "TRUE";
+        const between = invalidRange
+          ? 0
+          : this.clampSelectivity(
+            this.estimateLessThanSelectivity(tableRowCount, columnStats, upperValue, true)
+            - this.estimateLessThanSelectivity(tableRowCount, columnStats, lowerValue, false),
+          );
+
+        if (clause.op === "BETWEEN") return between;
+        return this.clampSelectivity(nonNullRatio - between);
+      }
+      case "IN":
+      case "NOT_IN": {
+        const literals: SqlPrimitive[] = [];
+        let unresolvedValueCount = 0;
+        let hasNullLiteral = false;
+
+        if (clause.valueExprs?.length) {
+          for (const expr of clause.valueExprs) {
+            const parsedLiteral = this.parseSelectivityLiteral(expr);
+            if (!parsedLiteral.parsed) {
+              unresolvedValueCount += 1;
+              continue;
+            }
+            const literal = parsedLiteral.value as SqlPrimitive;
+            literals.push(literal);
+            if (literal === null) hasNullLiteral = true;
+          }
+        } else if (clause.values?.length) {
+          for (const literal of clause.values) {
+            const v = literal as SqlPrimitive;
+            literals.push(v);
+            if (v === null) hasNullLiteral = true;
+          }
+        }
+
+        const inSelectivity = this.estimateInListSelectivity(tableRowCount, columnStats, literals, unresolvedValueCount);
+        if (clause.op === "IN") return inSelectivity;
+        if (hasNullLiteral) return 0;
+        const base = this.clampSelectivity(nonNullRatio - inSelectivity);
+        return unresolvedValueCount > 0 ? this.clampSelectivity(base * 0.5) : base;
+      }
+      case "LIKE":
+      case "NOT_LIKE": {
+        const patternRaw = clause.valueExprs?.[0];
+        if (!patternRaw) return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+        const parsedPattern = this.parseSelectivityLiteral(patternRaw);
+        if (!parsedPattern.parsed) return this.clampSelectivity(nonNullRatio * DEFAULT_LIKE_SELECTIVITY);
+        const like = this.estimateLikeSelectivity(tableRowCount, columnStats, parsedPattern.value as SqlPrimitive);
+        if (clause.op === "LIKE") return like;
+        return this.clampSelectivity(nonNullRatio - like);
+      }
+      case "IS_DISTINCT_FROM":
+      case "IS_NOT_DISTINCT_FROM": {
+        const rightRaw = clause.valueExprs?.[0];
+        if (!rightRaw) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+        const parsedLiteral = this.parseSelectivityLiteral(rightRaw);
+        if (!parsedLiteral.parsed) return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+
+        let isNotDistinct = 0;
+        if (parsedLiteral.value === null || parsedLiteral.value === undefined) {
+          isNotDistinct = columnStats ? this.clampSelectivity(columnStats.nullRatio) : 0.1;
+        } else {
+          isNotDistinct = this.estimateEqualitySelectivity(tableRowCount, columnStats, parsedLiteral.value as SqlPrimitive);
+        }
+        if (clause.op === "IS_NOT_DISTINCT_FROM") return isNotDistinct;
+        return this.clampSelectivity(1 - isNotDistinct);
+      }
+      default:
+        return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+    }
+  }
+
+  private estimateWhereTreeSelectivity(
+    node: WhereExprNode,
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    if (node.type === "clause") return this.estimateClauseSelectivity(node.clause, tableRowCount, stats);
+    if (node.type === "not") return this.clampSelectivity(1 - this.estimateWhereTreeSelectivity(node.node, tableRowCount, stats));
+
+    const left = this.estimateWhereTreeSelectivity(node.left, tableRowCount, stats);
+    const right = this.estimateWhereTreeSelectivity(node.right, tableRowCount, stats);
+    if (node.type === "and") return this.clampSelectivity(left * right);
+    return this.clampSelectivity(left + right - left * right);
+  }
+
+  private estimateWhereClausesSelectivity(
+    whereClauses: WhereClause[],
+    tableRowCount: number,
+    stats: OptimizerTableStatistics | undefined,
+  ): number {
+    let acc: number | null = null;
+    for (const clause of whereClauses) {
+      const clauseSelectivity = this.estimateClauseSelectivity(clause, tableRowCount, stats);
+      if (acc === null) {
+        acc = clauseSelectivity;
+        continue;
+      }
+      if (clause.logic === "OR") {
+        acc = this.clampSelectivity(acc + clauseSelectivity - acc * clauseSelectivity);
+      } else {
+        acc = this.clampSelectivity(acc * clauseSelectivity);
+      }
+    }
+    return this.clampSelectivity(acc ?? 1);
+  }
+
+  private estimatePredicateSelectivity(
+    parsed: Pick<ParsedSelect, "whereAst" | "whereTree" | "whereClauses">,
+    stats: OptimizerTableStatistics | undefined,
+    tableRowCount: number,
+  ): number {
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    if (!hasPredicate) return 1;
+    if (parsed.whereTree) return this.estimateWhereTreeSelectivity(parsed.whereTree, tableRowCount, stats);
+    if (parsed.whereClauses.length > 0) return this.estimateWhereClausesSelectivity(parsed.whereClauses, tableRowCount, stats);
+    return this.clampSelectivity(DEFAULT_PREDICATE_SELECTIVITY);
+  }
+
+  private getPersistedOptimizerStatistics(table?: string, options?: OptimizerStatisticsReadOptions): OptimizerTableStatistics[] {
+    const out: OptimizerTableStatistics[] = [];
+    const resolvedTable = table ? this.resolveCanonicalOptimizerStatsTableName(table) : null;
+    if (table && !resolvedTable) return out;
+    if (options?.version !== undefined && !resolvedTable) return out;
+
+    const tables = resolvedTable
+      ? [resolvedTable]
+      : [...this.optimizerStatsVersionObjects.keys()].sort((a, b) => this.textOrder(a, b));
+
+    for (const tableName of tables) {
+      const picked = this.pickOptimizerStatsVersionObject(tableName, {
+        visibility: options?.visibility,
+        version: options?.version,
+      });
+      if (!picked) continue;
+      out.push(this.cloneOptimizerTableStatistics(picked.statistics));
+    }
+    return out;
+  }
+
+  getOptimizerStatistics(table?: string, options?: OptimizerStatisticsReadOptions): OptimizerTableStatistics[] {
+    const source = options?.source ?? "live";
+    if (source === "versioned") return this.getPersistedOptimizerStatistics(table, options);
+
+    const out: OptimizerTableStatistics[] = [];
+    const resolvedTable = table ? this.resolveCanonicalTableName(table) : null;
+    if (table && !resolvedTable) return out;
+
+    const tables = resolvedTable ? [resolvedTable] : [...this.schemas.keys()].sort((a, b) => this.textOrder(a, b));
+    for (const tableName of tables) {
+      const stats = this.collectOptimizerStatisticsForTable(tableName);
+      if (stats) out.push(stats);
+    }
+    return out;
+  }
+
+  replayOptimizerStatistics(
+    table: string,
+    options?: { visibility?: "pending" | "confirmed"; version?: number },
+  ): OptimizerTableStatistics | null {
+    return this.getOptimizerStatistics(table, {
+      source: "versioned",
+      visibility: options?.visibility,
+      version: options?.version,
+    })[0] ?? null;
+  }
+
+  compareOptimizerStatisticsVersions(
+    table: string,
+    fromVersion: number,
+    toVersion: number,
+  ): OptimizerStatisticsVersionDiff | null {
+    if (!Number.isInteger(fromVersion) || !Number.isInteger(toVersion)) return null;
+    if (fromVersion <= 0 || toVersion <= 0) return null;
+
+    const canonical = this.resolveCanonicalOptimizerStatsTableName(table);
+    if (!canonical) return null;
+
+    const history = this.optimizerStatsVersionObjects.get(canonical) ?? [];
+    const from = history.find((object) => object.currentVersion === fromVersion);
+    const to = history.find((object) => object.currentVersion === toVersion);
+    if (!from || !to) return null;
+
+    const fromColumns = new Map<string, OptimizerColumnStatistics>();
+    const toColumns = new Map<string, OptimizerColumnStatistics>();
+    for (const column of from.statistics.columns) fromColumns.set(column.column.toUpperCase(), column);
+    for (const column of to.statistics.columns) toColumns.set(column.column.toUpperCase(), column);
+
+    const allColumnNames = [...new Set([...fromColumns.keys(), ...toColumns.keys()])].sort((a, b) => this.textOrder(a, b));
+    const addedColumns: string[] = [];
+    const removedColumns: string[] = [];
+    const changedColumns: OptimizerStatisticsVersionDiffColumn[] = [];
+
+    for (const name of allColumnNames) {
+      const fromColumn = fromColumns.get(name);
+      const toColumn = toColumns.get(name);
+
+      if (!fromColumn && toColumn) {
+        addedColumns.push(toColumn.column);
+        continue;
+      }
+      if (fromColumn && !toColumn) {
+        removedColumns.push(fromColumn.column);
+        continue;
+      }
+      if (!fromColumn || !toColumn) continue;
+
+      const fromHistogramRowCount = fromColumn.histogram.reduce((sum, bucket) => sum + bucket.rowCount, 0);
+      const toHistogramRowCount = toColumn.histogram.reduce((sum, bucket) => sum + bucket.rowCount, 0);
+      const fromHistogramNdv = fromColumn.histogram.reduce((sum, bucket) => sum + bucket.ndv, 0);
+      const toHistogramNdv = toColumn.histogram.reduce((sum, bucket) => sum + bucket.ndv, 0);
+
+      const change: OptimizerStatisticsVersionDiffColumn = {
+        column: toColumn.column,
+        rowCountDelta: toColumn.rowCount - fromColumn.rowCount,
+        ndvDelta: toColumn.ndv - fromColumn.ndv,
+        nullCountDelta: toColumn.nullCount - fromColumn.nullCount,
+        nullRatioDelta: toColumn.nullRatio - fromColumn.nullRatio,
+        histogramBucketDelta: toColumn.histogram.length - fromColumn.histogram.length,
+        histogramRowCountDelta: toHistogramRowCount - fromHistogramRowCount,
+        histogramNdvDelta: toHistogramNdv - fromHistogramNdv,
+      };
+
+      if (
+        change.rowCountDelta !== 0
+        || change.ndvDelta !== 0
+        || change.nullCountDelta !== 0
+        || change.nullRatioDelta !== 0
+        || change.histogramBucketDelta !== 0
+        || change.histogramRowCountDelta !== 0
+        || change.histogramNdvDelta !== 0
+      ) {
+        changedColumns.push(change);
+      }
+    }
+
+    addedColumns.sort((a, b) => this.textOrder(a, b));
+    removedColumns.sort((a, b) => this.textOrder(a, b));
+    changedColumns.sort((a, b) => this.textOrder(a.column, b.column));
+
+    return {
+      table: canonical,
+      fromVersion,
+      toVersion,
+      rowCountDelta: to.statistics.rowCount - from.statistics.rowCount,
+      analyzedAtDeltaMs: to.analyzedAt - from.analyzedAt,
+      addedColumns,
+      removedColumns,
+      changedColumns,
+    };
+  }
+
+  getSelectPlanStability(sql?: string): Array<{
+    key: string;
+    preferredMethod: PhysicalAccessPathMethod;
+    preferredIndexName?: string;
+    preferredIndexColumn?: string;
+    badPlanFallbackRemaining: number;
+    badPlanFallbackCount: number;
+    stablePinCount: number;
+    planSwitchCount: number;
+    executions: number;
+    lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+  }> {
+    const target = sql ? sql.trim().replace(/\s+/g, " ") : undefined;
+    const out: Array<{
+      key: string;
+      preferredMethod: PhysicalAccessPathMethod;
+      preferredIndexName?: string;
+      preferredIndexColumn?: string;
+      badPlanFallbackRemaining: number;
+      badPlanFallbackCount: number;
+      stablePinCount: number;
+      planSwitchCount: number;
+      executions: number;
+      lastReason: PlanStabilityReason | "BAD_PLAN_TRIGGER";
+    }> = [];
+
+    for (const [key, state] of this.selectPlanStability.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        preferredMethod: state.preferredMethod,
+        preferredIndexName: state.preferredIndexName,
+        preferredIndexColumn: state.preferredIndexColumn,
+        badPlanFallbackRemaining: state.badPlanFallbackRemaining,
+        badPlanFallbackCount: state.badPlanFallbackCount,
+        stablePinCount: state.stablePinCount,
+        planSwitchCount: state.planSwitchCount,
+        executions: state.executions,
+        lastReason: state.lastReason,
+      });
+    }
+    out.sort((a, b) => this.textOrder(a.key, b.key));
+    return out;
+  }
+
+  getSelectExecutionPipelineStats(sql?: string): Array<{
+    key: string;
+    executions: number;
+    pipelinedExecutions: number;
+    materializedExecutions: number;
+    earlyStopExecutions: number;
+    rowsVisited: number;
+    rowsReturned: number;
+    maxBufferedRows: number;
+    joinSpillExecutions: number;
+    joinSpillChunks: number;
+    joinSpillRowsProcessed: number;
+    lastMode: SelectExecutionMode;
+    lastRowsVisited: number;
+    lastRowsReturned: number;
+    lastBufferedRows: number;
+    lastEarlyStop: boolean;
+    lastJoinSpillSteps: number;
+    lastJoinSpillChunks: number;
+    lastJoinSpillRowsProcessed: number;
+    lastBlockers: SelectPipelineBlocker[];
+  }> {
+    const target = sql?.trim().replace(/\s+/g, " ");
+    const out: Array<{
+      key: string;
+      executions: number;
+      pipelinedExecutions: number;
+      materializedExecutions: number;
+      earlyStopExecutions: number;
+      rowsVisited: number;
+      rowsReturned: number;
+      maxBufferedRows: number;
+      joinSpillExecutions: number;
+      joinSpillChunks: number;
+      joinSpillRowsProcessed: number;
+      lastMode: SelectExecutionMode;
+      lastRowsVisited: number;
+      lastRowsReturned: number;
+      lastBufferedRows: number;
+      lastEarlyStop: boolean;
+      lastJoinSpillSteps: number;
+      lastJoinSpillChunks: number;
+      lastJoinSpillRowsProcessed: number;
+      lastBlockers: SelectPipelineBlocker[];
+    }> = [];
+
+    for (const [key, stats] of this.selectExecutionPipelineStats.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        executions: stats.executions,
+        pipelinedExecutions: stats.pipelinedExecutions,
+        materializedExecutions: stats.materializedExecutions,
+        earlyStopExecutions: stats.earlyStopExecutions,
+        rowsVisited: stats.rowsVisited,
+        rowsReturned: stats.rowsReturned,
+        maxBufferedRows: stats.maxBufferedRows,
+        joinSpillExecutions: stats.joinSpillExecutions,
+        joinSpillChunks: stats.joinSpillChunks,
+        joinSpillRowsProcessed: stats.joinSpillRowsProcessed,
+        lastMode: stats.lastMode,
+        lastRowsVisited: stats.lastRowsVisited,
+        lastRowsReturned: stats.lastRowsReturned,
+        lastBufferedRows: stats.lastBufferedRows,
+        lastEarlyStop: stats.lastEarlyStop,
+        lastJoinSpillSteps: stats.lastJoinSpillSteps,
+        lastJoinSpillChunks: stats.lastJoinSpillChunks,
+        lastJoinSpillRowsProcessed: stats.lastJoinSpillRowsProcessed,
+        lastBlockers: [...stats.lastBlockers],
+      });
+    }
+
+    out.sort((a, b) => this.textOrder(a.key, b.key));
+    return out;
+  }
+
+  getSubqueryExecutionStats(subquerySql?: string): Array<{
+    key: string;
+    executions: number;
+    correlatedExecutions: number;
+    cacheHits: number;
+    cacheMisses: number;
+    rowsScanned: number;
+    rowsReturned: number;
+    budgetExceededCount: number;
+  }> {
+    const target = subquerySql?.trim().replace(/\s+/g, " ");
+    const out: Array<{
+      key: string;
+      executions: number;
+      correlatedExecutions: number;
+      cacheHits: number;
+      cacheMisses: number;
+      rowsScanned: number;
+      rowsReturned: number;
+      budgetExceededCount: number;
+    }> = [];
+
+    for (const [key, stats] of this.subqueryExecutionStats.entries()) {
+      if (target && key !== target) continue;
+      out.push({
+        key,
+        executions: stats.executions,
+        correlatedExecutions: stats.correlatedExecutions,
+        cacheHits: stats.cacheHits,
+        cacheMisses: stats.cacheMisses,
+        rowsScanned: stats.rowsScanned,
+        rowsReturned: stats.rowsReturned,
+        budgetExceededCount: stats.budgetExceededCount,
+      });
+    }
+    out.sort((a, b) => this.textOrder(a.key, b.key));
+    return out;
+  }
+
+  private buildSelectExecutionPlan(
+    parsed: ParsedSelect,
+    bucket: SqlRow[],
+    opts?: { refreshIndexes?: boolean; trackLookupStats?: boolean; stabilityKey?: string },
+  ): SelectExecutionPlan {
+    const logicalPlan = this.buildLogicalSelectPlan(parsed);
+    const canUseSingleTableIndexes = logicalPlan.joins.length === 0;
+    const optimizerStats = this.getOptimizerStatistics(parsed.table)[0];
+    const tableRowCount = optimizerStats?.rowCount ?? bucket.length;
+    const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+    const predicateSelectivity = this.estimatePredicateSelectivity(parsed, optimizerStats, tableRowCount);
+    const estimatedFilteredRows = hasPredicate
+      ? Math.max(0, Math.min(tableRowCount, Math.ceil(tableRowCount * predicateSelectivity)))
+      : tableRowCount;
+
+    if (canUseSingleTableIndexes && (opts?.refreshIndexes ?? true)) {
+      this.rebuildSecondaryIndexesForTable(parsed.table);
+    }
+
+    const candidates: PhysicalSelectRuntimePath[] = [];
+    const addCandidate = (
+      method: PhysicalAccessPathMethod,
+      rows: SqlRow[],
+      orderSatisfied: boolean,
+      indexName?: string,
+      indexColumn?: string,
+      indexStrategy?: PhysicalIndexAccessStrategy,
+    ): void => {
+      const resolvedIndexStrategy = indexStrategy ?? this.resolvePhysicalIndexAccessStrategy(parsed, method, indexColumn);
+      const scannedRows = method === "TABLE_SCAN" ? tableRowCount : rows.length;
+      const estimatedRows = hasPredicate ? Math.min(scannedRows, estimatedFilteredRows) : scannedRows;
+      const estimatedCost = this.estimatePhysicalAccessPathCost(
+        parsed,
+        tableRowCount,
+        method,
+        scannedRows,
+        estimatedRows,
+        orderSatisfied,
+        resolvedIndexStrategy,
+      );
+      candidates.push({
+        method,
+        indexStrategy: resolvedIndexStrategy,
+        rows,
+        orderSatisfied,
+        indexName,
+        indexColumn,
+        estimatedRows,
+        estimatedCost,
+      });
+    };
+
+    addCandidate("TABLE_SCAN", bucket, false, undefined, undefined, "FULL_TABLE_SCAN");
+
+    if (canUseSingleTableIndexes) {
+      const ordered = this.getBtreeOrderedScanCandidates(
+        parsed.table,
+        bucket,
+        {
+          orderByList: logicalPlan.orderByList,
+          whereClauses: parsed.whereClauses,
+          groupBy: logicalPlan.groupBy,
+          aggregate: logicalPlan.aggregate,
+          rowNumberAlias: logicalPlan.rowNumberAlias,
+          having: logicalPlan.having,
+        },
+        false,
+      );
+      if (ordered) {
+        addCandidate("BTREE_ORDERED_SCAN", ordered.rows, ordered.orderSatisfied, ordered.indexName, ordered.column);
+      }
+
+      if (parsed.whereClauses.length > 0) {
+        const hash = this.getHashIndexedCandidates(parsed.table, parsed.whereClauses, false);
+        if (hash) addCandidate("HASH_INDEX_LOOKUP", hash.rows, false, hash.indexName, hash.column);
+
+        const btree = this.getBtreeIndexedCandidates(parsed.table, parsed.whereClauses, false);
+        if (btree) addCandidate("BTREE_INDEX_LOOKUP", btree.rows, false, btree.indexName, btree.column);
+      }
+    }
+
+    const optimizerChosen = this.pickBestPhysicalAccessPath(candidates);
+    const stabilized = this.applySelectPlanStabilityPolicy(opts?.stabilityKey, optimizerChosen, candidates);
+    const chosenRuntime = stabilized.chosen;
+    if ((opts?.trackLookupStats ?? true) && chosenRuntime.method !== "TABLE_SCAN") {
+      this.bumpIndexLookupStats(parsed.table, chosenRuntime.rows.length > 0);
+    }
+
+    const toPhysicalPath = (candidate: PhysicalSelectRuntimePath): PhysicalSelectAccessPath => ({
+      method: candidate.method,
+      indexStrategy: candidate.indexStrategy,
+      estimatedCost: candidate.estimatedCost,
+      estimatedRows: candidate.estimatedRows,
+      orderSatisfied: candidate.orderSatisfied,
+      indexName: candidate.indexName,
+      indexColumn: candidate.indexColumn,
+    });
+
+    const joinAlgorithms = this.buildPhysicalJoinPlan(chosenRuntime.rows.length, logicalPlan.joins);
+
+    return {
+      logical: logicalPlan,
+      physical: {
+        optimizerChosen: toPhysicalPath(optimizerChosen),
+        chosen: toPhysicalPath(chosenRuntime),
+        candidates: candidates.map((candidate) => toPhysicalPath(candidate)),
+        joinAlgorithms,
+        stabilityReason: stabilized.reason,
+        stabilityPinned: stabilized.reason !== "NONE",
+      },
+      scannedRows: chosenRuntime.rows,
+      orderSatisfied: chosenRuntime.orderSatisfied,
+    };
+  }
+
+  private formatPhysicalCandidates(candidates: PhysicalSelectAccessPath[]): string {
+    return candidates
+      .map((candidate) => {
+        const parts = [
+          `cost=${candidate.estimatedCost}`,
+          `rows=${candidate.estimatedRows}`,
+          `order=${candidate.orderSatisfied ? "Y" : "N"}`,
+          `access=${candidate.indexStrategy}`,
+        ];
+        if (candidate.indexName) parts.push(`index=${candidate.indexName}`);
+        if (candidate.indexColumn) parts.push(`column=${candidate.indexColumn}`);
+        return `${candidate.method}[${parts.join(",")}]`;
+      })
+      .join(" ; ");
+  }
+
   async query(sql: string): Promise<QueryResult> {
     const normalized = normalizeSql(sql);
     this.logger.debug("query start", {
@@ -2010,36 +5331,46 @@ export class WalrusSqlClient {
       const cachedRows = this.getCachedQuery(normalizedSql);
       if (cachedRows) return { rows: cachedRows };
 
-      const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+      this.enterSubqueryRuntimeScope();
+      try {
+        const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
 
-    if (ast.kind === "union") {
-      const rightPlan = this.splitSelectTail(ast.rightSql);
+        if (ast.kind === "union" || ast.kind === "intersect" || ast.kind === "except") {
+          const setOpToken = ast.kind === "union" ? "UNION" : ast.kind === "intersect" ? "INTERSECT" : "EXCEPT";
+          const rightPlan = this.splitSelectTail(ast.rightSql, setOpToken);
 
-      const left = await this.query(ast.leftSql);
-      const right = await this.query(rightPlan.baseSql);
+          const left = await this.query(ast.leftSql);
+          const right = await this.query(rightPlan.baseSql);
 
-      const inferredLeftColumns = this.inferUnionColumns(ast.leftSql);
-      const leftColumns =
-        inferredLeftColumns
-        ?? (left.rows[0] ? Object.keys(left.rows[0]) : right.rows[0] ? Object.keys(right.rows[0]) : undefined);
+          const leftStaticArity = this.inferSetOpArity(ast.leftSql);
+          const rightStaticArity = this.inferSetOpArity(rightPlan.baseSql);
+          const leftRuntimeColumns = this.inferRuntimeProjectionColumns(left.rows);
+          const rightRuntimeColumns = this.inferRuntimeProjectionColumns(right.rows);
+          const leftArity = leftRuntimeColumns?.length ?? leftStaticArity;
+          const rightArity = rightRuntimeColumns?.length ?? rightStaticArity;
+          this.assertSetOpArityCompatible(leftArity, rightArity, setOpToken);
 
-      const normalizedLeft = leftColumns ? left.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : left.rows;
-      const normalizedRight = leftColumns ? right.rows.map((row) => this.normalizeUnionRow(row, leftColumns)) : right.rows;
+          const leftColumns =
+            leftRuntimeColumns
+            ?? this.inferSetOpColumns(ast.leftSql)
+            ?? rightRuntimeColumns
+            ?? this.inferSetOpColumns(rightPlan.baseSql);
 
-      const merged = ast.all
-        ? [...normalizedLeft, ...normalizedRight]
-        : (() => {
-            const dedup = new Map<string, SqlRow>();
-            for (const row of [...normalizedLeft, ...normalizedRight]) {
-              dedup.set(this.makeRowKey(row), row);
-            }
-            return [...dedup.values()];
-          })();
+          const normalizedLeft =
+            leftColumns ? left.rows.map((row) => this.normalizeSetOpRow(row, leftColumns, setOpToken)) : left.rows;
+          const normalizedRight =
+            leftColumns ? right.rows.map((row) => this.normalizeSetOpRow(row, leftColumns, setOpToken)) : right.rows;
 
-      const ordered = this.applyOrder(merged, rightPlan.orderByList);
-      const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
-      return this.buildQueryResult(normalizedSql, paged);
-    }
+          const merged = ast.kind === "union"
+            ? this.combineUnionRows(normalizedLeft, normalizedRight, ast.all)
+            : ast.kind === "intersect"
+              ? this.combineIntersectRows(normalizedLeft, normalizedRight, ast.all)
+              : this.combineExceptRows(normalizedLeft, normalizedRight, ast.all);
+
+          const ordered = this.applyOrder(merged, rightPlan.orderByList);
+          const paged = this.applyPage(ordered, rightPlan.offset, rightPlan.limit);
+          return this.buildQueryResult(normalizedSql, paged);
+        }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
       const { subquerySql, alias, rewrittenSql } = ast.from;
@@ -2061,103 +5392,266 @@ export class WalrusSqlClient {
     }
 
     const parsed = this.parseSelect(normalizedSql, sql);
+    const planStabilityKey = parsed.explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "").trim() : normalizedSql;
+    const materializedViewSources = await this.materializeSelectViewSources(parsed);
+    try {
+      if (parsed.explain) {
+        const explainBucket = this.tables.get(parsed.table) ?? [];
+        const explainPlan = this.buildSelectExecutionPlan(parsed, explainBucket, {
+          refreshIndexes: false,
+          trackLookupStats: false,
+          stabilityKey: planStabilityKey,
+        });
+        const explainExecutionMode = this.resolveSelectExecutionMode(explainPlan.logical, explainPlan.orderSatisfied);
+        const explainStability = this.getSelectPlanStability(planStabilityKey)[0];
+        const explainStats = this.getOptimizerStatistics(parsed.table)[0];
+        const predicateStats = this.pickPredicateColumnStats(explainStats, parsed.whereClauses);
+        const hasPredicate = Boolean(parsed.whereAst || parsed.whereTree || parsed.whereClauses.length > 0);
+        const explainTableRows = explainStats?.rowCount ?? explainBucket.length;
+        const predicateSelectivity = hasPredicate
+          ? this.estimatePredicateSelectivity(parsed, explainStats, explainTableRows)
+          : 1;
+        return this.buildQueryResult(normalizedSql, [
+          {
+            type: "EXPLAIN",
+            table: parsed.table,
+            where: parsed.where ?? null,
+            groupBy: parsed.groupBy?.join(",") ?? null,
+            aggregate: parsed.aggregate ?? null,
+            orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
+            limit: parsed.limit ?? null,
+            offset: parsed.offset ?? null,
+            mode: this.opts.mode ?? "simulator",
+            join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
+            joins: parsed.joins?.length
+              ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
+              : null,
+            logicalRewriteRules: explainPlan.logical.rewriteRules.length ? explainPlan.logical.rewriteRules.join(",") : null,
+            logicalPredicateSource: explainPlan.logical.predicateSource,
+            logicalJoinCount: explainPlan.logical.joins.length,
+            logicalJoinReorderApplied: explainPlan.logical.joinReorder.applied,
+            logicalJoinReorderAlgorithm: explainPlan.logical.joinReorder.algorithm,
+            logicalJoinReorderCost: explainPlan.logical.joinReorder.estimatedCost,
+            logicalJoinOrderOriginal: explainPlan.logical.joinReorder.originalJoinOrder.length
+              ? explainPlan.logical.joinReorder.originalJoinOrder.join(" -> ")
+              : null,
+            logicalJoinOrderFinal: explainPlan.logical.joinReorder.finalJoinOrder.length
+              ? explainPlan.logical.joinReorder.finalJoinOrder.join(" -> ")
+              : null,
+            physicalJoinCount: explainPlan.physical.joinAlgorithms.length,
+            physicalJoinAlgorithms: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms.map((step) => step.algorithm).join(" -> ")
+              : null,
+            physicalJoinMemoryBudgetRows: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms[0]!.memoryBudgetRows
+              : this.getJoinMemoryBudgetRows(),
+            physicalJoinSpillChunkRows: this.getJoinSpillChunkRows(),
+            physicalJoinPlan: explainPlan.physical.joinAlgorithms.length
+              ? explainPlan.physical.joinAlgorithms
+                .map((step, idx) =>
+                  `#${idx + 1}:${step.algorithm}[left=${step.leftRows},right=${step.rightRows},out=${step.estimatedOutputRows},cost=${step.estimatedCost},mem=${step.estimatedMemoryRows}/${step.memoryBudgetRows},budgetConstrained=${step.memoryBudgetConstrained}]`)
+                .join(" ; ")
+              : null,
+            physicalOptimizerAccessPath: explainPlan.physical.optimizerChosen.method,
+            physicalOptimizerIndexStrategy: explainPlan.physical.optimizerChosen.indexStrategy,
+            physicalOptimizerCost: explainPlan.physical.optimizerChosen.estimatedCost,
+            physicalOptimizerEstimatedRows: explainPlan.physical.optimizerChosen.estimatedRows,
+            physicalAccessPath: explainPlan.physical.chosen.method,
+            physicalIndexStrategy: explainPlan.physical.chosen.indexStrategy,
+            physicalCost: explainPlan.physical.chosen.estimatedCost,
+            physicalEstimatedRows: explainPlan.physical.chosen.estimatedRows,
+            physicalOrderSatisfied: explainPlan.physical.chosen.orderSatisfied,
+            physicalStabilityReason: explainPlan.physical.stabilityReason,
+            physicalStabilityPinned: explainPlan.physical.stabilityPinned,
+            physicalBadPlanFallbackRemaining: explainStability?.badPlanFallbackRemaining ?? 0,
+            physicalBadPlanFallbackCount: explainStability?.badPlanFallbackCount ?? 0,
+            physicalStablePinCount: explainStability?.stablePinCount ?? 0,
+            physicalPlanSwitchCount: explainStability?.planSwitchCount ?? 0,
+            physicalPlanExecutions: explainStability?.executions ?? 0,
+            physicalCandidates: this.formatPhysicalCandidates(explainPlan.physical.candidates),
+            executionPipelineEligible: explainExecutionMode.mode === "PIPELINED",
+            executionPipelineMode: explainExecutionMode.mode,
+            executionPipelineBlockers: explainExecutionMode.blockers.length
+              ? explainExecutionMode.blockers.join(",")
+              : null,
+            statsAnalyzedAt: explainStats?.analyzedAt ?? null,
+            statsTableRowCount: explainTableRows,
+            statsColumnCount: explainStats?.columns.length ?? 0,
+            statsPredicateColumn: predicateStats?.column ?? null,
+            statsPredicateNdv: predicateStats?.ndv ?? null,
+            statsPredicateNullRatio: predicateStats?.nullRatio ?? null,
+            statsPredicateHistogramBuckets: predicateStats?.histogram.length ?? null,
+            statsPredicateSelectivity: hasPredicate ? predicateSelectivity : null,
+            statsPredicateEstimatedRows: hasPredicate ? Math.ceil(explainTableRows * predicateSelectivity) : null,
+          },
+        ]);
+      }
 
-    if (parsed.explain) {
-      return this.buildQueryResult(normalizedSql, [
-        {
-          type: "EXPLAIN",
-          table: parsed.table,
-          where: parsed.where ?? null,
-          groupBy: parsed.groupBy?.join(",") ?? null,
-          aggregate: parsed.aggregate ?? null,
-          orderBy: parsed.orderByList?.map((x) => `${x.field} ${x.direction}`).join(",") ?? null,
-          limit: parsed.limit ?? null,
-          offset: parsed.offset ?? null,
-          mode: this.opts.mode ?? "simulator",
-          join: parsed.join ? `${parsed.join.type} ${parsed.join.table} ON ${parsed.join.leftField}=${parsed.join.rightField}` : null,
-          joins: parsed.joins?.length
-            ? parsed.joins.map((j) => `${j.type} ${j.table} ON ${j.leftField}=${j.rightField}`).join(" ; ")
-            : null,
-        },
-      ]);
-    }
+      if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor && materializedViewSources.length === 0) {
+        const onchain = await this.withWalrusRetry(async () =>
+          this.opts.onchainQueryExecutor!({
+            sql,
+            table: parsed.table,
+            fields: parsed.fields,
+            where: parsed.where,
+            limit: parsed.limit,
+            offset: parsed.offset,
+            orderBy: parsed.orderBy,
+            orderDirection: parsed.orderDirection,
+            orderByList: parsed.orderByList,
+            aggregate: parsed.aggregate,
+            aggregateField: parsed.aggregateField,
+            groupBy: parsed.groupBy,
+            having: parsed.having,
+            explain: parsed.explain,
+            join: parsed.join,
+            joins: parsed.joins,
+          }),
+        );
+        return this.buildQueryResult(normalizedSql, onchain.rows);
+      }
 
-    if ((this.opts.mode ?? "simulator") === "onchain" && this.opts.onchainQueryExecutor) {
-      const onchain = await this.withWalrusRetry(async () =>
-        this.opts.onchainQueryExecutor!({
-          sql,
-          table: parsed.table,
-          fields: parsed.fields,
-          where: parsed.where,
-          limit: parsed.limit,
-          offset: parsed.offset,
-          orderBy: parsed.orderBy,
-          orderDirection: parsed.orderDirection,
-          orderByList: parsed.orderByList,
-          aggregate: parsed.aggregate,
-          aggregateField: parsed.aggregateField,
-          groupBy: parsed.groupBy,
-          having: parsed.having,
-          explain: parsed.explain,
-          join: parsed.join,
-          joins: parsed.joins,
-        }),
-      );
-      return this.buildQueryResult(normalizedSql, onchain.rows);
-    }
+      const bucket = this.requireTable(parsed.table);
+      const selectPlan = this.buildSelectExecutionPlan(parsed, bucket, {
+        refreshIndexes: true,
+        trackLookupStats: true,
+        stabilityKey: planStabilityKey,
+      });
 
-    const bucket = this.requireTable(parsed.table);
-    const baseRows = parsed.joins?.length
-      ? parsed.joins.reduce((acc, j, idx) => this.applyJoin(idx === 0 ? parsed.table : parsed.joins![idx - 1]!.table, acc, j), bucket)
-      : parsed.join
-      ? this.applyJoin(parsed.table, bucket, parsed.join)
-      : bucket;
-    const filtered = parsed.whereAst
-      ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
-      : parsed.whereTree
-      ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
-      : parsed.whereClauses.length
+      const logicalPlan = selectPlan.logical;
+      const joinSpillStats: JoinSpillRuntimeStats = { steps: 0, chunks: 0, rowsProcessed: 0 };
+      const baseRows = logicalPlan.joins.length
+        ? logicalPlan.joins.reduce(
+            (acc, joinStep, idx) => this.applyJoin(
+              idx === 0 ? logicalPlan.table : logicalPlan.joins[idx - 1]!.table,
+              acc,
+              joinStep,
+              selectPlan.physical.joinAlgorithms[idx]?.algorithm ?? "NESTED_LOOP",
+              joinSpillStats,
+            ),
+            selectPlan.scannedRows,
+          )
+        : selectPlan.scannedRows;
+
+      const executionMode = this.resolveSelectExecutionMode(logicalPlan, selectPlan.orderSatisfied);
+      if (executionMode.mode === "PIPELINED") {
+        const pipelined = this.executeSelectPipelineRows(baseRows, logicalPlan, parsed);
+        const pipelinedResult = this.buildQueryResult(normalizedSql, pipelined.rows);
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, pipelinedResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "PIPELINED",
+          pipelined.rowsVisited,
+          pipelinedResult.rows.length,
+          pipelinedResult.rows.length,
+          pipelined.earlyStop,
+          executionMode.blockers,
+          joinSpillStats,
+        );
+        const successMeta: Record<string, unknown> = {
+          sql: normalized,
+          rows: pipelinedResult.rows.length,
+          executionMode: "PIPELINED",
+          pipelineRowsVisited: pipelined.rowsVisited,
+          pipelineEarlyStop: pipelined.earlyStop,
+        };
+        if (this.logger.level === "debug" && pipelinedResult.rows[0]) {
+          successMeta.firstRowTyped = this.toTypedLogRow(pipelinedResult.rows[0], "debug.query.firstRow");
+        }
+        this.logger.debug("query success", successMeta);
+        return pipelinedResult;
+      }
+
+      const filtered = logicalPlan.predicateSource === "AST" && parsed.whereAst
+        ? baseRows.filter((row) => this.evaluateWhereAst(row, parsed.whereAst!, parsed.where) === "TRUE")
+        : logicalPlan.predicateSource === "TREE" && parsed.whereTree
+        ? baseRows.filter((row) => this.evaluateWhereTree(row, parsed.whereTree!) === "TRUE")
+        : logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length
         ? this.applyWhereClauses(baseRows, parsed.whereClauses)
         : baseRows;
 
-    if (parsed.groupBy?.length) {
-      const grouped = this.groupRows(filtered, parsed.groupBy, parsed.aggregate, parsed.aggregateField);
-      const havingRows = parsed.havingAst
-        ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
-        : parsed.having
-        ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(parsed.having!)) === "TRUE")
-        : grouped;
-      const orderedGrouped = this.applyOrder(havingRows, parsed.orderByList);
-      const pagedGrouped = this.applyPage(orderedGrouped, parsed.offset, parsed.limit);
-      return this.buildQueryResult(
-        normalizedSql,
-        pagedGrouped.map((row) => this.pickFields(row, parsed.fields)),
-      );
-    }
+      if (logicalPlan.groupBy?.length) {
+        const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField);
+        const havingRows = parsed.havingAst
+          ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
+          : logicalPlan.having
+          ? grouped.filter((row) => this.evaluateWhereTree(row, this.parseWhereTree(logicalPlan.having!)) === "TRUE")
+          : grouped;
+        const orderedGrouped = this.applyOrder(havingRows, logicalPlan.orderByList);
+        const pagedGrouped = this.applyPage(orderedGrouped, logicalPlan.offset, logicalPlan.limit);
+        const groupedResult = this.buildQueryResult(
+          normalizedSql,
+          pagedGrouped.map((row) => this.pickFields(row, logicalPlan.fields)),
+        );
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, groupedResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "MATERIALIZED",
+          baseRows.length,
+          groupedResult.rows.length,
+          Math.max(baseRows.length, filtered.length, grouped.length, havingRows.length, orderedGrouped.length, pagedGrouped.length),
+          false,
+          executionMode.blockers,
+          joinSpillStats,
+        );
+        return groupedResult;
+      }
 
-    if (parsed.aggregate) {
-      return this.buildQueryResult(normalizedSql, [this.computeAggregateRow(filtered, parsed.aggregate, parsed.aggregateField)]);
-    }
+      if (logicalPlan.aggregate) {
+        const aggregateResult = this.buildQueryResult(normalizedSql, [
+          this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField),
+        ]);
+        this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
+        this.recordSelectExecutionPipelineStats(
+          normalizedSql,
+          "MATERIALIZED",
+          baseRows.length,
+          aggregateResult.rows.length,
+          Math.max(baseRows.length, filtered.length),
+          false,
+          executionMode.blockers,
+          joinSpillStats,
+        );
+        return aggregateResult;
+      }
 
-    const withWindow = parsed.rowNumberAlias
-      ? this.applyRowNumber(filtered, parsed.rowNumberAlias, parsed.rowNumberSpec)
-      : filtered;
-    const ordered = this.applyOrder(withWindow, parsed.orderByList);
-    const paged = this.applyPage(ordered, parsed.offset, parsed.limit);
+      const withWindow = logicalPlan.rowNumberAlias
+        ? this.applyRowNumber(filtered, logicalPlan.rowNumberAlias, logicalPlan.rowNumberSpec)
+        : filtered;
+      const ordered = selectPlan.orderSatisfied ? withWindow : this.applyOrder(withWindow, logicalPlan.orderByList);
+      const paged = this.applyPage(ordered, logicalPlan.offset, logicalPlan.limit);
 
       const result = this.buildQueryResult(
         normalizedSql,
-        paged.map((row) => this.pickFields(row, parsed.fields)),
+        paged.map((row) => this.pickFields(row, logicalPlan.fields)),
+      );
+      this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, result.rows.length, bucket.length);
+      this.recordSelectExecutionPipelineStats(
+        normalizedSql,
+        "MATERIALIZED",
+        baseRows.length,
+        result.rows.length,
+        Math.max(baseRows.length, filtered.length, withWindow.length, ordered.length, paged.length),
+        false,
+        executionMode.blockers,
+        joinSpillStats,
       );
       const successMeta: Record<string, unknown> = {
         sql: normalized,
         rows: result.rows.length,
+        executionMode: "MATERIALIZED",
       };
       if (this.logger.level === "debug" && result.rows[0]) {
         successMeta.firstRowTyped = this.toTypedLogRow(result.rows[0], "debug.query.firstRow");
       }
       this.logger.debug("query success", successMeta);
       return result;
+    } finally {
+      this.cleanupMaterializedSelectViewSources(materializedViewSources);
+    }
+      } finally {
+        this.leaveSubqueryRuntimeScope();
+      }
     } catch (err) {
       this.transitionTransactionToAbortedOnError(normalized);
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
@@ -2692,6 +6186,10 @@ export class WalrusSqlClient {
       schema.columns.push(col);
       this.uniqueGroupsCache.delete(table);
       this.rebuildUniqueIndexes(table);
+      this.syncConstraintIndexesToCatalog(table);
+      this.pruneInvalidIndexesForTable(table);
+      this.pruneIndexVersionObjectsForTable(table);
+      this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -2730,6 +6228,7 @@ export class WalrusSqlClient {
         });
       }
 
+      this.invalidateViewsForDroppedColumn(table, column);
       schema.columns.splice(idx, 1);
       schema.foreignKeys = (schema.foreignKeys ?? []).filter(
         (fk) => !fk.columns.some((c) => c.toUpperCase() === column.toUpperCase()),
@@ -2738,6 +6237,10 @@ export class WalrusSqlClient {
       const rows = this.requireTable(table);
       for (const r of rows) delete r[column];
       this.rebuildUniqueIndexes(table);
+      this.syncConstraintIndexesToCatalog(table);
+      this.pruneInvalidIndexesForTable(table);
+      this.pruneIndexVersionObjectsForTable(table);
+      this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
       return;
     }
@@ -3285,7 +6788,11 @@ export class WalrusSqlClient {
         const beforeImage = { ...row };
         this.removeRowFromUniqueIndexes(table, row);
         this.recordTransactionLogWrite(table, "DELETE", beforeImage, beforeImage, null);
-        if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "DELETE", beforeImage);
+        if (!this.isDmlWriteStagingActive()) {
+          this.removeRowFromSecondaryIndexes(table, beforeImage);
+          this.bumpIndexMaintenanceStats(table, "DELETE", 1);
+          this.applyImmediateRowVersion(table, "DELETE", beforeImage);
+        }
         touched++;
       }
 
@@ -3296,15 +6803,162 @@ export class WalrusSqlClient {
     return counts;
   }
 
+  private findRowReferenceInSetByKey(table: string, rows: Set<SqlRow>, rowLike: SqlRow): SqlRow | null {
+    const target = this.encodeIndexRowRefKey(table, rowLike);
+    for (const candidate of rows.values()) {
+      if (this.encodeIndexRowRefKey(table, candidate) === target) return candidate;
+    }
+    return null;
+  }
+
+  private recomputeHashIndexStatsForTable(table: string): void {
+    const tableIndexes = this.hashIndexes.get(table);
+    if (!tableIndexes || tableIndexes.size === 0) {
+      this.hashIndexStats.delete(table);
+      return;
+    }
+
+    let keys = 0;
+    let rowsIndexed = 0;
+    for (const buckets of tableIndexes.values()) {
+      keys += buckets.size;
+      for (const rows of buckets.values()) rowsIndexed += rows.size;
+    }
+    this.hashIndexStats.set(table, { keys, rowsIndexed });
+  }
+
+  private recomputeBtreeIndexStatsForTable(table: string): void {
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes || tableIndexes.size === 0) {
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    let keys = 0;
+    let rowsIndexed = 0;
+    for (const runtime of tableIndexes.values()) {
+      keys += runtime.entries.length;
+      for (const leaf of runtime.entries) rowsIndexed += leaf.rows.size;
+    }
+    this.btreeIndexStats.set(table, { keys, rowsIndexed });
+  }
+
+  private recomputeSecondaryIndexStatsForTable(table: string): void {
+    this.recomputeHashIndexStatsForTable(table);
+    this.recomputeBtreeIndexStatsForTable(table);
+  }
+
+  private addRowToSecondaryIndexes(table: string, row: SqlRow, options?: { recomputeStats?: boolean }): void {
+    let changed = false;
+
+    for (const entry of this.getActiveIndexEntriesForTable(table)) {
+      const indexName = this.normalizeIndexName(entry.name);
+      const column = entry.columns[0]!;
+      const value = this.resolveRowValue(row, column);
+      if (value === null || value === undefined) continue;
+
+      if (entry.type === "HASH") {
+        const tableIndexes = this.hashIndexes.get(table) ?? new Map<string, Map<string, Set<SqlRow>>>();
+        const buckets = tableIndexes.get(indexName) ?? new Map<string, Set<SqlRow>>();
+        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.insert:${table}.${indexName}.${column}`);
+        const bucketRows = buckets.get(encodedKey) ?? new Set<SqlRow>();
+        if (!this.findRowReferenceInSetByKey(table, bucketRows, row)) {
+          bucketRows.add(row);
+          changed = true;
+        }
+        buckets.set(encodedKey, bucketRows);
+        tableIndexes.set(indexName, buckets);
+        this.hashIndexes.set(table, tableIndexes);
+        continue;
+      }
+
+      const tableIndexes = this.btreeIndexes.get(table) ?? new Map<string, BtreeRuntimeIndex>();
+      const runtime = tableIndexes.get(indexName) ?? { column, entries: [] };
+      let leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+      if (!leaf) {
+        leaf = { key: value, rows: new Set<SqlRow>() };
+        runtime.entries.push(leaf);
+        runtime.entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+      }
+      if (!this.findRowReferenceInSetByKey(table, leaf.rows, row)) {
+        leaf.rows.add(row);
+        changed = true;
+      }
+      tableIndexes.set(indexName, runtime);
+      this.btreeIndexes.set(table, tableIndexes);
+    }
+
+    if (changed && (options?.recomputeStats ?? true)) this.recomputeSecondaryIndexStatsForTable(table);
+  }
+
+  private removeRowFromSecondaryIndexes(table: string, row: SqlRow, options?: { recomputeStats?: boolean }): void {
+    let changed = false;
+
+    const hashIndexesForTable = this.hashIndexes.get(table);
+    if (hashIndexesForTable) {
+      for (const [indexName, buckets] of [...hashIndexesForTable.entries()]) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.type !== "HASH" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+
+        const column = entry.columns[0]!;
+        const value = this.resolveRowValue(row, column);
+        if (value === null || value === undefined) continue;
+        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.delete:${table}.${indexName}.${column}`);
+        const bucketRows = buckets.get(encodedKey);
+        if (!bucketRows) continue;
+
+        const existing = this.findRowReferenceInSetByKey(table, bucketRows, row);
+        if (!existing) continue;
+        bucketRows.delete(existing);
+        changed = true;
+        if (bucketRows.size === 0) buckets.delete(encodedKey);
+        if (buckets.size === 0) hashIndexesForTable.delete(indexName);
+      }
+
+      if (hashIndexesForTable.size === 0) this.hashIndexes.delete(table);
+    }
+
+    const btreeIndexesForTable = this.btreeIndexes.get(table);
+    if (btreeIndexesForTable) {
+      for (const [indexName, runtime] of [...btreeIndexesForTable.entries()]) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.type !== "BTREE" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+
+        const column = runtime.column;
+        const value = this.resolveRowValue(row, column);
+        if (value === null || value === undefined) continue;
+
+        const leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+        if (!leaf) continue;
+        const existing = this.findRowReferenceInSetByKey(table, leaf.rows, row);
+        if (!existing) continue;
+
+        leaf.rows.delete(existing);
+        changed = true;
+        if (leaf.rows.size === 0) runtime.entries = runtime.entries.filter((entryLeaf) => entryLeaf !== leaf);
+        if (runtime.entries.length === 0) btreeIndexesForTable.delete(indexName);
+      }
+
+      if (btreeIndexesForTable.size === 0) this.btreeIndexes.delete(table);
+    }
+
+    if (changed && (options?.recomputeStats ?? true)) this.recomputeSecondaryIndexStatsForTable(table);
+  }
+
   private commitRowUpdate(table: string, row: SqlRow, next: SqlRow): void {
     const beforeImage = { ...row };
     this.removeRowFromUniqueIndexes(table, row);
+    if (!this.isDmlWriteStagingActive()) this.removeRowFromSecondaryIndexes(table, beforeImage);
     Object.keys(row).forEach((k) => delete row[k]);
     Object.assign(row, next);
     this.addRowToUniqueIndexes(table, row);
+    if (!this.isDmlWriteStagingActive()) this.addRowToSecondaryIndexes(table, row);
     this.recordTransactionLogWrite(table, "UPDATE", beforeImage, beforeImage, { ...row });
     this.bumpConstraintCost(table, { updateOps: 1 });
-    if (!this.isDmlWriteStagingActive()) this.applyImmediateRowVersion(table, "UPDATE", row);
+    if (!this.isDmlWriteStagingActive()) {
+      this.bumpIndexMaintenanceStats(table, "UPDATE", 1);
+      this.applyImmediateRowVersion(table, "UPDATE", row);
+    }
   }
 
   private didForeignKeyReferenceChange(fk: ForeignKeySpec, before: SqlRow, after: SqlRow): boolean {
@@ -3388,6 +7042,981 @@ export class WalrusSqlClient {
     if (schema.primaryKeyGroup?.length) pushGroup(schema.primaryKeyGroup);
     for (const g of schema.uniqueGroups ?? []) pushGroup(g);
     return groups;
+  }
+
+  private normalizeIndexName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
+  private normalizeViewName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
+  private getViewCatalogEntry(name: string): ViewCatalogEntry | undefined {
+    return this.viewCatalog.get(this.normalizeViewName(name));
+  }
+
+  private assertUpdatableViewDeferred(
+    operation: "INSERT" | "UPDATE" | "DELETE",
+    tableName: string,
+    role: "target" | "source" = "target",
+  ): void {
+    const viewEntry = this.getViewCatalogEntry(tableName);
+    if (!viewEntry) return;
+
+    const code = operation === "INSERT"
+      ? ClientErrorCodeEnum.UnsupportedInsert
+      : operation === "UPDATE"
+        ? ClientErrorCodeEnum.UnsupportedUpdate
+        : ClientErrorCodeEnum.UnsupportedDelete;
+    throw sqlError(
+      code,
+      `updatable view is deferred in Phase 3: ${operation} ${role} cannot reference view ${viewEntry.name}`,
+    );
+  }
+
+  private hasTableNameConflict(name: string): boolean {
+    const key = name.trim().toUpperCase();
+    if (!key) return false;
+    for (const tableName of this.tables.keys()) {
+      if (tableName.toUpperCase() === key) return true;
+    }
+    for (const schemaName of this.schemas.keys()) {
+      if (schemaName.toUpperCase() === key) return true;
+    }
+    return false;
+  }
+
+  private isViewAllowedByNameList(viewName: string): boolean {
+    const allowed = this.opts.viewPolicy?.allowedViewNames;
+    if (!allowed?.length) return true;
+    const key = this.normalizeViewName(viewName);
+    return allowed.some((candidate) => this.normalizeViewName(candidate) === key);
+  }
+
+  private assertViewPermission(action: ViewPolicyAction, viewName: string): void {
+    const policy = this.opts.viewPolicy;
+    if (!policy) return;
+
+    const allowedByAction = action === "CREATE"
+      ? policy.allowCreate !== false
+      : action === "DROP"
+        ? policy.allowDrop !== false
+        : policy.allowSelect !== false;
+    const viewKey = this.normalizeViewName(viewName);
+    if (!allowedByAction) {
+      const code = action === "SELECT" ? "ERR_UNSUPPORTED_SELECT" : "ERR_UNSUPPORTED_DDL";
+      throw sqlError(code, `${action} VIEW denied by view policy: ${viewKey}`);
+    }
+    if (!this.isViewAllowedByNameList(viewKey)) {
+      const code = action === "SELECT" ? "ERR_UNSUPPORTED_SELECT" : "ERR_UNSUPPORTED_DDL";
+      throw sqlError(code, `${action} VIEW denied by allowed view list: ${viewKey}`);
+    }
+  }
+
+  private resolveViewDependencySource(
+    sourceToken: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+  ): string | null {
+    const key = sourceToken.trim().toUpperCase();
+    if (!key) return null;
+    const fromAlias = sourceAliases.get(key);
+    if (fromAlias) return fromAlias;
+    if (sourceNames.has(key)) return key;
+    return null;
+  }
+
+  private markViewDependencyColumn(
+    dependencyMap: Map<string, Set<string>>,
+    source: string,
+    column: string,
+  ): void {
+    const sourceKey = source.trim().toUpperCase();
+    if (!sourceKey) return;
+    const columnKey = column.trim().toUpperCase();
+    if (!columnKey) return;
+
+    const bucket = dependencyMap.get(sourceKey) ?? new Set<string>();
+    bucket.add(columnKey);
+    dependencyMap.set(sourceKey, bucket);
+  }
+
+  private collectViewDependencyColumnsFromIdentifier(
+    identifier: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    const trimmed = identifier.trim();
+    if (!trimmed || sourceNames.size === 0) return;
+
+    if (trimmed === VIEW_DEPENDENCY_WILDCARD) {
+      for (const source of sourceNames) {
+        this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+      }
+      return;
+    }
+
+    const parts = trimmed.split(".").map((part) => part.trim()).filter(Boolean);
+    if (!parts.length) return;
+
+    if (parts.length >= 2) {
+      const sourceToken = parts[parts.length - 2]!;
+      const columnToken = parts[parts.length - 1]!;
+      const resolvedSource = this.resolveViewDependencySource(sourceToken, sourceNames, sourceAliases);
+      if (resolvedSource) {
+        this.markViewDependencyColumn(dependencyMap, resolvedSource, columnToken);
+        return;
+      }
+    }
+
+    const columnToken = parts[parts.length - 1]!;
+    for (const source of sourceNames) {
+      this.markViewDependencyColumn(dependencyMap, source, columnToken);
+    }
+  }
+
+  private collectViewDependencyColumnsFromRawExpr(
+    rawExpr: string,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (sourceNames.size === 0) return;
+
+    const scrubbed = rawExpr.replace(/'[^']*'/g, " ").replace(/\"[^\"]*\"/g, " ");
+    for (const qualified of scrubbed.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*|\*)/g)) {
+      this.collectViewDependencyColumnsFromIdentifier(
+        `${qualified[1]}.${qualified[2]}`,
+        sourceNames,
+        sourceAliases,
+        dependencyMap,
+      );
+    }
+
+    for (const match of scrubbed.matchAll(/\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g)) {
+      const token = match[1]!;
+      const upper = token.toUpperCase();
+      if (VIEW_DEPENDENCY_KEYWORDS.has(upper)) continue;
+
+      const nextChunk = scrubbed.slice((match.index ?? 0) + token.length);
+      if (/^\s*\(/.test(nextChunk)) continue;
+      this.collectViewDependencyColumnsFromIdentifier(token, sourceNames, sourceAliases, dependencyMap);
+    }
+  }
+
+  private collectViewDependencyColumnsFromExpr(
+    expr: ExprAst | undefined,
+    sourceNames: Set<string>,
+    sourceAliases: Map<string, string>,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (!expr || sourceNames.size === 0) return;
+
+    switch (expr.kind) {
+      case "identifier":
+        this.collectViewDependencyColumnsFromIdentifier(expr.name, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "binary":
+        this.collectViewDependencyColumnsFromExpr(expr.left, sourceNames, sourceAliases, dependencyMap);
+        this.collectViewDependencyColumnsFromExpr(expr.right, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "unary":
+        this.collectViewDependencyColumnsFromExpr(expr.expr, sourceNames, sourceAliases, dependencyMap);
+        return;
+      case "function":
+        for (const arg of expr.args) {
+          this.collectViewDependencyColumnsFromExpr(arg, sourceNames, sourceAliases, dependencyMap);
+        }
+        return;
+      case "raw":
+        this.collectViewDependencyColumnsFromRawExpr(expr.text, sourceNames, sourceAliases, dependencyMap);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private collectViewDependencyFromSelectAst(
+    ast: SelectStatementAst,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    const sourceNames = new Set<string>();
+    const sourceAliases = new Map<string, string>();
+
+    const trackSource = (tableName: string, alias?: string): void => {
+      const source = tableName.trim().toUpperCase();
+      if (!source) return;
+      sourceNames.add(source);
+      if (!dependencyMap.has(source)) dependencyMap.set(source, new Set<string>());
+      sourceAliases.set(source, source);
+      if (alias) sourceAliases.set(alias.trim().toUpperCase(), source);
+    };
+
+    if (ast.from.kind === "table") {
+      trackSource(ast.from.name, ast.from.alias);
+    } else {
+      const nestedAst = parseSqlToAst(ast.from.subquerySql, { dialect: this.opts.dialect ?? "ansi" });
+      this.collectViewDependencyFromStatement(nestedAst, dependencyMap);
+    }
+
+    const joins = ast.joins?.length ? ast.joins : ast.join ? [ast.join] : [];
+    for (const join of joins) {
+      trackSource(join.table);
+      this.collectViewDependencyColumnsFromIdentifier(join.onLeft, sourceNames, sourceAliases, dependencyMap);
+      this.collectViewDependencyColumnsFromIdentifier(join.onRight, sourceNames, sourceAliases, dependencyMap);
+    }
+
+    for (const item of ast.selectItems) {
+      if (item.expr.kind === "identifier" && item.expr.name.trim() === VIEW_DEPENDENCY_WILDCARD) {
+        for (const source of sourceNames) {
+          this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+        }
+        continue;
+      }
+      if (item.expr.kind === "raw") {
+        const rawExpr = item.expr.text.trim();
+        if (rawExpr === VIEW_DEPENDENCY_WILDCARD) {
+          for (const source of sourceNames) {
+            this.markViewDependencyColumn(dependencyMap, source, VIEW_DEPENDENCY_WILDCARD);
+          }
+          continue;
+        }
+        const qualifiedWildcard = rawExpr.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\.\*$/);
+        if (qualifiedWildcard) {
+          this.collectViewDependencyColumnsFromIdentifier(
+            `${qualifiedWildcard[1]}.${VIEW_DEPENDENCY_WILDCARD}`,
+            sourceNames,
+            sourceAliases,
+            dependencyMap,
+          );
+          continue;
+        }
+      }
+      this.collectViewDependencyColumnsFromExpr(item.expr, sourceNames, sourceAliases, dependencyMap);
+    }
+    this.collectViewDependencyColumnsFromExpr(ast.where, sourceNames, sourceAliases, dependencyMap);
+    this.collectViewDependencyColumnsFromExpr(ast.having, sourceNames, sourceAliases, dependencyMap);
+    for (const orderItem of ast.orderBy ?? []) {
+      this.collectViewDependencyColumnsFromExpr(orderItem.expr, sourceNames, sourceAliases, dependencyMap);
+    }
+    for (const groupItem of ast.groupBy ?? []) {
+      this.collectViewDependencyColumnsFromExpr(groupItem, sourceNames, sourceAliases, dependencyMap);
+    }
+  }
+
+  private collectViewDependencyFromStatement(
+    ast: SqlAstStatement,
+    dependencyMap: Map<string, Set<string>>,
+  ): void {
+    if (ast.kind === "select") {
+      this.collectViewDependencyFromSelectAst(ast, dependencyMap);
+      return;
+    }
+
+    if (ast.kind === "union" || ast.kind === "intersect" || ast.kind === "except") {
+      const left = parseSqlToAst(ast.leftSql, { dialect: this.opts.dialect ?? "ansi" });
+      const right = parseSqlToAst(ast.rightSql, { dialect: this.opts.dialect ?? "ansi" });
+      this.collectViewDependencyFromStatement(left, dependencyMap);
+      this.collectViewDependencyFromStatement(right, dependencyMap);
+    }
+  }
+
+  private extractViewDependencies(querySql: string): ViewDependencyEntry[] {
+    const ast = parseSqlToAst(querySql, { dialect: this.opts.dialect ?? "ansi" });
+    const dependencyMap = new Map<string, Set<string>>();
+    this.collectViewDependencyFromStatement(ast, dependencyMap);
+
+    const out: ViewDependencyEntry[] = [];
+    for (const [source, columns] of dependencyMap.entries()) {
+      out.push({
+        source,
+        columns: [...columns.values()].sort(),
+      });
+    }
+    out.sort((a, b) => this.textOrder(a.source, b.source));
+    return out;
+  }
+
+  private markViewInvalid(viewName: string, reason: string): void {
+    const normalizedViewName = this.normalizeViewName(viewName);
+    const entry = this.viewCatalog.get(normalizedViewName);
+    if (!entry) return;
+    entry.status = "INVALID";
+    entry.invalidReason = reason;
+    entry.invalidatedAt = Date.now();
+  }
+
+  private collectTransitiveDependentViews(seedViews: Set<string>): Set<string> {
+    const impacted = new Set<string>(seedViews);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const entry of this.viewCatalog.values()) {
+        const viewName = this.normalizeViewName(entry.name);
+        if (impacted.has(viewName)) continue;
+        const dependsOnImpactedView = entry.dependencies.some((dependency) =>
+          impacted.has(this.normalizeViewName(dependency.source)));
+        if (!dependsOnImpactedView) continue;
+        impacted.add(viewName);
+        changed = true;
+      }
+    }
+    return impacted;
+  }
+
+  private invalidateViewsForDroppedTable(table: string): void {
+    const tableKey = table.trim().toUpperCase();
+    const directlyImpacted = new Set<string>();
+    for (const entry of this.viewCatalog.values()) {
+      if (!entry.dependencies.some((dependency) => dependency.source.toUpperCase() === tableKey)) continue;
+      directlyImpacted.add(this.normalizeViewName(entry.name));
+    }
+
+    if (!directlyImpacted.size) return;
+    const impacted = this.collectTransitiveDependentViews(directlyImpacted);
+    for (const viewName of impacted) {
+      const reason = directlyImpacted.has(viewName)
+        ? `base table dropped: ${table}`
+        : `dependent view invalidated after table drop: ${table}`;
+      this.markViewInvalid(viewName, reason);
+    }
+  }
+
+  private invalidateViewsForDroppedColumn(table: string, column: string): void {
+    const tableKey = table.trim().toUpperCase();
+    const columnKey = column.trim().toUpperCase();
+    const directlyImpacted = new Set<string>();
+
+    for (const entry of this.viewCatalog.values()) {
+      const hasDependency = entry.dependencies.some((dependency) => {
+        if (dependency.source.toUpperCase() !== tableKey) return false;
+        const columns = dependency.columns.map((it) => it.toUpperCase());
+        if (columns.includes(VIEW_DEPENDENCY_WILDCARD)) return true;
+        return columns.includes(columnKey);
+      });
+      if (!hasDependency) continue;
+      directlyImpacted.add(this.normalizeViewName(entry.name));
+    }
+
+    if (!directlyImpacted.size) return;
+    const impacted = this.collectTransitiveDependentViews(directlyImpacted);
+    for (const viewName of impacted) {
+      const reason = directlyImpacted.has(viewName)
+        ? `base column dropped: ${table}.${column}`
+        : `dependent view invalidated after column drop: ${table}.${column}`;
+      this.markViewInvalid(viewName, reason);
+    }
+  }
+
+  private pruneInvalidIndexesForTable(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+
+    const validColumns = new Set(schema.columns.map((column) => column.name.toUpperCase()));
+    for (const [indexName, entry] of [...this.indexCatalog.entries()]) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.columns.every((column) => validColumns.has(column.toUpperCase()))) continue;
+      this.indexCatalog.delete(indexName);
+    }
+  }
+
+  private executeCreateIndexStatement(ast: CreateIndexStatementAst): string {
+    const table = ast.tableName.trim();
+    const schema = this.schemas.get(table);
+    if (!schema || !this.tables.has(table)) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+    const indexName = this.normalizeIndexName(ast.indexName);
+    if (this.indexCatalog.has(indexName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index already exists: ${ast.indexName}`);
+    }
+
+    if (ast.columns.length !== 1) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", "CREATE INDEX execution currently supports single-column BTREE indexes only");
+    }
+
+    const requestedColumn = ast.columns[0]!.trim();
+    const schemaColumn = schema.columns.find((column) => column.name.toUpperCase() === requestedColumn.toUpperCase());
+    if (!schemaColumn) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index column not found on table ${table}: ${requestedColumn}`);
+    }
+
+    this.indexCatalog.set(indexName, {
+      name: indexName,
+      table,
+      columns: [schemaColumn.name],
+      type: "BTREE",
+      unique: ast.unique,
+      status: "ACTIVE",
+    });
+    this.rebuildBtreeIndexesForTable(table);
+    this.recordImmutableIndexVersionObject(this.indexCatalog.get(indexName)!);
+    return table;
+  }
+
+  private executeCreateViewStatement(ast: CreateViewStatementAst): string {
+    const viewName = this.normalizeViewName(ast.viewName);
+    this.assertViewPermission("CREATE", viewName);
+    if (this.hasTableNameConflict(viewName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `name conflict with existing table: ${ast.viewName}`);
+    }
+    if (this.viewCatalog.has(viewName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `view already exists: ${ast.viewName}`);
+    }
+
+    const dependencies = this.extractViewDependencies(ast.querySql);
+    this.viewCatalog.set(viewName, {
+      name: viewName,
+      querySql: ast.querySql,
+      status: "ACTIVE",
+      dependencies,
+    });
+    return viewName;
+  }
+
+  private executeDropIndexStatement(ast: DropIndexStatementAst): string | null {
+    const indexName = this.normalizeIndexName(ast.indexName);
+    const entry = this.indexCatalog.get(indexName);
+    const tableHint = ast.tableName?.trim();
+    if (!entry || (tableHint && entry.table.toUpperCase() !== tableHint.toUpperCase())) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `index not found: ${ast.indexName}`);
+    }
+
+    if (entry.unique && indexName.startsWith(`__${entry.table.toUpperCase()}__`)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `cannot drop internal constraint index: ${entry.name}`);
+    }
+
+    this.indexCatalog.delete(indexName);
+    this.rebuildSecondaryIndexesForTable(entry.table);
+    return entry.table;
+  }
+
+  private executeDropViewStatement(ast: DropViewStatementAst): string | null {
+    const viewName = this.normalizeViewName(ast.viewName);
+    const entry = this.viewCatalog.get(viewName);
+    if (!entry) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `view not found: ${ast.viewName}`);
+    }
+
+    this.assertViewPermission("DROP", viewName);
+    this.viewCatalog.delete(viewName);
+    return entry.name;
+  }
+
+  private rebuildSecondaryIndexesForTable(table: string): void {
+    this.rebuildHashIndexesForTable(table);
+    this.rebuildBtreeIndexesForTable(table);
+  }
+
+  private rebuildHashIndexesForTable(table: string): void {
+    const rows = this.tables.get(table);
+    if (!rows) {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+      return;
+    }
+
+    const indexesForTable = new Map<string, Map<string, Set<SqlRow>>>();
+    let keys = 0;
+    let rowsIndexed = 0;
+
+    for (const entry of this.indexCatalog.values()) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.type !== "HASH") continue;
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+
+      const column = entry.columns[0]!;
+      const bucket = new Map<string, Set<SqlRow>>();
+      for (const row of rows) {
+        const val = this.resolveRowValue(row, column);
+        if (val === null || val === undefined) continue;
+        const key = this.encodeTypedKey(val, `hash.index.key:${table}.${entry.name}.${column}`);
+        const set = bucket.get(key) ?? new Set<SqlRow>();
+        set.add(row);
+        bucket.set(key, set);
+        rowsIndexed += 1;
+      }
+
+      if (bucket.size > 0) {
+        keys += bucket.size;
+        indexesForTable.set(entry.name.toUpperCase(), bucket);
+      }
+    }
+
+    if (indexesForTable.size > 0) {
+      this.hashIndexes.set(table, indexesForTable);
+      this.hashIndexStats.set(table, { keys, rowsIndexed });
+      this.recordIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
+    } else {
+      this.hashIndexes.delete(table);
+      this.hashIndexStats.delete(table);
+    }
+  }
+
+  private rebuildBtreeIndexesForTable(table: string): void {
+    const rows = this.tables.get(table);
+    if (!rows) {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+      return;
+    }
+
+    const indexesForTable: BtreeRuntimeIndexMap = new Map();
+    let keys = 0;
+    let rowsIndexed = 0;
+
+    for (const entry of this.indexCatalog.values()) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (entry.type !== "BTREE") continue;
+      if (entry.status !== "ACTIVE") continue;
+      if (entry.columns.length !== 1) continue;
+
+      const column = entry.columns[0]!;
+      const leafMap = new Map<string, BtreeIndexLeafEntry>();
+      for (const row of rows) {
+        const val = this.resolveRowValue(row, column);
+        if (val === null || val === undefined) continue;
+
+        const encoded = this.encodeTypedKey(val, `btree.index.key:${table}.${entry.name}.${column}`);
+        const existing = leafMap.get(encoded);
+        if (existing) {
+          existing.rows.add(row);
+        } else {
+          leafMap.set(encoded, {
+            key: val as SqlPrimitive,
+            rows: new Set<SqlRow>([row]),
+          });
+          keys += 1;
+        }
+        rowsIndexed += 1;
+      }
+
+      if (leafMap.size === 0) continue;
+      const leaves = [...leafMap.values()].sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+      indexesForTable.set(entry.name.toUpperCase(), {
+        column,
+        entries: leaves,
+      });
+    }
+
+    if (indexesForTable.size > 0) {
+      this.btreeIndexes.set(table, indexesForTable);
+      this.btreeIndexStats.set(table, { keys, rowsIndexed });
+      this.recordIndexMaintenance(table, "INDEX_REBUILD", rowsIndexed);
+    } else {
+      this.btreeIndexes.delete(table);
+      this.btreeIndexStats.delete(table);
+    }
+  }
+
+  private getHashIndexedCandidates(
+    table: string,
+    whereClauses: WhereClause[],
+    trackLookupStats = true,
+  ): { rows: SqlRow[]; indexName: string; column: string } | null {
+    const tableIndexes = this.hashIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    let best: { rows: SqlRow[]; indexName: string; column: string } | null = null;
+    for (const clause of whereClauses) {
+      if (clause.logic === "OR") continue;
+      if (clause.op !== "=") continue;
+      if (!clause.field || clause.field.includes(".")) continue;
+      if (!clause.valueExprs?.length) continue;
+
+      const eqValueRaw = clause.valueExprs[0]!.trim();
+      if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(eqValueRaw)) continue;
+      const eqValue = this.castValue(eqValueRaw);
+      if (eqValue === null || eqValue === undefined) continue;
+
+      for (const [indexName, buckets] of tableIndexes.entries()) {
+        const entry = this.indexCatalog.get(indexName);
+        if (!entry || entry.columns.length !== 1) continue;
+        const column = entry.columns[0]!;
+        if (column.toUpperCase() !== clause.field.toUpperCase()) continue;
+
+        const key = this.encodeTypedKey(eqValue as SqlPrimitive, `hash.index.lookup:${table}.${indexName}.${column}`);
+        const hit = buckets.get(key);
+        const candidateRows = hit ? [...hit] : [];
+        const candidate = { rows: candidateRows, indexName, column };
+        if (!best) {
+          best = candidate;
+          continue;
+        }
+        if (candidate.rows.length < best.rows.length) {
+          best = candidate;
+          continue;
+        }
+        if (candidate.rows.length > best.rows.length) continue;
+        if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
+      }
+    }
+
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
+  }
+
+  private compareBtreeKey(a: SqlPrimitive, b: SqlPrimitive): number {
+    const lt = this.compareByOp(a, b, "<");
+    if (lt === "TRUE") return -1;
+    const gt = this.compareByOp(a, b, ">");
+    if (gt === "TRUE") return 1;
+    return 0;
+  }
+
+  private pickTighterBtreeBound(
+    current: BtreeRangeBound | undefined,
+    candidate: BtreeRangeBound,
+    edge: "lower" | "upper",
+  ): BtreeRangeBound {
+    if (!current) return candidate;
+    const cmp = this.compareBtreeKey(candidate.value, current.value);
+
+    if (edge === "lower") {
+      if (cmp > 0) return candidate;
+      if (cmp < 0) return current;
+      if (!candidate.inclusive && current.inclusive) return candidate;
+      return current;
+    }
+
+    if (cmp < 0) return candidate;
+    if (cmp > 0) return current;
+    if (!candidate.inclusive && current.inclusive) return candidate;
+    return current;
+  }
+
+  private isSimpleLiteralExpr(rawExpr: string): boolean {
+    const trimmed = rawExpr.trim();
+    if (!trimmed) return false;
+    if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(trimmed)) return false;
+    if (/^(TRUE|FALSE|NULL)$/i.test(trimmed)) return true;
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) return true;
+    if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+      return true;
+    }
+    return false;
+  }
+
+  private parseIndexLiteral(rawExpr: string): SqlPrimitive | undefined {
+    if (!this.isSimpleLiteralExpr(rawExpr)) return undefined;
+    const parsed = this.castValue(rawExpr);
+    if (parsed === null || parsed === undefined) return undefined;
+    return parsed as SqlPrimitive;
+  }
+
+  private parseLikePrefixPredicate(rawExpr: string, escapeChar?: string): BtreePrefixPredicate | undefined {
+    const parsed = this.parseIndexLiteral(rawExpr);
+    if (typeof parsed !== "string") return undefined;
+
+    const pattern = parsed;
+    const escape = escapeChar?.[0];
+    let prefix = "";
+    let wildcardSeen = false;
+
+    for (let i = 0; i < pattern.length; i += 1) {
+      const ch = pattern[i]!;
+      if (escape && ch === escape) {
+        const next = pattern[i + 1];
+        if (next !== undefined) {
+          if (wildcardSeen) return undefined;
+          prefix += next;
+          i += 1;
+          continue;
+        }
+        if (wildcardSeen) return undefined;
+        prefix += ch;
+        continue;
+      }
+
+      if (ch === "_") return undefined;
+      if (ch === "%") {
+        wildcardSeen = true;
+        continue;
+      }
+      if (wildcardSeen) return undefined;
+      prefix += ch;
+    }
+
+    if (prefix.length === 0) return undefined;
+    return {
+      prefix,
+      exact: !wildcardSeen,
+      caseInsensitive: true,
+    };
+  }
+
+  private pickPreferredBtreePrefixPredicate(
+    current: BtreePrefixPredicate | undefined,
+    candidate: BtreePrefixPredicate,
+  ): BtreePrefixPredicate {
+    if (!current) return candidate;
+    if (candidate.prefix.length > current.prefix.length) return candidate;
+    if (candidate.prefix.length < current.prefix.length) return current;
+    if (candidate.exact && !current.exact) return candidate;
+    if (!candidate.exact && current.exact) return current;
+    return this.textOrder(candidate.prefix, current.prefix) < 0 ? candidate : current;
+  }
+
+  private matchesBtreePrefix(key: SqlPrimitive, predicate: BtreePrefixPredicate): boolean {
+    const keyText = String(key);
+    const source = predicate.caseInsensitive ? keyText.toLowerCase() : keyText;
+    const target = predicate.caseInsensitive ? predicate.prefix.toLowerCase() : predicate.prefix;
+    if (predicate.exact) return source === target;
+    return source.startsWith(target);
+  }
+
+  private extractBtreeRangePredicate(column: string, whereClauses: WhereClause[]): BtreeRangePredicate | null {
+    if (whereClauses.length === 0) return null;
+    if (whereClauses.some((clause) => clause.logic === "OR")) return null;
+
+    let lower: BtreeRangeBound | undefined;
+    let upper: BtreeRangeBound | undefined;
+    let prefix: BtreePrefixPredicate | undefined;
+    const target = column.toUpperCase();
+
+    for (const clause of whereClauses) {
+      if (!clause.field || clause.field.includes(".")) continue;
+      if (clause.field.toUpperCase() !== target) continue;
+      if (clause.valueExpr) continue;
+
+      if (clause.op === "=") {
+        const eqRaw = clause.valueExprs?.[0];
+        if (!eqRaw) continue;
+        const eqValue = this.parseIndexLiteral(eqRaw);
+        if (eqValue === undefined) continue;
+        const bound: BtreeRangeBound = { value: eqValue, inclusive: true };
+        lower = this.pickTighterBtreeBound(lower, bound, "lower");
+        upper = this.pickTighterBtreeBound(upper, bound, "upper");
+        continue;
+      }
+
+      if (clause.op === ">" || clause.op === ">=" || clause.op === "<" || clause.op === "<=") {
+        const cmpRaw = clause.valueExprs?.[0];
+        if (!cmpRaw) continue;
+        const cmpValue = this.parseIndexLiteral(cmpRaw);
+        if (cmpValue === undefined) continue;
+
+        if (clause.op === ">" || clause.op === ">=") {
+          lower = this.pickTighterBtreeBound(
+            lower,
+            { value: cmpValue, inclusive: clause.op === ">=" },
+            "lower",
+          );
+        } else {
+          upper = this.pickTighterBtreeBound(
+            upper,
+            { value: cmpValue, inclusive: clause.op === "<=" },
+            "upper",
+          );
+        }
+        continue;
+      }
+
+      if (clause.op === "BETWEEN") {
+        const lowRaw = clause.valueExprs?.[0];
+        const highRaw = clause.valueExprs?.[1];
+        if (!lowRaw || !highRaw) continue;
+        const lowValue = this.parseIndexLiteral(lowRaw);
+        const highValue = this.parseIndexLiteral(highRaw);
+        if (lowValue === undefined || highValue === undefined) continue;
+
+        lower = this.pickTighterBtreeBound(lower, { value: lowValue, inclusive: true }, "lower");
+        upper = this.pickTighterBtreeBound(upper, { value: highValue, inclusive: true }, "upper");
+        continue;
+      }
+
+      if (clause.op === "LIKE") {
+        const patternRaw = clause.valueExprs?.[0];
+        if (!patternRaw) continue;
+        const parsedPrefix = this.parseLikePrefixPredicate(patternRaw, clause.likeEscape);
+        if (!parsedPrefix) continue;
+        prefix = this.pickPreferredBtreePrefixPredicate(prefix, parsedPrefix);
+      }
+    }
+
+    if (!lower && !upper && !prefix) return null;
+    return { lower, upper, prefix };
+  }
+
+  private isBtreePredicateEmpty(predicate: BtreeRangePredicate): boolean {
+    if (!predicate.lower || !predicate.upper) return false;
+    const cmp = this.compareBtreeKey(predicate.lower.value, predicate.upper.value);
+    if (cmp > 0) return true;
+    if (cmp < 0) return false;
+    return !predicate.lower.inclusive || !predicate.upper.inclusive;
+  }
+
+  private scanBtreeIndexRows(
+    index: BtreeRuntimeIndex,
+    direction: "ASC" | "DESC",
+    predicate?: BtreeRangePredicate,
+  ): SqlRow[] {
+    if (predicate && this.isBtreePredicateEmpty(predicate)) return [];
+
+    const entries = direction === "DESC" ? [...index.entries].reverse() : index.entries;
+    const out: SqlRow[] = [];
+    for (const leaf of entries) {
+      if (predicate?.lower) {
+        const cmpLower = this.compareBtreeKey(leaf.key, predicate.lower.value);
+        const tooLow = cmpLower < 0 || (cmpLower === 0 && !predicate.lower.inclusive);
+        if (tooLow) {
+          if (direction === "DESC") break;
+          continue;
+        }
+      }
+
+      if (predicate?.upper) {
+        const cmpUpper = this.compareBtreeKey(leaf.key, predicate.upper.value);
+        const tooHigh = cmpUpper > 0 || (cmpUpper === 0 && !predicate.upper.inclusive);
+        if (tooHigh) {
+          if (direction === "ASC") break;
+          continue;
+        }
+      }
+
+      if (predicate?.prefix && !this.matchesBtreePrefix(leaf.key, predicate.prefix)) continue;
+
+      out.push(...leaf.rows.values());
+    }
+    return out;
+  }
+
+  private getBtreeIndexedCandidates(
+    table: string,
+    whereClauses: WhereClause[],
+    trackLookupStats = true,
+  ): { rows: SqlRow[]; indexName: string; column: string } | null {
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    let best: { rows: SqlRow[]; indexName: string; column: string } | null = null;
+    for (const [indexName, runtime] of tableIndexes.entries()) {
+      const entry = this.indexCatalog.get(indexName);
+      if (!entry || entry.columns.length !== 1) continue;
+
+      const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
+      if (!predicate) continue;
+      const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
+      const candidate = { rows, indexName, column: runtime.column };
+      if (!best) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length < best.rows.length) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length > best.rows.length) continue;
+      if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
+    }
+
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
+  }
+
+  private getBtreeOrderedScanCandidates(
+    table: string,
+    rows: SqlRow[],
+    parsed: Pick<ParsedSelect, "orderByList" | "whereClauses" | "groupBy" | "aggregate" | "rowNumberAlias" | "having">,
+    trackLookupStats = true,
+  ): { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null {
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias) return null;
+    if (!parsed.orderByList || parsed.orderByList.length !== 1) return null;
+
+    const orderExpr = parsed.orderByList[0]!.field.trim();
+    const orderExprMatch = orderExpr.match(/^[a-zA-Z_][a-zA-Z0-9_\.]*$/);
+    if (!orderExprMatch) return null;
+
+    const orderField = orderExpr.includes(".") ? orderExpr.split(".").at(-1)! : orderExpr;
+    const direction = parsed.orderByList[0]!.direction;
+    const tableIndexes = this.btreeIndexes.get(table);
+    if (!tableIndexes) return null;
+
+    let best: { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null = null;
+    for (const [indexName, runtime] of tableIndexes.entries()) {
+      if (runtime.column.toUpperCase() !== orderField.toUpperCase()) continue;
+      const predicate = this.extractBtreeRangePredicate(runtime.column, parsed.whereClauses);
+      const orderedRows = this.scanBtreeIndexRows(runtime, direction, predicate ?? undefined);
+
+      const isBoundByOrderColumn = Boolean(predicate && (predicate.lower || predicate.upper));
+      if (!isBoundByOrderColumn) {
+        const nullTail = rows.filter((row) => {
+          const value = this.resolveRowValue(row, runtime.column);
+          return value === null || value === undefined;
+        });
+        orderedRows.push(...nullTail);
+      }
+
+      const candidate = {
+        rows: orderedRows,
+        indexName,
+        column: runtime.column,
+        orderSatisfied: true,
+      };
+      if (!best) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length < best.rows.length) {
+        best = candidate;
+        continue;
+      }
+      if (candidate.rows.length > best.rows.length) continue;
+      if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
+    }
+
+    if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
+    return best;
+  }
+
+  getHashIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {
+    const out: { table: string; keys: number; rowsIndexed: number }[] = [];
+    for (const [tableName, stats] of this.hashIndexStats.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
+    }
+    out.sort((a, b) => this.textOrder(a.table, b.table));
+    return out;
+  }
+
+  getBtreeIndexStats(table?: string): { table: string; keys: number; rowsIndexed: number }[] {
+    const out: { table: string; keys: number; rowsIndexed: number }[] = [];
+    for (const [tableName, stats] of this.btreeIndexStats.entries()) {
+      if (table && tableName.toUpperCase() !== table.toUpperCase()) continue;
+      out.push({ table: tableName, keys: stats.keys, rowsIndexed: stats.rowsIndexed });
+    }
+    out.sort((a, b) => this.textOrder(a.table, b.table));
+    return out;
+  }
+
+  private syncConstraintIndexesToCatalog(table: string): void {
+    const schema = this.schemas.get(table);
+    if (!schema) return;
+
+    for (const [indexName, entry] of [...this.indexCatalog.entries()]) {
+      if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
+      if (!entry.unique) continue;
+      if (!indexName.startsWith(`__${table.toUpperCase()}__`)) continue;
+      this.indexCatalog.delete(indexName);
+    }
+
+    const groups = this.getUniqueGroups(table, schema);
+    for (const group of groups) {
+      const normalizedColumns = group.map((column) => column.trim());
+      const syntheticName = this.normalizeIndexName(`__${table}__${normalizedColumns.join("_")}__UNQ`);
+      this.indexCatalog.set(syntheticName, {
+        name: syntheticName,
+        table,
+        columns: normalizedColumns,
+        type: "HASH",
+        unique: true,
+        status: "ACTIVE",
+      });
+    }
   }
 
   private getUniqueGroups(table: string, schema?: TableSchema): string[][] {
@@ -3881,8 +8510,9 @@ export class WalrusSqlClient {
     };
   }
 
-  private inferUnionColumns(selectSql: string): string[] | undefined {
+  private inferSetOpColumns(selectSql: string): string[] | undefined {
     const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind === "union" || ast.kind === "intersect" || ast.kind === "except") return this.inferSetOpColumns(ast.leftSql);
     if (ast.kind !== "select") return undefined;
 
     return ast.selectItems.map((it, idx) => {
@@ -3899,8 +8529,43 @@ export class WalrusSqlClient {
     });
   }
 
-  private normalizeUnionRow(row: SqlRow, columns: string[]): SqlRow {
+  private inferSetOpArity(selectSql: string): number | undefined {
+    const ast = parseSqlToAst(selectSql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind === "select") return ast.selectItems.length;
+    if (ast.kind !== "union" && ast.kind !== "intersect" && ast.kind !== "except") return undefined;
+
+    const setOpToken = ast.kind === "union" ? "UNION" : ast.kind === "intersect" ? "INTERSECT" : "EXCEPT";
+    const left = this.inferSetOpArity(ast.leftSql);
+    const right = this.inferSetOpArity(ast.rightSql);
+    this.assertSetOpArityCompatible(left, right, setOpToken);
+    return left ?? right;
+  }
+
+  private inferRuntimeProjectionColumns(rows: SqlRow[]): string[] | undefined {
+    if (!rows.length) return undefined;
+    const [first] = rows;
+    if (!first) return undefined;
+    return Object.keys(first);
+  }
+
+  private assertSetOpArityCompatible(left?: number, right?: number, setOpToken: "UNION" | "INTERSECT" | "EXCEPT" = "UNION"): void {
+    if (left === undefined || right === undefined) return;
+    if (left === right) return;
+    throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
+      message: `${setOpToken} branches must project the same number of columns (left=${left}, right=${right})`,
+      token: setOpToken,
+    });
+  }
+
+  private normalizeSetOpRow(row: SqlRow, columns: string[], setOpToken: "UNION" | "INTERSECT" | "EXCEPT" = "UNION"): SqlRow {
     const values = Object.values(row);
+    if (values.length !== columns.length) {
+      throw createSqlError("SQL_SEMANTIC_TYPE_MISMATCH", {
+        message: `${setOpToken} branch row width mismatch: expected ${columns.length} columns but got ${values.length}`,
+        token: setOpToken,
+      });
+    }
+
     const out: SqlRow = {};
     columns.forEach((col, idx) => {
       out[col] = values[idx] ?? null;
@@ -3908,7 +8573,83 @@ export class WalrusSqlClient {
     return out;
   }
 
-  private splitSelectTail(sql: string): {
+  private combineUnionRows(leftRows: SqlRow[], rightRows: SqlRow[], all: boolean): SqlRow[] {
+    if (all) return [...leftRows, ...rightRows];
+
+    const dedup = new Map<string, SqlRow>();
+    for (const row of [...leftRows, ...rightRows]) {
+      dedup.set(this.makeRowKey(row), row);
+    }
+    return [...dedup.values()];
+  }
+
+  private combineIntersectRows(leftRows: SqlRow[], rightRows: SqlRow[], all: boolean): SqlRow[] {
+    if (all) {
+      const rightCounts = new Map<string, number>();
+      for (const row of rightRows) {
+        const key = this.makeRowKey(row);
+        rightCounts.set(key, (rightCounts.get(key) ?? 0) + 1);
+      }
+
+      const out: SqlRow[] = [];
+      for (const row of leftRows) {
+        const key = this.makeRowKey(row);
+        const remaining = rightCounts.get(key) ?? 0;
+        if (remaining <= 0) continue;
+        out.push(row);
+        if (remaining === 1) rightCounts.delete(key);
+        else rightCounts.set(key, remaining - 1);
+      }
+      return out;
+    }
+
+    const rightKeys = new Set(rightRows.map((row) => this.makeRowKey(row)));
+    const out: SqlRow[] = [];
+    const emitted = new Set<string>();
+    for (const row of leftRows) {
+      const key = this.makeRowKey(row);
+      if (!rightKeys.has(key) || emitted.has(key)) continue;
+      emitted.add(key);
+      out.push(row);
+    }
+    return out;
+  }
+
+  private combineExceptRows(leftRows: SqlRow[], rightRows: SqlRow[], all: boolean): SqlRow[] {
+    if (all) {
+      const rightCounts = new Map<string, number>();
+      for (const row of rightRows) {
+        const key = this.makeRowKey(row);
+        rightCounts.set(key, (rightCounts.get(key) ?? 0) + 1);
+      }
+
+      const out: SqlRow[] = [];
+      for (const row of leftRows) {
+        const key = this.makeRowKey(row);
+        const remaining = rightCounts.get(key) ?? 0;
+        if (remaining > 0) {
+          if (remaining === 1) rightCounts.delete(key);
+          else rightCounts.set(key, remaining - 1);
+          continue;
+        }
+        out.push(row);
+      }
+      return out;
+    }
+
+    const rightKeys = new Set(rightRows.map((row) => this.makeRowKey(row)));
+    const out: SqlRow[] = [];
+    const emitted = new Set<string>();
+    for (const row of leftRows) {
+      const key = this.makeRowKey(row);
+      if (rightKeys.has(key) || emitted.has(key)) continue;
+      emitted.add(key);
+      out.push(row);
+    }
+    return out;
+  }
+
+  private splitSelectTail(sql: string, setOpToken: "UNION" | "INTERSECT" | "EXCEPT" = "UNION"): {
     baseSql: string;
     orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
     limit?: number;
@@ -3917,8 +8658,8 @@ export class WalrusSqlClient {
     const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
     if (ast.kind !== "select") {
       throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-        message: "UNION right branch must be a SELECT statement for tail planning",
-        token: "UNION",
+        message: `${setOpToken} right branch must be a SELECT statement for tail planning`,
+        token: setOpToken,
         dialect: this.opts.dialect ?? "ansi",
       });
     }
@@ -3932,7 +8673,7 @@ export class WalrusSqlClient {
             const rendered = exprAstToSql(o.expr);
             if (!rendered) {
               throw createSqlError("SQL_SEMANTIC_UNKNOWN_IDENTIFIER", {
-                message: "Unable to render ORDER BY expression in UNION tail",
+                message: `Unable to render ORDER BY expression in ${setOpToken} tail`,
                 token: "ORDER BY",
               });
             }
@@ -4120,10 +8861,335 @@ export class WalrusSqlClient {
     };
   }
 
+  private resolveJoinFieldValue(row: SqlRow, field: string): SqlPrimitive | undefined {
+    const trimmed = field.trim();
+    if (!trimmed) return undefined;
+    if (Object.prototype.hasOwnProperty.call(row, trimmed)) return row[trimmed] as SqlPrimitive;
+
+    const parts = trimmed.split(".");
+    const unqualified = parts.at(-1) ?? trimmed;
+    if (Object.prototype.hasOwnProperty.call(row, unqualified)) return row[unqualified] as SqlPrimitive;
+    return undefined;
+  }
+
+  private toJoinComparableKey(value: SqlPrimitive | undefined, sourceContext: string): string | null {
+    if (value === null || value === undefined) return null;
+    return this.encodeTypedKey(value, sourceContext);
+  }
+
+  private mergeJoinedRows(leftTable: string, leftRow: SqlRow, rightTable: string, rightRow: SqlRow): SqlRow {
+    const merged: SqlRow = {};
+    for (const [k, v] of Object.entries(leftRow)) {
+      merged[k] = v;
+      merged[`${leftTable}.${k}`] = v;
+    }
+    for (const [k, v] of Object.entries(rightRow)) {
+      merged[`${rightTable}.${k}`] = v;
+      if (!(k in merged)) merged[k] = v;
+    }
+    return merged;
+  }
+
+  private mergeUnmatchedLeftRow(leftTable: string, leftRow: SqlRow, rightTable?: string): SqlRow {
+    const merged: SqlRow = {};
+    for (const [k, v] of Object.entries(leftRow)) {
+      merged[k] = v;
+      merged[`${leftTable}.${k}`] = v;
+    }
+
+    if (rightTable) {
+      const rightColumns = this.schemas.get(rightTable)?.columns.map((c) => c.name) ?? [];
+      for (const col of rightColumns) {
+        merged[`${rightTable}.${col}`] = null;
+        if (!(col in merged)) merged[col] = null;
+      }
+    }
+
+    return merged;
+  }
+
+  private mergeUnmatchedRightRow(rightTable: string, rightRow: SqlRow, leftTable?: string): SqlRow {
+    const merged: SqlRow = {};
+
+    if (leftTable) {
+      const leftColumns = this.schemas.get(leftTable)?.columns.map((c) => c.name) ?? [];
+      for (const col of leftColumns) {
+        merged[`${leftTable}.${col}`] = null;
+        if (!(col in merged)) merged[col] = null;
+      }
+    }
+
+    for (const [k, v] of Object.entries(rightRow)) {
+      merged[`${rightTable}.${k}`] = v;
+      if (!(k in merged)) merged[k] = v;
+    }
+    return merged;
+  }
+
+  private applyNestedLoopJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
+  ): SqlRow[] {
+    const out: SqlRow[] = [];
+    const matchedRightIndexes = new Set<number>();
+
+    for (const leftRow of leftRows) {
+      let matched = false;
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        const rightRow = rightRows[ri]!;
+        const leftVal = this.resolveJoinFieldValue(leftRow, join.leftField);
+        const rightVal = this.resolveJoinFieldValue(rightRow, join.rightField);
+        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
+        matched = true;
+        matchedRightIndexes.add(ri);
+        out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRow));
+      }
+
+      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRightIndexes.has(ri)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
+      }
+    }
+
+    return out;
+  }
+
+  private applyHashJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
+  ): SqlRow[] {
+    const rightIndex = new Map<string, number[]>();
+
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+        "join.hash.right",
+      );
+      if (key === null) continue;
+      const bucket = rightIndex.get(key);
+      if (bucket) bucket.push(ri);
+      else rightIndex.set(key, [ri]);
+    }
+
+    const out: SqlRow[] = [];
+    const matchedRightIndexes = new Set<number>();
+
+    for (const leftRow of leftRows) {
+      let matched = false;
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(leftRow, join.leftField),
+        "join.hash.left",
+      );
+      const rightHits = key === null ? undefined : rightIndex.get(key);
+      if (rightHits?.length) {
+        for (const ri of rightHits) {
+          matched = true;
+          matchedRightIndexes.add(ri);
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[ri]!));
+        }
+      }
+
+      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRightIndexes.has(ri)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
+      }
+    }
+
+    return out;
+  }
+
+  private applySortMergeJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[] = this.requireTable(join.table),
+  ): SqlRow[] {
+    type JoinEntry = { key: string; rowIndex: number };
+
+    const leftEntries: JoinEntry[] = [];
+    for (let li = 0; li < leftRows.length; li++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(leftRows[li]!, join.leftField),
+        "join.merge.left",
+      );
+      if (key !== null) leftEntries.push({ key, rowIndex: li });
+    }
+
+    const rightEntries: JoinEntry[] = [];
+    for (let ri = 0; ri < rightRows.length; ri++) {
+      const key = this.toJoinComparableKey(
+        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+        "join.merge.right",
+      );
+      if (key !== null) rightEntries.push({ key, rowIndex: ri });
+    }
+
+    leftEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : this.textOrder(a.key, b.key)));
+    rightEntries.sort((a, b) => (a.key === b.key ? a.rowIndex - b.rowIndex : this.textOrder(a.key, b.key)));
+
+    const matchesByLeft = new Map<number, number[]>();
+    const matchedRightIndexes = new Set<number>();
+
+    let li = 0;
+    let ri = 0;
+    while (li < leftEntries.length && ri < rightEntries.length) {
+      const leftEntry = leftEntries[li]!;
+      const rightEntry = rightEntries[ri]!;
+      const cmp = this.textOrder(leftEntry.key, rightEntry.key);
+
+      if (cmp < 0) {
+        li += 1;
+        continue;
+      }
+      if (cmp > 0) {
+        ri += 1;
+        continue;
+      }
+
+      let liEnd = li + 1;
+      while (liEnd < leftEntries.length && leftEntries[liEnd]!.key === leftEntry.key) liEnd += 1;
+      let riEnd = ri + 1;
+      while (riEnd < rightEntries.length && rightEntries[riEnd]!.key === rightEntry.key) riEnd += 1;
+
+      const rightGroupIndexes = rightEntries.slice(ri, riEnd).map((entry) => entry.rowIndex);
+      for (let leftIdx = li; leftIdx < liEnd; leftIdx++) {
+        const leftRowIndex = leftEntries[leftIdx]!.rowIndex;
+        const bucket = matchesByLeft.get(leftRowIndex) ?? [];
+        for (const rightRowIndex of rightGroupIndexes) {
+          bucket.push(rightRowIndex);
+          matchedRightIndexes.add(rightRowIndex);
+        }
+        matchesByLeft.set(leftRowIndex, bucket);
+      }
+
+      li = liEnd;
+      ri = riEnd;
+    }
+
+    const out: SqlRow[] = [];
+    for (let leftRowIndex = 0; leftRowIndex < leftRows.length; leftRowIndex++) {
+      const leftRow = leftRows[leftRowIndex]!;
+      const rightHits = matchesByLeft.get(leftRowIndex);
+      if (rightHits?.length) {
+        for (const rightRowIndex of rightHits) {
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[rightRowIndex]!));
+        }
+        continue;
+      }
+      if (join.type === "LEFT" || join.type === "FULL") {
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRow, join.table));
+      }
+    }
+
+    if (join.type === "FULL") {
+      for (let rightRowIndex = 0; rightRowIndex < rightRows.length; rightRowIndex++) {
+        if (matchedRightIndexes.has(rightRowIndex)) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[rightRowIndex]!, leftTable));
+      }
+    }
+
+    return out;
+  }
+
+  private shouldApplyJoinSpillStrategy(
+    algorithm: JoinExecutionAlgorithm,
+    leftRows: number,
+    rightRows: number,
+  ): boolean {
+    if (algorithm === "NESTED_LOOP") return false;
+    const budgetRows = this.getJoinMemoryBudgetRows();
+    const estimatedMemoryRows = this.estimateJoinAlgorithmMemoryRows(algorithm, leftRows, rightRows);
+    return estimatedMemoryRows > budgetRows;
+  }
+
+  private applySpillChunkJoin(
+    leftTable: string,
+    leftRows: SqlRow[],
+    join: NonNullable<ParsedSelect["join"]>,
+    rightRows: SqlRow[],
+    chunkRows: number,
+  ): { rows: SqlRow[]; chunks: number; rowsProcessed: number } {
+    const safeChunkRows = Math.max(1, Math.floor(chunkRows));
+    const out: SqlRow[] = [];
+    const trackLeft = join.type === "LEFT" || join.type === "FULL";
+    const matchedLeft = trackLeft ? new Uint8Array(leftRows.length) : null;
+    const matchedRight = join.type === "FULL" ? new Uint8Array(rightRows.length) : null;
+    let chunks = 0;
+    let rowsProcessed = 0;
+
+    for (let chunkStart = 0; chunkStart < rightRows.length; chunkStart += safeChunkRows) {
+      const chunkEnd = Math.min(rightRows.length, chunkStart + safeChunkRows);
+      chunks += 1;
+      rowsProcessed += chunkEnd - chunkStart;
+
+      const rightIndex = new Map<string, number[]>();
+      for (let ri = chunkStart; ri < chunkEnd; ri++) {
+        const key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+          "join.spill.right",
+        );
+        if (key === null) continue;
+        const bucket = rightIndex.get(key);
+        if (bucket) bucket.push(ri);
+        else rightIndex.set(key, [ri]);
+      }
+
+      for (let li = 0; li < leftRows.length; li++) {
+        const leftRow = leftRows[li]!;
+        const key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(leftRow, join.leftField),
+          "join.spill.left",
+        );
+        const rightHits = key === null ? undefined : rightIndex.get(key);
+        if (!rightHits?.length) continue;
+
+        if (matchedLeft) matchedLeft[li] = 1;
+        for (const ri of rightHits) {
+          if (matchedRight) matchedRight[ri] = 1;
+          out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRows[ri]!));
+        }
+      }
+    }
+
+    if (matchedLeft) {
+      for (let li = 0; li < leftRows.length; li++) {
+        if (matchedLeft[li] === 1) continue;
+        out.push(this.mergeUnmatchedLeftRow(leftTable, leftRows[li]!, join.table));
+      }
+    }
+
+    if (matchedRight) {
+      for (let ri = 0; ri < rightRows.length; ri++) {
+        if (matchedRight[ri] === 1) continue;
+        out.push(this.mergeUnmatchedRightRow(join.table, rightRows[ri]!, leftTable));
+      }
+    }
+
+    return { rows: out, chunks, rowsProcessed };
+  }
+
   private applyJoin(
     leftTable: string,
     leftRows: SqlRow[],
     join: NonNullable<ParsedSelect["join"]>,
+    algorithm: JoinExecutionAlgorithm = "NESTED_LOOP",
+    spillStats?: JoinSpillRuntimeStats,
   ): SqlRow[] {
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
@@ -4133,61 +9199,29 @@ export class WalrusSqlClient {
         leftField: join.rightField,
         rightField: join.leftField,
       };
-      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin);
+      return this.applyJoin(join.table, syntheticLeftRows, syntheticJoin, algorithm, spillStats);
     }
 
     const rightRows = this.requireTable(join.table);
-    const leftField = join.leftField.includes(".") ? join.leftField.split(".")[1] : join.leftField;
-    const rightField = join.rightField.includes(".") ? join.rightField.split(".")[1] : join.rightField;
-
-    const out: SqlRow[] = [];
-    const matchedRightIndexes = new Set<number>();
-    for (const l of leftRows) {
-      let matched = false;
-      for (let ri = 0; ri < rightRows.length; ri++) {
-        const r = rightRows[ri]!;
-        const leftVal = l[leftField];
-        const rightVal = r[rightField];
-        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
-        matched = true;
-        matchedRightIndexes.add(ri);
-        const merged: SqlRow = {};
-
-        for (const [k, v] of Object.entries(l)) {
-          merged[k] = v;
-          merged[`${leftTable}.${k}`] = v;
-        }
-        for (const [k, v] of Object.entries(r)) {
-          merged[`${join.table}.${k}`] = v;
-          if (!(k in merged)) merged[k] = v;
-        }
-
-        out.push(merged);
+    if (this.shouldApplyJoinSpillStrategy(algorithm, leftRows.length, rightRows.length)) {
+      const spill = this.applySpillChunkJoin(
+        leftTable,
+        leftRows,
+        join,
+        rightRows,
+        this.getJoinSpillChunkRows(),
+      );
+      if (spillStats) {
+        spillStats.steps += 1;
+        spillStats.chunks += spill.chunks;
+        spillStats.rowsProcessed += spill.rowsProcessed;
       }
-
-      if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-        const merged: SqlRow = {};
-        for (const [k, v] of Object.entries(l)) {
-          merged[k] = v;
-          merged[`${leftTable}.${k}`] = v;
-        }
-        out.push(merged);
-      }
+      return spill.rows;
     }
 
-    if (join.type === "FULL") {
-      for (let ri = 0; ri < rightRows.length; ri++) {
-        if (matchedRightIndexes.has(ri)) continue;
-        const r = rightRows[ri]!;
-        const merged: SqlRow = {};
-        for (const [k, v] of Object.entries(r)) {
-          merged[`${join.table}.${k}`] = v;
-          if (!(k in merged)) merged[k] = v;
-        }
-        out.push(merged);
-      }
-    }
-    return out;
+    if (algorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join, rightRows);
+    if (algorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join, rightRows);
+    return this.applyNestedLoopJoin(leftTable, leftRows, join, rightRows);
   }
 
   private parseWhereTree(whereExpr: string): WhereExprNode {
@@ -4500,15 +9534,18 @@ export class WalrusSqlClient {
       };
     }
 
-    const cmpSubqueryMatch = expr.match(
-      /^([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(=|!=|<>|>=|<=|>|<)\s*\(\s*(SELECT\s+.+)\s*\)$/i,
-    );
-    if (cmpSubqueryMatch) {
-      return {
-        field: cmpSubqueryMatch[1],
-        op: cmpSubqueryMatch[2] as CompareOp,
-        subquerySql: cmpSubqueryMatch[3],
-      };
+    const cmpSubqueryTopLevel = this.findTopLevelComparator(expr);
+    if (cmpSubqueryTopLevel) {
+      const rightSubquery = cmpSubqueryTopLevel.right.trim().match(/^\(\s*(SELECT\s+.+)\s*\)$/i);
+      if (rightSubquery) {
+        const leftParsed = this.parseFieldExpr(cmpSubqueryTopLevel.left);
+        return {
+          field: leftParsed.field,
+          valueExpr: leftParsed.valueExpr,
+          op: cmpSubqueryTopLevel.op as CompareOp,
+          subquerySql: rightSubquery[1]!.trim(),
+        };
+      }
     }
 
     const truthPredMatch = expr.match(/^(.+?)\s+IS\s+(NOT\s+)?(TRUE|FALSE|UNKNOWN)$/i);
@@ -4613,22 +9650,40 @@ export class WalrusSqlClient {
 
   private parseSubquerySelect(subquerySql: string, outerRow?: SqlRow): SqlRow[] {
     const normalized = subquerySql.trim().replace(/\s+/g, " ");
-    const m = normalized.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WHERE\s+(.+))?$/i);
-    if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", subquerySql);
+    const plan = this.getParsedSubqueryPlan(normalized);
+    const stats = this.getOrCreateSubqueryStats(normalized);
+    const correlated = plan.outerRefs.length > 0;
 
-    const fieldExpr = m[1]!.trim();
-    const table = m[2]!.trim();
-    const where = m[3]?.trim();
+    stats.executions += 1;
+    if (correlated) stats.correlatedExecutions += 1;
 
-    const rows = this.requireTable(table);
-    const boundWhere = where && outerRow ? this.bindOuterRefs(where, outerRow) : where;
-    const filtered = boundWhere
-      ? rows.filter((r) => this.evaluateWhereTree(r, this.parseWhereTree(boundWhere)) === "TRUE")
-      : rows;
+    const cacheKey = this.buildSubqueryResultCacheKey(plan, outerRow);
+    const cached = this.subqueryRuntime?.resultCache.get(cacheKey);
+    if (cached) {
+      stats.cacheHits += 1;
+      stats.rowsReturned += cached.length;
+      return this.deepCloneRows(cached);
+    }
+    stats.cacheMisses += 1;
 
-    if (fieldExpr === "*") return filtered.map((r) => ({ ...r }));
+    const sourceRows = this.requireTable(plan.table);
+    const matchedInnerRows: SqlRow[] = [];
+    const matchedEvalRows: SqlRow[] = [];
+    for (const innerRow of sourceRows) {
+      this.consumeSubqueryCost(stats, correlated, normalized);
+      const evalRow = this.buildSubqueryEvalRow(innerRow, plan.table, plan.tableAlias, outerRow);
+      if (plan.whereTree && this.evaluateWhereTree(evalRow, plan.whereTree) !== "TRUE") continue;
+      matchedInnerRows.push({ ...innerRow });
+      matchedEvalRows.push(evalRow);
+    }
 
-    const aggMatch = fieldExpr.match(
+    if (plan.fieldExpr === "*") {
+      stats.rowsReturned += matchedInnerRows.length;
+      this.storeSubqueryResultCache(cacheKey, matchedInnerRows);
+      return this.deepCloneRows(matchedInnerRows);
+    }
+
+    const aggMatch = plan.fieldExpr.match(
       /^([a-zA-Z_][a-zA-Z0-9_]*)\((\*|[a-zA-Z_][a-zA-Z0-9_\.]*)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*))?$/i,
     );
     if (aggMatch) {
@@ -4638,31 +9693,115 @@ export class WalrusSqlClient {
 
       if (fn === "COUNT") {
         const count = aggField === "*"
-          ? filtered.length
-          : filtered.filter((r) => this.resolveRowValue(r, aggField) !== null && this.resolveRowValue(r, aggField) !== undefined).length;
-        return [{ [alias]: count }];
+          ? matchedEvalRows.length
+          : matchedEvalRows.filter((r) => {
+              const value = this.resolveRowValue(r, aggField);
+              return value !== null && value !== undefined;
+            }).length;
+        const out = [{ [alias]: count }];
+        stats.rowsReturned += out.length;
+        this.storeSubqueryResultCache(cacheKey, out);
+        return this.deepCloneRows(out);
       }
 
-      const nums = filtered
+      const nums = matchedEvalRows
         .map((r) => Number(this.resolveRowValue(r, aggField)))
         .filter((n) => Number.isFinite(n));
 
-      if (fn === "SUM") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) : null }];
-      if (fn === "AVG") return [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null }];
-      if (fn === "MIN") return [{ [alias]: nums.length ? Math.min(...nums) : null }];
-      if (fn === "MAX") return [{ [alias]: nums.length ? Math.max(...nums) : null }];
+      let out: SqlRow[] | null = null;
+      if (fn === "SUM") out = [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) : null }];
+      else if (fn === "AVG") out = [{ [alias]: nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null }];
+      else if (fn === "MIN") out = [{ [alias]: nums.length ? Math.min(...nums) : null }];
+      else if (fn === "MAX") out = [{ [alias]: nums.length ? Math.max(...nums) : null }];
+      if (out) {
+        stats.rowsReturned += out.length;
+        this.storeSubqueryResultCache(cacheKey, out);
+        return this.deepCloneRows(out);
+      }
     }
 
-    const fields = fieldExpr.split(",").map((x) => x.trim()).filter(Boolean);
-    return filtered.map((row) => {
+    const fields = this.splitTopLevelComma(plan.fieldExpr).map((x) => x.trim()).filter(Boolean);
+    const projected = matchedEvalRows.map((row) => {
       const out: SqlRow = {};
       for (const f of fields) out[f] = this.evalExpr(row, f) ?? null;
       return out;
     });
+    stats.rowsReturned += projected.length;
+    this.storeSubqueryResultCache(cacheKey, projected);
+    return this.deepCloneRows(projected);
+  }
+
+  private parseSubqueryExistsValue(subquerySql: string, outerRow?: SqlRow): boolean {
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    const plan = this.getParsedSubqueryPlan(normalized);
+    const aggMatch = plan.fieldExpr.match(
+      /^([a-zA-Z_][a-zA-Z0-9_]*)\((\*|[a-zA-Z_][a-zA-Z0-9_\.]*)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_\.]*))?$/i,
+    );
+    if (aggMatch) {
+      const fn = aggMatch[1]!.toUpperCase();
+      if (fn === "COUNT" || fn === "SUM" || fn === "AVG" || fn === "MIN" || fn === "MAX") {
+        return this.parseSubquerySelect(normalized, outerRow).length > 0;
+      }
+    }
+
+    const stats = this.getOrCreateSubqueryStats(normalized);
+    const correlated = plan.outerRefs.length > 0;
+
+    stats.executions += 1;
+    if (correlated) stats.correlatedExecutions += 1;
+
+    const cacheKey = `${this.buildSubqueryResultCacheKey(plan, outerRow)}::EXISTS`;
+    const cached = this.subqueryRuntime?.resultCache.get(cacheKey);
+    if (cached) {
+      stats.cacheHits += 1;
+      stats.rowsReturned += cached.length;
+      return cached.length > 0;
+    }
+    stats.cacheMisses += 1;
+
+    const sourceRows = this.requireTable(plan.table);
+    for (const innerRow of sourceRows) {
+      this.consumeSubqueryCost(stats, correlated, normalized);
+      const evalRow = this.buildSubqueryEvalRow(innerRow, plan.table, plan.tableAlias, outerRow);
+      if (plan.whereTree && this.evaluateWhereTree(evalRow, plan.whereTree) !== "TRUE") continue;
+
+      const existsRow: SqlRow[] = [{ __exists: 1 }];
+      stats.rowsReturned += existsRow.length;
+      this.storeSubqueryResultCache(cacheKey, existsRow);
+      return true;
+    }
+
+    this.storeSubqueryResultCache(cacheKey, []);
+    return false;
+  }
+
+  private assertSubquerySingleColumnProjection(plan: ParsedSubqueryPlan, subquerySql: string): void {
+    const fieldExpr = plan.fieldExpr.trim();
+    if (fieldExpr === "*") {
+      const schema = this.schemas.get(plan.table);
+      const projectedCount = schema?.columns.length
+        ?? (() => {
+          const first = this.tables.get(plan.table)?.[0];
+          return first ? Object.keys(first).length : undefined;
+        })();
+      if (projectedCount !== undefined && projectedCount !== 1) {
+        throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
+      }
+      return;
+    }
+
+    const projectedFields = this.splitTopLevelComma(fieldExpr).map((x) => x.trim()).filter(Boolean);
+    if (projectedFields.length !== 1) {
+      throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
+    }
   }
 
   private parseSubqueryValues(subquerySql: string, field?: string, outerRow?: SqlRow): SqlPrimitive[] {
-    const rows = this.parseSubquerySelect(subquerySql, outerRow);
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    const plan = this.getParsedSubqueryPlan(normalized);
+    if (!field) this.assertSubquerySingleColumnProjection(plan, normalized);
+
+    const rows = this.parseSubquerySelect(normalized, outerRow);
     if (!rows.length) return [];
 
     if (field) {
@@ -4674,6 +9813,65 @@ export class WalrusSqlClient {
     if (keys.length !== 1) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", `Subquery must return exactly 1 column: ${subquerySql}`);
     const key = keys[0]!;
     return rows.map((r) => r[key] ?? null);
+  }
+
+  private tryGetUncorrelatedSubqueryPlan(subquerySql: string): ParsedSubqueryPlan | null {
+    const normalized = subquerySql.trim().replace(/\s+/g, " ");
+    if (!normalized) return null;
+    try {
+      const plan = this.getParsedSubqueryPlan(normalized);
+      if (plan.outerRefs.length > 0) return null;
+      return plan;
+    } catch {
+      return null;
+    }
+  }
+
+  private tryUnnestUncorrelatedSubqueryValues(subquerySql: string): SqlPrimitive[] | null {
+    if (!this.subqueryRuntime) return null;
+    const plan = this.tryGetUncorrelatedSubqueryPlan(subquerySql);
+    if (!plan) return null;
+
+    const cacheKey = `${plan.normalizedSql}::UNNEST_VALUES`;
+    const cached = this.subqueryRuntime.unnestCache.get(cacheKey);
+    if (cached?.kind === "VALUES") return [...cached.values];
+
+    const values = this.parseSubqueryValues(plan.normalizedSql, undefined, undefined);
+    this.subqueryRuntime.unnestCache.set(cacheKey, { kind: "VALUES", values: [...values] });
+    return values;
+  }
+
+  private tryUnnestUncorrelatedSubqueryExists(subquerySql: string): boolean | null {
+    if (!this.subqueryRuntime) return null;
+    const plan = this.tryGetUncorrelatedSubqueryPlan(subquerySql);
+    if (!plan) return null;
+
+    const cacheKey = `${plan.normalizedSql}::UNNEST_EXISTS`;
+    const cached = this.subqueryRuntime.unnestCache.get(cacheKey);
+    if (cached?.kind === "EXISTS") return cached.exists;
+
+    const exists = this.parseSubqueryExistsValue(plan.normalizedSql, undefined);
+    this.subqueryRuntime.unnestCache.set(cacheKey, { kind: "EXISTS", exists });
+    return exists;
+  }
+
+  private hasUnnestableUncorrelatedSubquery(whereClauses: WhereClause[]): boolean {
+    for (const clause of whereClauses) {
+      const subquerySql = clause.subquerySql ?? (typeof clause.value === "string" ? clause.value : undefined);
+      if (!subquerySql) continue;
+      if (
+        clause.op !== "IN_SUBQUERY"
+        && clause.op !== "NOT_IN_SUBQUERY"
+        && clause.op !== "EXISTS"
+        && clause.op !== "NOT_EXISTS"
+        && clause.op !== "ANY"
+        && clause.op !== "ALL"
+      ) {
+        continue;
+      }
+      if (this.tryGetUncorrelatedSubqueryPlan(subquerySql)) return true;
+    }
+    return false;
   }
 
   private parseScalarSubqueryValue(subquerySql: string, outerRow?: SqlRow): SqlPrimitive {
@@ -4714,17 +9912,6 @@ export class WalrusSqlClient {
       quantifier: m[3]!.toUpperCase() === "SOME" ? "ANY" : (m[3]!.toUpperCase() as "ANY" | "ALL"),
       subquerySql: m[4]!.trim(),
     };
-  }
-
-  private bindOuterRefs(expr: string, outerRow: SqlRow): string {
-    return expr.replace(/\bouter\.([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_m, key: string) => {
-      const v = outerRow[key];
-      if (v === null || v === undefined) return "NULL";
-      if (typeof v === "number") return String(v);
-      if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
-      const s = String(v).replace(/'/g, "''");
-      return `'${s}'`;
-    });
   }
 
   private evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
@@ -4964,6 +10151,15 @@ export class WalrusSqlClient {
     );
   }
 
+  private textOrder(a: string, b: string): number {
+    const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(a, b, "text.order");
+    const lt = typedValueComparator.lt(leftTyped, rightTyped);
+    if (lt === true) return -1;
+    const gt = typedValueComparator.gt(leftTyped, rightTyped);
+    if (gt === true) return 1;
+    return 0;
+  }
+
   private normalizeComparableTypedPair(
     left: SqlPrimitive | undefined,
     right: SqlPrimitive | undefined,
@@ -5078,19 +10274,70 @@ export class WalrusSqlClient {
 
   private applyWhereClauses(rows: SqlRow[], clauses: WhereClause[]): SqlRow[] {
     return rows.filter((row) => {
-      let acc: TruthValue | null = null;
-      for (const c of clauses) {
-        const matched = this.evaluateClause(row, c);
-        if (acc === null) {
-          acc = matched;
-        } else if (c.logic === "OR") {
-          acc = this.tvOr(acc, matched);
-        } else {
-          acc = this.tvAnd(acc, matched);
-        }
-      }
-      return acc === "TRUE";
+      return this.evaluateClauseChain(row, clauses) === "TRUE";
     });
+  }
+
+  private evaluateClauseChain(row: SqlRow, clauses: WhereClause[]): TruthValue {
+    let acc: TruthValue | null = null;
+    for (const c of clauses) {
+      const matched = this.evaluateClause(row, c);
+      if (acc === null) {
+        acc = matched;
+      } else if (c.logic === "OR") {
+        acc = this.tvOr(acc, matched);
+      } else {
+        acc = this.tvAnd(acc, matched);
+      }
+    }
+    return acc ?? "FALSE";
+  }
+
+  private evaluateSelectPredicateRow(row: SqlRow, logicalPlan: LogicalSelectPlan, parsed: ParsedSelect): boolean {
+    if (logicalPlan.predicateSource === "AST" && parsed.whereAst) {
+      return this.evaluateWhereAst(row, parsed.whereAst, parsed.where) === "TRUE";
+    }
+    if (logicalPlan.predicateSource === "TREE" && parsed.whereTree) {
+      return this.evaluateWhereTree(row, parsed.whereTree) === "TRUE";
+    }
+    if (logicalPlan.predicateSource === "CLAUSES" && parsed.whereClauses.length > 0) {
+      return this.evaluateClauseChain(row, parsed.whereClauses) === "TRUE";
+    }
+    return true;
+  }
+
+  private executeSelectPipelineRows(
+    rows: SqlRow[],
+    logicalPlan: LogicalSelectPlan,
+    parsed: ParsedSelect,
+  ): { rows: SqlRow[]; rowsVisited: number; earlyStop: boolean } {
+    const offset = Math.max(0, logicalPlan.offset ?? 0);
+    const rawLimit = logicalPlan.limit;
+    const hasLimit = rawLimit !== undefined;
+    const limit = hasLimit ? Math.max(0, rawLimit ?? 0) : undefined;
+    if (limit === 0) return { rows: [], rowsVisited: 0, earlyStop: true };
+
+    let rowsVisited = 0;
+    let matchedRows = 0;
+    let emittedRows = 0;
+    const out: SqlRow[] = [];
+
+    for (const row of rows) {
+      rowsVisited += 1;
+      if (!this.evaluateSelectPredicateRow(row, logicalPlan, parsed)) continue;
+      if (matchedRows < offset) {
+        matchedRows += 1;
+        continue;
+      }
+
+      out.push(this.pickFields(row, logicalPlan.fields));
+      emittedRows += 1;
+      if (limit !== undefined && emittedRows >= limit) {
+        return { rows: out, rowsVisited, earlyStop: true };
+      }
+    }
+
+    return { rows: out, rowsVisited, earlyStop: false };
   }
 
   private likeToRegex(patternRaw: string, escapeChar?: string): string {
@@ -5123,7 +10370,8 @@ export class WalrusSqlClient {
   private evaluateClause(row: SqlRow, clause: WhereClause): TruthValue {
     if (clause.op === "EXISTS" || clause.op === "NOT_EXISTS") {
       const subquerySql = String(clause.value ?? "");
-      const exists = this.parseSubquerySelect(subquerySql, row).length > 0;
+      const unnestExists = this.tryUnnestUncorrelatedSubqueryExists(subquerySql);
+      const exists = unnestExists ?? this.parseSubqueryExistsValue(subquerySql, row);
       const tv: TruthValue = exists ? "TRUE" : "FALSE";
       return clause.op === "EXISTS" ? tv : this.tvNot(tv);
     }
@@ -5132,7 +10380,7 @@ export class WalrusSqlClient {
 
     if (clause.op === "ANY" || clause.op === "ALL") {
       const subquerySql = String(clause.value ?? "");
-      const values = this.parseSubqueryValues(subquerySql, undefined, row);
+      const values = this.tryUnnestUncorrelatedSubqueryValues(subquerySql) ?? this.parseSubqueryValues(subquerySql, undefined, row);
       const cmp = clause.compareOp ?? "=";
 
       if (!values.length) {
@@ -5159,7 +10407,8 @@ export class WalrusSqlClient {
     }
 
     if (clause.op === "IN_SUBQUERY" || clause.op === "NOT_IN_SUBQUERY") {
-      const values = this.parseSubqueryValues(clause.subquerySql ?? "", undefined, row);
+      const values = this.tryUnnestUncorrelatedSubqueryValues(clause.subquerySql ?? "")
+        ?? this.parseSubqueryValues(clause.subquerySql ?? "", undefined, row);
       let hasUnknown = false;
       for (const v of values) {
         const t = this.compareByOp(left, v, "=");
@@ -5468,10 +10717,15 @@ export class WalrusSqlClient {
     for (const f of fields) {
       const parsed = this.parseFieldExpr(f);
       const key = parsed.field;
-      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : row[key];
+      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : this.resolveProjectionFieldValue(row, key);
       out[key] = val ?? null;
     }
     return out;
+  }
+
+  private resolveProjectionFieldValue(row: SqlRow, field: string): SqlPrimitive | undefined {
+    if (Object.prototype.hasOwnProperty.call(row, field)) return row[field] as SqlPrimitive;
+    return this.resolveRowValue(row, field);
   }
 
   private makeRowKey(row: SqlRow): string {
@@ -5535,3 +10789,5 @@ export class WalrusSqlClient {
     return v;
   }
 }
+
+

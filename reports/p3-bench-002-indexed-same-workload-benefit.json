@@ -1,0 +1,114 @@
+{
+  "benchmark": "p3-bench-002-indexed-same-load-benefit",
+  "at": "2026-03-20T04:42:37.011Z",
+  "config": {
+    "customers": 1200,
+    "ordersPerCustomer": 14,
+    "paidEveryNOrders": 7,
+    "customerRangeStart": 120,
+    "customerRangeEnd": 720,
+    "warmupRounds": 3,
+    "measuredRounds": 16
+  },
+  "dataset": {
+    "customers": 1200,
+    "orders": 16800,
+    "paidOrders": 2400
+  },
+  "query": {
+    "sql": "SELECT customer_id, SUM(amount) FROM p3_bench2_orders WHERE status = 'paid' AND customer_id >= 120 AND customer_id <= 720 GROUP BY customer_id ORDER BY sum DESC, customer_id ASC LIMIT 80",
+    "warmupRounds": 3,
+    "measuredRounds": 16
+  },
+  "baseline": {
+    "explain": {
+      "physicalOptimizerAccessPath": "TABLE_SCAN",
+      "physicalOptimizerIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalOptimizerCost": 78300,
+      "physicalAccessPath": "TABLE_SCAN",
+      "physicalIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalCost": 78300,
+      "physicalCandidates": "TABLE_SCAN[cost=78300,rows=1688,order=N,access=FULL_TABLE_SCAN]"
+    },
+    "performance": {
+      "queryCount": 16,
+      "totalDurationMs": 7704.971,
+      "throughputQps": 2.077,
+      "avgLatencyMs": 481.556,
+      "minLatencyMs": 367.594,
+      "p50LatencyMs": 443.462,
+      "p95LatencyMs": 763.113,
+      "p99LatencyMs": 763.113,
+      "maxLatencyMs": 763.113
+    },
+    "execution": {
+      "resultRows": 80,
+      "totalRowsReturned": 1280,
+      "rowsVisited": 268800,
+      "rowsVisitedPerQuery": 16800,
+      "lastRowsVisited": 16800,
+      "pipelinedExecutions": 0,
+      "materializedExecutions": 16
+    },
+    "observability": {
+      "indexObservabilityEntries": 0,
+      "lookupCountTotal": 0,
+      "lookupHitsTotal": 0,
+      "lookupMissesTotal": 0,
+      "maintenanceRowsTotal": 0
+    }
+  },
+  "indexed": {
+    "explain": {
+      "physicalOptimizerAccessPath": "BTREE_INDEX_LOOKUP",
+      "physicalOptimizerIndexStrategy": "INDEX_BACK_TABLE",
+      "physicalOptimizerCost": 43384,
+      "physicalAccessPath": "BTREE_INDEX_LOOKUP",
+      "physicalIndexStrategy": "INDEX_BACK_TABLE",
+      "physicalCost": 43384,
+      "physicalCandidates": "TABLE_SCAN[cost=78300,rows=1688,order=N,access=FULL_TABLE_SCAN] ; BTREE_INDEX_LOOKUP[cost=43384,rows=1688,order=N,access=INDEX_BACK_TABLE,index=IDX_P3_BENCH2_ORDERS_STATUS,column=status]"
+    },
+    "performance": {
+      "queryCount": 16,
+      "totalDurationMs": 5795.755,
+      "throughputQps": 2.761,
+      "avgLatencyMs": 362.229,
+      "minLatencyMs": 305.227,
+      "p50LatencyMs": 355.833,
+      "p95LatencyMs": 449.772,
+      "p99LatencyMs": 449.772,
+      "maxLatencyMs": 449.772
+    },
+    "execution": {
+      "resultRows": 80,
+      "totalRowsReturned": 1280,
+      "rowsVisited": 38400,
+      "rowsVisitedPerQuery": 2400,
+      "lastRowsVisited": 2400,
+      "pipelinedExecutions": 0,
+      "materializedExecutions": 16
+    },
+    "observability": {
+      "indexObservabilityEntries": 1,
+      "lookupCountTotal": 19,
+      "lookupHitsTotal": 19,
+      "lookupMissesTotal": 0,
+      "maintenanceRowsTotal": 688800
+    },
+    "indexBuildMs": 347.038,
+    "createdIndexes": [
+      "idx_p3_bench2_orders_status",
+      "idx_p3_bench2_orders_customer_id"
+    ]
+  },
+  "gains": {
+    "throughputQpsDelta": 0.684,
+    "throughputQpsGainPct": 32.932,
+    "p95LatencyMsDelta": 313.341,
+    "p95LatencyReductionPct": 41.061,
+    "rowsVisitedPerQueryDelta": 14400,
+    "rowsVisitedReductionPct": 85.714,
+    "physicalCostDelta": 34916,
+    "physicalCostReductionPct": 44.593
+  }
+}

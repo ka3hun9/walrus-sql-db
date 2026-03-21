@@ -1,0 +1,18 @@
+{
+  "item": "P3-IDX-003",
+  "generatedAt": "2026-03-18T02:35:59.733Z",
+  "rounds": 200,
+  "datasetRows": 5000,
+  "indexedSql": "SELECT id FROM p3_idx_bench_users WHERE email = 'u4242@ex.com'",
+  "nonIndexedSql": "SELECT id FROM p3_idx_bench_users WHERE name = 'name_42'",
+  "indexedTotalMs": 30.405,
+  "nonIndexedTotalMs": 42.65,
+  "speedupApprox": 1.4,
+  "hashIndexStats": [
+    {
+      "table": "p3_idx_bench_users",
+      "keys": 10000,
+      "rowsIndexed": 10000
+    }
+  ]
+}

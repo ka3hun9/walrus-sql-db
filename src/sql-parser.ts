@@ -1,6 +1,10 @@
 import { createSqlError } from "./sql-errors.js";
 import { inspectSqlGrammarSkeleton, type SqlDialectProfile, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
+  CreateIndexStatementAst,
+  CreateViewStatementAst,
+  DropIndexStatementAst,
+  DropViewStatementAst,
   ExprAst,
   JoinAst,
   OrderItemAst,
@@ -539,6 +543,8 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
       "FULL",
       "JOIN",
       "UNION",
+      "INTERSECT",
+      "EXCEPT",
     ]);
     if (!clauseKeywords.has(token)) {
       alias = aliasCandidate[1]!;
@@ -552,9 +558,17 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
   };
 }
 
-function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; all: boolean } | null {
+type TopLevelSetOperator = "UNION" | "INTERSECT" | "EXCEPT";
+
+function splitSetOpTopLevel(
+  sql: string,
+): { operator: TopLevelSetOperator; leftSql: string; rightSql: string; all: boolean } | null {
   let depth = 0;
   let quote = "";
+  let lastSetOpIndex: number | null = null;
+  let lastSetOpLength = 0;
+  let lastSetOpAll = false;
+  let lastOperator: TopLevelSetOperator = "UNION";
 
   for (let i = 0; i < sql.length; i++) {
     const ch = sql[i]!;
@@ -580,24 +594,63 @@ function splitUnionTopLevel(sql: string): { leftSql: string; rightSql: string; a
 
     if (depth !== 0) continue;
 
+    const prev = i === 0 ? " " : sql[i - 1]!;
+    if (/[a-zA-Z0-9_]/.test(prev)) continue;
+
     const rest = sql.slice(i).toUpperCase();
     if (rest.startsWith("UNION ALL") && (rest.length === "UNION ALL".length || /\s/.test(rest["UNION ALL".length]!))) {
-      return {
-        leftSql: sql.slice(0, i).trim(),
-        rightSql: sql.slice(i + "UNION ALL".length).trim(),
-        all: true,
-      };
+      lastSetOpIndex = i;
+      lastSetOpLength = "UNION ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "UNION";
+      continue;
+    }
+    if (
+      rest.startsWith("INTERSECT ALL")
+      && (rest.length === "INTERSECT ALL".length || /\s/.test(rest["INTERSECT ALL".length]!))
+    ) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "INTERSECT ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "INTERSECT";
+      continue;
+    }
+    if (rest.startsWith("EXCEPT ALL") && (rest.length === "EXCEPT ALL".length || /\s/.test(rest["EXCEPT ALL".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "EXCEPT ALL".length;
+      lastSetOpAll = true;
+      lastOperator = "EXCEPT";
+      continue;
     }
     if (rest.startsWith("UNION") && (rest.length === "UNION".length || /\s/.test(rest["UNION".length]!))) {
-      return {
-        leftSql: sql.slice(0, i).trim(),
-        rightSql: sql.slice(i + "UNION".length).trim(),
-        all: false,
-      };
+      lastSetOpIndex = i;
+      lastSetOpLength = "UNION".length;
+      lastSetOpAll = false;
+      lastOperator = "UNION";
+      continue;
+    }
+    if (rest.startsWith("INTERSECT") && (rest.length === "INTERSECT".length || /\s/.test(rest["INTERSECT".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "INTERSECT".length;
+      lastSetOpAll = false;
+      lastOperator = "INTERSECT";
+      continue;
+    }
+    if (rest.startsWith("EXCEPT") && (rest.length === "EXCEPT".length || /\s/.test(rest["EXCEPT".length]!))) {
+      lastSetOpIndex = i;
+      lastSetOpLength = "EXCEPT".length;
+      lastSetOpAll = false;
+      lastOperator = "EXCEPT";
     }
   }
 
-  return null;
+  if (lastSetOpIndex === null) return null;
+  return {
+    operator: lastOperator,
+    leftSql: sql.slice(0, lastSetOpIndex).trim(),
+    rightSql: sql.slice(lastSetOpIndex + lastSetOpLength).trim(),
+    all: lastSetOpAll,
+  };
 }
 
 const NESTED_TRANSACTION_POLICY = "error_on_nested_begin" as const;
@@ -651,6 +704,137 @@ function parseTransactionStatement(base: string, rawSql: string): TransactionSta
     message: `${firstToken} only supports optional WORK in parser baseline`,
     token: firstToken,
   });
+}
+
+function parseCreateIndexStatement(base: string, rawSql: string): CreateIndexStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(
+    /^CREATE\s+(UNIQUE\s+)?INDEX\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]+)\)$/i,
+  );
+
+  if (!match) {
+    if (/^CREATE\s+(UNIQUE\s+)?INDEX\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "CREATE INDEX requires syntax: CREATE [UNIQUE] INDEX <name> ON <table>(<col,...>)",
+        token: "INDEX",
+      });
+    }
+    return null;
+  }
+
+  const columns = splitCommaAware(match[4]!).map((c) => c.trim()).filter(Boolean);
+  if (columns.length === 0 || columns.some((c) => !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(c))) {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE INDEX column list must contain valid identifiers",
+      token: match[4]!.trim(),
+    });
+  }
+
+  return {
+    kind: "create_index",
+    unique: !!match[1],
+    indexName: match[2]!,
+    tableName: match[3]!,
+    columns,
+    rawSql,
+  };
+}
+
+function parseDropIndexStatement(base: string, rawSql: string): DropIndexStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(
+    /^DROP\s+INDEX\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*))?$/i,
+  );
+
+  if (!match) {
+    if (/^DROP\s+INDEX\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "DROP INDEX requires syntax: DROP INDEX [IF EXISTS] <name> [ON <table>]",
+        token: "INDEX",
+      });
+    }
+    return null;
+  }
+
+  return {
+    kind: "drop_index",
+    ifExists: !!match[1],
+    indexName: match[2]!,
+    tableName: match[3]?.trim() || undefined,
+    rawSql,
+  };
+}
+
+function parseCreateViewStatement(
+  base: string,
+  rawSql: string,
+  dialect: SqlDialectProfile,
+): CreateViewStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(/^CREATE\s+VIEW\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+(.+)$/i);
+
+  if (!match) {
+    if (/^CREATE\s+VIEW\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "CREATE VIEW requires syntax: CREATE VIEW <name> AS <select-query>",
+        token: "VIEW",
+      });
+    }
+    return null;
+  }
+
+  const querySql = match[2]!.trim();
+  if (!/^SELECT\b/i.test(querySql)) {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE VIEW currently requires a SELECT-based query after AS",
+      token: querySql.split(/\s+/)[0] ?? querySql,
+    });
+  }
+
+  const queryAst = parseSqlToAst(querySql, { dialect });
+  if (queryAst.kind !== "select" && queryAst.kind !== "union" && queryAst.kind !== "intersect" && queryAst.kind !== "except") {
+    throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
+      message: "CREATE VIEW query must be a SELECT/UNION/INTERSECT/EXCEPT statement",
+      token: querySql.split(/\s+/)[0] ?? querySql,
+    });
+  }
+
+  return {
+    kind: "create_view",
+    viewName: match[1]!,
+    querySql,
+    rawSql,
+  };
+}
+
+function parseDropViewStatement(base: string, rawSql: string): DropViewStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+/i.test(normalized)) return null;
+
+  const match = normalized.match(/^DROP\s+VIEW\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+
+  if (!match) {
+    if (/^DROP\s+VIEW\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "DROP VIEW requires syntax: DROP VIEW [IF EXISTS] <name>",
+        token: "VIEW",
+      });
+    }
+    return null;
+  }
+
+  return {
+    kind: "drop_view",
+    ifExists: !!match[1],
+    viewName: match[2]!,
+    rawSql,
+  };
 }
 
 export type ParseSqlToAstOptions = {
@@ -724,27 +908,27 @@ export function parseSqlToAst(
   const explain = /^EXPLAIN\s+/i.test(normalized);
   const base = explain ? normalized.replace(/^EXPLAIN\s+/i, "") : normalized;
 
-  const union = splitUnionTopLevel(base);
-  if (union) {
-    if (!union.leftSql || !union.rightSql) {
+  const setOp = splitSetOpTopLevel(base);
+  if (setOp) {
+    if (!setOp.leftSql || !setOp.rightSql) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "UNION requires both left and right SELECT statements",
-        token: "UNION",
+        message: `${setOp.operator} requires both left and right SELECT statements`,
+        token: setOp.operator,
       });
     }
 
-    if (/^(ORDER|LIMIT|OFFSET|GROUP\s+BY|HAVING|WHERE|UNION)\b/i.test(union.rightSql)) {
+    if (/^(ORDER|LIMIT|OFFSET|GROUP\s+BY|HAVING|WHERE|UNION|INTERSECT|EXCEPT)\b/i.test(setOp.rightSql)) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "UNION right branch is missing SELECT statement",
-        token: "UNION",
+        message: `${setOp.operator} right branch is missing SELECT statement`,
+        token: setOp.operator,
       });
     }
 
     return {
-      kind: "union",
-      all: union.all,
-      leftSql: union.leftSql,
-      rightSql: union.rightSql,
+      kind: setOp.operator === "UNION" ? "union" : setOp.operator === "INTERSECT" ? "intersect" : "except",
+      all: setOp.all,
+      leftSql: setOp.leftSql,
+      rightSql: setOp.rightSql,
       rawSql: sql,
     };
   }
@@ -752,10 +936,23 @@ export function parseSqlToAst(
   const transaction = parseTransactionStatement(base, sql);
   if (transaction) return transaction;
 
+  const createIndex = parseCreateIndexStatement(base, sql);
+  if (createIndex) return createIndex;
+
+  const dropIndex = parseDropIndexStatement(base, sql);
+  if (dropIndex) return dropIndex;
+
+  const createView = parseCreateViewStatement(base, sql, dialect);
+  if (createView) return createView;
+
+  const dropView = parseDropViewStatement(base, sql);
+  if (dropView) return dropView;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
-      message: "Only SELECT/UNION/BEGIN/COMMIT/ROLLBACK statements are currently accepted by parser baseline",
+      message:
+        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }

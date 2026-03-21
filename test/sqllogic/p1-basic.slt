@@ -1,0 +1,26 @@
+# phase-1 basic sqllogic fixtures
+
+statement ok
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), age INT)
+----
+
+statement ok
+INSERT INTO users (id, name, age) VALUES (1, 'alice', 20)
+----
+
+statement ok
+INSERT INTO users (id, name, age) VALUES (2, 'bob', 30)
+----
+
+query rowsort
+SELECT id, name FROM users ORDER BY id
+----
+1|alice
+2|bob
+----
+
+query rowsort
+SELECT COUNT(*) FROM users
+----
+2
+----

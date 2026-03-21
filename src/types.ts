@@ -1085,7 +1085,8 @@ export type StorageWriteOperation =
   | "ALTER_TABLE"
   | "INSERT_ROW"
   | "UPDATE_ROW"
-  | "DELETE_ROW";
+  | "DELETE_ROW"
+  | "INDEX_REBUILD";
 
 export interface StorageWriteEvent {
   table: string;
@@ -1147,6 +1148,46 @@ export interface VersionedStorageObject {
   confirmationStatus: "pending" | "confirmed";
   immutable: true;
   rows: ReadonlyArray<Readonly<SqlRow>>;
+}
+
+export type IndexStorageObjectType = "HASH" | "BTREE";
+
+export interface IndexHashStorageBucket {
+  encodedKey: string;
+  rowKeys: ReadonlyArray<string>;
+}
+
+export interface IndexBtreeStorageEntry {
+  key: SqlPrimitive;
+  rowKeys: ReadonlyArray<string>;
+}
+
+export type IndexStoragePayload =
+  | {
+      indexType: "HASH";
+      buckets: ReadonlyArray<IndexHashStorageBucket>;
+    }
+  | {
+      indexType: "BTREE";
+      entries: ReadonlyArray<IndexBtreeStorageEntry>;
+    };
+
+export interface IndexVersionedStorageObject {
+  table: string;
+  indexName: string;
+  column: string;
+  indexType: IndexStorageObjectType;
+  objectId: string;
+  version: number;
+  prevVersion: number | null;
+  currentVersion: number;
+  commitDigest: string;
+  createdAt: number;
+  confirmationStatus: "pending" | "confirmed";
+  immutable: true;
+  keyCount: number;
+  rowCount: number;
+  payload: IndexStoragePayload;
 }
 
 export interface DurabilityRecoverySummary {
@@ -1297,6 +1338,13 @@ export interface OnchainQueryRequest {
 
 export type OnchainQueryExecutor = (req: OnchainQueryRequest) => Promise<QueryResult>;
 
+export interface WalrusSqlViewPolicyOptions {
+  allowCreate?: boolean;
+  allowDrop?: boolean;
+  allowSelect?: boolean;
+  allowedViewNames?: string[];
+}
+
 export interface WalrusSqlClientOptions {
   packageId: string;
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
@@ -1330,4 +1378,9 @@ export interface WalrusSqlClientOptions {
     level?: import("./logger.js").LogLevel;
     sink?: import("./logger.js").LogSink;
   };
+  joinExecution?: {
+    memoryBudgetRows?: number;
+    spillChunkRows?: number;
+  };
+  viewPolicy?: WalrusSqlViewPolicyOptions;
 }

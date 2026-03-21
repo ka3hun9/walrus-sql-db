@@ -1,0 +1,54 @@
+{
+  "benchmark": "p3-bench-001-no-index-complex-query-baseline",
+  "at": "2026-03-20T01:32:57.481Z",
+  "config": {
+    "customers": 600,
+    "ordersPerCustomer": 10,
+    "refundEveryNOrders": 5,
+    "warmupRounds": 3,
+    "measuredRounds": 12
+  },
+  "dataset": {
+    "customers": 600,
+    "orders": 6000,
+    "refunds": 1200
+  },
+  "query": {
+    "sql": "SELECT customer_id, SUM(amount) FROM p3_bench1_customers INNER JOIN p3_bench1_orders ON p3_bench1_customers.id = p3_bench1_orders.customer_id LEFT JOIN p3_bench1_refunds ON p3_bench1_orders.id = p3_bench1_refunds.order_id WHERE p3_bench1_orders.status IN ('paid','shipped') AND p3_bench1_customers.tier <= 3 GROUP BY customer_id ORDER BY sum DESC, customer_id ASC LIMIT 50",
+    "warmupRounds": 3,
+    "measuredRounds": 12,
+    "explain": {
+      "physicalOptimizerAccessPath": "TABLE_SCAN",
+      "physicalOptimizerIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalAccessPath": "TABLE_SCAN",
+      "physicalIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalJoinAlgorithms": "HASH_JOIN -> HASH_JOIN"
+    }
+  },
+  "performance": {
+    "queryCount": 12,
+    "totalDurationMs": 4248.629,
+    "throughputQps": 2.824,
+    "avgLatencyMs": 354.048,
+    "minLatencyMs": 330.748,
+    "p50LatencyMs": 345.732,
+    "p95LatencyMs": 404.156,
+    "p99LatencyMs": 404.156,
+    "maxLatencyMs": 404.156
+  },
+  "execution": {
+    "resultRows": 50,
+    "totalRowsReturned": 600,
+    "rowsVisited": 72000,
+    "rowsVisitedPerQuery": 6000,
+    "lastRowsVisited": 6000,
+    "pipelinedExecutions": 0,
+    "materializedExecutions": 12
+  },
+  "noIndexEvidence": {
+    "indexObservabilityEntries": 0,
+    "lookupCountTotal": 0,
+    "maintenanceRowsTotal": 0,
+    "noIndexObserved": true
+  }
+}

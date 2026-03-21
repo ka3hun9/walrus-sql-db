@@ -1,0 +1,145 @@
+{
+  "benchmark": "p3-bench-004-large-dataset-complex-join-subquery-stress",
+  "at": "2026-03-20T16:04:51.369Z",
+  "config": {
+    "customers": 2600,
+    "ordersPerCustomer": 18,
+    "shipmentDeliveredEveryNOrders": 2,
+    "refundEveryNOrders": 6,
+    "warmupRounds": 2,
+    "measuredRounds": 10,
+    "joinMemoryBudgetRows": 250000,
+    "joinSpillChunkRows": 4096
+  },
+  "dataset": {
+    "customers": 2600,
+    "orders": 46800,
+    "shipments": 46800,
+    "refunds": 7800,
+    "paidOrders": 7800,
+    "shippedOrders": 7800
+  },
+  "query": {
+    "joinSql": "SELECT customer_region, SUM(order_amount) FROM p3_bench4_customers INNER JOIN p3_bench4_orders ON p3_bench4_customers.customer_id = p3_bench4_orders.customer_id INNER JOIN p3_bench4_shipments ON p3_bench4_orders.order_id = p3_bench4_shipments.order_id LEFT JOIN p3_bench4_refunds ON p3_bench4_orders.order_id = p3_bench4_refunds.order_id WHERE customer_tier <= 4 AND order_status IN ('paid','shipped') AND delivered_flag = 1 GROUP BY customer_region ORDER BY sum DESC, customer_region ASC LIMIT 8",
+    "subquerySql": "SELECT customer_id FROM p3_bench4_customers WHERE customer_tier <= 4 AND customer_id <= 80 AND customer_id IN (SELECT customer_id FROM p3_bench4_orders WHERE order_status = 'paid') AND EXISTS (SELECT 1 FROM p3_bench4_customers WHERE p3_bench4_customers.customer_region = outer.customer_region AND customer_tier >= 4) AND customer_id < (SELECT MAX(customer_id) FROM p3_bench4_customers WHERE p3_bench4_customers.customer_region = outer.customer_region) ORDER BY customer_id ASC LIMIT 150",
+    "warmupRounds": 2,
+    "measuredRounds": 10,
+    "subqueryFragments": {
+      "inSubquery": "SELECT customer_id FROM p3_bench4_orders WHERE order_status = 'paid'",
+      "existsSubquery": "SELECT 1 FROM p3_bench4_customers WHERE p3_bench4_customers.customer_region = outer.customer_region AND customer_tier >= 4",
+      "scalarSubquery": "SELECT MAX(customer_id) FROM p3_bench4_customers WHERE p3_bench4_customers.customer_region = outer.customer_region"
+    }
+  },
+  "joinStress": {
+    "explain": {
+      "physicalOptimizerAccessPath": "TABLE_SCAN",
+      "physicalOptimizerIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalOptimizerCost": 6524,
+      "physicalAccessPath": "TABLE_SCAN",
+      "physicalIndexStrategy": "FULL_TABLE_SCAN",
+      "physicalCost": 6524,
+      "physicalCandidates": "TABLE_SCAN[cost=6524,rows=27,order=N,access=FULL_TABLE_SCAN]",
+      "physicalJoinCount": 3,
+      "physicalJoinAlgorithms": "HASH_JOIN -> HASH_JOIN -> HASH_JOIN",
+      "physicalJoinPlan": "#1:HASH_JOIN[left=2600,right=46800,out=46800,cost=59808,mem=2600/250000,budgetConstrained=false] ; #2:HASH_JOIN[left=46800,right=46800,out=46800,cost=280808,mem=46800/250000,budgetConstrained=false] ; #3:HASH_JOIN[left=46800,right=7800,out=46800,cost=85808,mem=7800/250000,budgetConstrained=false]"
+    },
+    "performance": {
+      "queryCount": 10,
+      "totalDurationMs": 120323.3,
+      "throughputQps": 0.083,
+      "avgLatencyMs": 12032.164,
+      "minLatencyMs": 8578.862,
+      "p50LatencyMs": 11535.857,
+      "p95LatencyMs": 22486.979,
+      "p99LatencyMs": 22486.979,
+      "maxLatencyMs": 22486.979
+    },
+    "execution": {
+      "resultRows": 5,
+      "totalRowsReturned": 50,
+      "rowsVisited": 468000,
+      "rowsVisitedPerQuery": 46800,
+      "lastRowsVisited": 46800,
+      "pipelinedExecutions": 0,
+      "materializedExecutions": 10,
+      "earlyStopExecutions": 0,
+      "joinSpillExecutions": 0,
+      "joinSpillChunks": 0,
+      "joinSpillRowsProcessed": 0
+    },
+    "observability": {
+      "indexObservabilityEntries": 4,
+      "lookupCountTotal": 0,
+      "lookupHitsTotal": 0,
+      "lookupMissesTotal": 0,
+      "maintenanceRowsTotal": 197600
+    }
+  },
+  "subqueryStress": {
+    "explain": {
+      "physicalOptimizerAccessPath": "BTREE_INDEX_LOOKUP",
+      "physicalOptimizerIndexStrategy": "INDEX_BACK_TABLE",
+      "physicalOptimizerCost": 3911,
+      "physicalAccessPath": "BTREE_INDEX_LOOKUP",
+      "physicalIndexStrategy": "INDEX_BACK_TABLE",
+      "physicalCost": 3911,
+      "physicalCandidates": "TABLE_SCAN[cost=6244,rows=2,order=N,access=FULL_TABLE_SCAN] ; BTREE_INDEX_LOOKUP[cost=3911,rows=2,order=N,access=INDEX_BACK_TABLE,index=IDX_P3_BENCH4_CUSTOMERS_TIER,column=customer_tier]",
+      "physicalJoinCount": 0,
+      "physicalJoinAlgorithms": "",
+      "physicalJoinPlan": ""
+    },
+    "performance": {
+      "queryCount": 10,
+      "totalDurationMs": 144759.808,
+      "throughputQps": 0.069,
+      "avgLatencyMs": 14475.952,
+      "minLatencyMs": 14043.086,
+      "p50LatencyMs": 14330.666,
+      "p95LatencyMs": 15442.342,
+      "p99LatencyMs": 15442.342,
+      "maxLatencyMs": 15442.342
+    },
+    "execution": {
+      "resultRows": 54,
+      "totalRowsReturned": 540,
+      "rowsVisited": 17340,
+      "rowsVisitedPerQuery": 1734,
+      "lastRowsVisited": 1734,
+      "pipelinedExecutions": 0,
+      "materializedExecutions": 10,
+      "earlyStopExecutions": 0,
+      "joinSpillExecutions": 0,
+      "joinSpillChunks": 0,
+      "joinSpillRowsProcessed": 0
+    },
+    "observability": {
+      "indexObservabilityEntries": 4,
+      "lookupCountTotal": 12,
+      "lookupHitsTotal": 12,
+      "lookupMissesTotal": 0,
+      "maintenanceRowsTotal": 228800
+    },
+    "subquery": {
+      "entries": 3,
+      "executions": 62424,
+      "correlatedExecutions": 41616,
+      "cacheHits": 62292,
+      "cacheMisses": 132,
+      "rowsScanned": 718080,
+      "rowsReturned": 162344016,
+      "budgetExceededCount": 0
+    }
+  },
+  "verdict": {
+    "largeDataset": true,
+    "complexJoinObserved": true,
+    "complexSubqueryObserved": true,
+    "stableResultRows": true,
+    "reasons": [
+      "large dataset rows=46800",
+      "join plan=HASH_JOIN -> HASH_JOIN -> HASH_JOIN",
+      "subquery executions=62424, correlated=41616",
+      "both workloads captured non-zero rowsVisited"
+    ]
+  }
+}
