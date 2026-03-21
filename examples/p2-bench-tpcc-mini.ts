@@ -1,4 +1,4 @@
-import { runP2TpccMiniBenchmark, writeP2BenchReport } from "../src/p2-benchmarks.js";
+import { runP2TpccMiniBenchmark, writeP2BenchReport } from "../test/benchmark/p2-benchmarks.js";
 
 const report = await runP2TpccMiniBenchmark({
   warehouses: 1,

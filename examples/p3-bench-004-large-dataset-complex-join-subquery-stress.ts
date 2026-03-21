@@ -1,7 +1,7 @@
 import {
   runP3Bench004LargeDatasetComplexJoinSubqueryStress,
   writeP3BenchReport,
-} from "../src/p3-benchmarks.js";
+} from "../test/benchmark/p3-benchmarks.js";
 
 const report = await runP3Bench004LargeDatasetComplexJoinSubqueryStress();
 const outPath = "reports/p3-bench-004-large-dataset-complex-join-subquery-stress.json";

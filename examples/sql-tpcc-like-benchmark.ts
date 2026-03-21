@@ -1,4 +1,4 @@
-import { runTpccLikeBenchmark, writeTpccLikeBenchmarkReport } from "../src/p2-benchmarks.js";
+import { runTpccLikeBenchmark, writeTpccLikeBenchmarkReport } from "../test/benchmark/p2-benchmarks.js";
 
 const outputPath = process.argv[2] ?? "reports/sql-tpcc-like-benchmark.json";
 const txCountArg = Number(process.argv[3] ?? "0");

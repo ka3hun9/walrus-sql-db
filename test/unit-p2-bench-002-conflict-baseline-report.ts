@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runTpccLikeBenchmark, writeTpccLikeBenchmarkReport } from "../src/p2-benchmarks.js";
+import { runTpccLikeBenchmark, writeTpccLikeBenchmarkReport } from "../test/benchmark/p2-benchmarks.js";
 
 const dir = await mkdtemp(join(tmpdir(), "walrus-sql-p2-bench-002-"));
 const reportPath = join(dir, "tpcc-conflict-baseline.json");

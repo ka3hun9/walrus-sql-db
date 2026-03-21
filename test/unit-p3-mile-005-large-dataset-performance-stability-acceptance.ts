@@ -5,7 +5,7 @@ import {
   runP3Bench002IndexedSameLoadBenefit,
   runP3Bench003CboBenefitVsFixedRuleBaseline,
   runP3Bench004LargeDatasetComplexJoinSubqueryStress,
-} from "../src/p3-benchmarks.js";
+} from "../test/benchmark/p3-benchmarks.js";
 
 type P3Test007Report = {
   benchmark: string;

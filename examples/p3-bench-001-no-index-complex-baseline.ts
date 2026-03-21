@@ -1,4 +1,4 @@
-import { runP3Bench001NoIndexComplexBaseline, writeP3BenchReport } from "../src/p3-benchmarks.js";
+import { runP3Bench001NoIndexComplexBaseline, writeP3BenchReport } from "../test/benchmark/p3-benchmarks.js";
 
 const report = await runP3Bench001NoIndexComplexBaseline();
 const outPath = "reports/p3-bench-001-no-index-complex-baseline.json";

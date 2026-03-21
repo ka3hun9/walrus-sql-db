@@ -1,4 +1,4 @@
-import { runP3Bench002IndexedSameLoadBenefit, writeP3BenchReport } from "../src/p3-benchmarks.js";
+import { runP3Bench002IndexedSameLoadBenefit, writeP3BenchReport } from "../test/benchmark/p3-benchmarks.js";
 
 const report = await runP3Bench002IndexedSameLoadBenefit();
 const outPath = "reports/p3-bench-002-indexed-same-workload-benefit.json";

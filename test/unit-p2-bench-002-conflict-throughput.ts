@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { runP2ConflictBenchmark } from "../src/p2-benchmarks.js";
+import { runP2ConflictBenchmark } from "../test/benchmark/p2-benchmarks.js";
 
 const report = await runP2ConflictBenchmark({ rounds: 12 });
 

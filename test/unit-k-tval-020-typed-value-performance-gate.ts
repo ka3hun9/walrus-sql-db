@@ -4,7 +4,7 @@ import {
   evaluateTypedValuePerformanceRegression,
   runPerformanceBenchmarks,
   type PerformanceBenchmarkReport,
-} from "../src/performance-benchmarks.js";
+} from "../test/benchmark/performance-benchmarks.js";
 
 const baselinePath = "test/fixtures/k-tval-020-performance-baseline.json";
 const baseline = JSON.parse(await fs.readFile(baselinePath, "utf8")) as PerformanceBenchmarkReport;

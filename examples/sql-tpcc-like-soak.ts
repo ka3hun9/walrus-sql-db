@@ -1,4 +1,4 @@
-import { runTpccLikeSoakBenchmark, writeTpccLikeSoakReport } from "../src/p2-benchmarks.js";
+import { runTpccLikeSoakBenchmark, writeTpccLikeSoakReport } from "../test/benchmark/p2-benchmarks.js";
 
 const outputPath = process.argv[2] ?? "reports/sql-tpcc-like-soak.json";
 const durationArg = Number(process.argv[3] ?? "0");

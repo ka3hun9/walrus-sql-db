@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { runTpccLikeSoakBenchmark } from "../src/p2-benchmarks.js";
+import { runTpccLikeSoakBenchmark } from "../test/benchmark/p2-benchmarks.js";
 
 const report = await runTpccLikeSoakBenchmark({
   durationMs: 1_200,

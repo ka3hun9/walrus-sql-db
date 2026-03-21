@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import {
   runP3Bench004LargeDatasetComplexJoinSubqueryStress,
   writeP3BenchReport,
-} from "../src/p3-benchmarks.js";
+} from "../test/benchmark/p3-benchmarks.js";
 
 const report = await runP3Bench004LargeDatasetComplexJoinSubqueryStress({
   customers: 1400,
