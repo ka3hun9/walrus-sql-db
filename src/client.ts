@@ -181,6 +181,15 @@ type WhereExprNode =
   | { type: "not"; node: WhereExprNode }
   | { type: "and" | "or"; left: WhereExprNode; right: WhereExprNode };
 
+type SupportedWindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK";
+
+type ParsedWindowFunctionSpec = {
+  name: SupportedWindowFunctionName;
+  alias: string;
+  partitionBy: string[];
+  orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
+};
+
 type ParsedSelect = {
   explain: boolean;
   table: string;
@@ -211,11 +220,7 @@ type ParsedSelect = {
     leftField: string;
     rightField: string;
   }>;
-  rowNumberAlias?: string;
-  rowNumberSpec?: {
-    partitionBy: string[];
-    orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
-  };
+  windowFunctions?: ParsedWindowFunctionSpec[];
 };
 
 type LogicalPredicateSource = "AST" | "TREE" | "CLAUSES" | "NONE";
@@ -251,8 +256,7 @@ type LogicalSelectPlan = {
   orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
   limit?: number;
   offset?: number;
-  rowNumberAlias?: string;
-  rowNumberSpec?: ParsedSelect["rowNumberSpec"];
+  windowFunctions?: ParsedWindowFunctionSpec[];
   rewriteRules: LogicalRewriteRule[];
 };
 
@@ -314,7 +318,7 @@ type SelectPipelineBlocker =
   | "JOIN_CHAIN"
   | "GROUP_BY"
   | "AGGREGATE"
-  | "ROW_NUMBER"
+  | "WINDOW_FUNCTION"
   | "ORDER_BY_SORT";
 
 type SelectExecutionPipelineStats = {
@@ -3898,8 +3902,7 @@ export class WalrusSqlClient {
       orderByList,
       limit: parsed.limit,
       offset: parsed.offset,
-      rowNumberAlias: parsed.rowNumberAlias,
-      rowNumberSpec: parsed.rowNumberSpec,
+      windowFunctions: parsed.windowFunctions,
       rewriteRules,
     };
   }
@@ -4077,7 +4080,7 @@ export class WalrusSqlClient {
 
   private isCoveringIndexAccess(parsed: ParsedSelect, indexColumn: string): boolean {
     if (parsed.joins?.length) return false;
-    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias || parsed.rowNumberSpec) {
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.windowFunctions?.length) {
       return false;
     }
     if (parsed.fields.length === 1 && parsed.fields[0] === "*") return false;
@@ -4139,7 +4142,7 @@ export class WalrusSqlClient {
     if (!orderSatisfied) {
       cost += this.estimateSortWork(Math.max(1, estimatedRows), parsed.orderByList?.length ?? 0);
     }
-    if (parsed.groupBy?.length || parsed.aggregate || parsed.having || parsed.rowNumberAlias) {
+    if (parsed.groupBy?.length || parsed.aggregate || parsed.having || parsed.windowFunctions?.length) {
       cost += Math.max(1, Math.ceil(Math.max(1, estimatedRows) * 0.5));
     }
 
@@ -4384,7 +4387,7 @@ export class WalrusSqlClient {
     if (logicalPlan.joins.length > 0) blockers.push("JOIN_CHAIN");
     if (logicalPlan.groupBy?.length) blockers.push("GROUP_BY");
     if (logicalPlan.aggregate) blockers.push("AGGREGATE");
-    if (logicalPlan.rowNumberAlias) blockers.push("ROW_NUMBER");
+    if (logicalPlan.windowFunctions?.length) blockers.push("WINDOW_FUNCTION");
     if (logicalPlan.orderByList?.length && !orderSatisfied) blockers.push("ORDER_BY_SORT");
     return blockers;
   }
@@ -5250,7 +5253,7 @@ export class WalrusSqlClient {
           whereClauses: parsed.whereClauses,
           groupBy: logicalPlan.groupBy,
           aggregate: logicalPlan.aggregate,
-          rowNumberAlias: logicalPlan.rowNumberAlias,
+          windowFunctions: logicalPlan.windowFunctions,
           having: logicalPlan.having,
         },
         false,
@@ -5616,8 +5619,8 @@ export class WalrusSqlClient {
         return aggregateResult;
       }
 
-      const withWindow = logicalPlan.rowNumberAlias
-        ? this.applyRowNumber(filtered, logicalPlan.rowNumberAlias, logicalPlan.rowNumberSpec)
+      const withWindow = logicalPlan.windowFunctions?.length
+        ? this.applyWindowFunctions(filtered, logicalPlan.windowFunctions)
         : filtered;
       const ordered = selectPlan.orderSatisfied ? withWindow : this.applyOrder(withWindow, logicalPlan.orderByList);
       const paged = this.applyPage(ordered, logicalPlan.offset, logicalPlan.limit);
@@ -7922,10 +7925,10 @@ export class WalrusSqlClient {
   private getBtreeOrderedScanCandidates(
     table: string,
     rows: SqlRow[],
-    parsed: Pick<ParsedSelect, "orderByList" | "whereClauses" | "groupBy" | "aggregate" | "rowNumberAlias" | "having">,
+    parsed: Pick<ParsedSelect, "orderByList" | "whereClauses" | "groupBy" | "aggregate" | "windowFunctions" | "having">,
     trackLookupStats = true,
   ): { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null {
-    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.rowNumberAlias) return null;
+    if (parsed.aggregate || parsed.groupBy?.length || parsed.having || parsed.windowFunctions?.length) return null;
     if (!parsed.orderByList || parsed.orderByList.length !== 1) return null;
 
     const orderExpr = parsed.orderByList[0]!.field.trim();
@@ -8407,12 +8410,27 @@ export class WalrusSqlClient {
     }
   }
 
-  private isRowNumberWindowItem(item: SelectItemAst): boolean {
-    return (item.window?.name ?? "").toUpperCase() === "ROW_NUMBER";
+  private isSupportedWindowFunctionName(name: string): name is SupportedWindowFunctionName {
+    const upper = name.toUpperCase();
+    return upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK";
   }
 
-  private windowToRowNumberSpec(window?: SelectItemAst["window"]): ParsedSelect["rowNumberSpec"] {
-    if (!window || window.name.toUpperCase() !== "ROW_NUMBER") return undefined;
+  private defaultWindowAlias(name: SupportedWindowFunctionName): string {
+    return name.toLowerCase();
+  }
+
+  private windowToParsedWindowFunction(
+    window?: SelectItemAst["window"],
+    explicitAlias?: string,
+  ): ParsedWindowFunctionSpec | undefined {
+    if (!window) return undefined;
+    const name = window.name.toUpperCase();
+    if (!this.isSupportedWindowFunctionName(name)) {
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `window function not supported yet: ${window.name}`);
+    }
+    if (window.args.length > 0) {
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `${name}() does not accept arguments`);
+    }
 
     const partitionBy = window.over.partitionBy
       .map((expr) => this.exprAstToSql(expr) ?? "")
@@ -8426,7 +8444,12 @@ export class WalrusSqlClient {
       }))
       .filter((item) => item.field);
 
-    return { partitionBy, orderBy };
+    return {
+      name,
+      alias: explicitAlias?.trim() || this.defaultWindowAlias(name),
+      partitionBy,
+      orderBy,
+    };
   }
 
   private astSelectToParsedSelect(ast: SelectStatementAst): ParsedSelect {
@@ -8452,26 +8475,29 @@ export class WalrusSqlClient {
       }))
       .filter((x) => x.field);
 
-    const rowNumberItem = ast.selectItems.find((it) => this.isRowNumberWindowItem(it));
-    const rowNumberAlias = rowNumberItem?.alias ?? (rowNumberItem ? "row_number" : undefined);
-    const rowNumberSpec = this.windowToRowNumberSpec(rowNumberItem?.window);
+    const windowFunctions: ParsedWindowFunctionSpec[] = [];
+    const windowAliasByItemIndex = new Map<number, string>();
+    ast.selectItems.forEach((it, idx) => {
+      const parsedWindow = this.windowToParsedWindowFunction(it.window, it.alias);
+      if (!parsedWindow) return;
+      windowFunctions.push(parsedWindow);
+      windowAliasByItemIndex.set(idx, parsedWindow.alias);
+    });
 
-    const rawFieldTexts = ast.selectItems.map((it) => {
-      if (this.isRowNumberWindowItem(it)) {
-        return it.alias ?? "row_number";
-      }
+    const rawFieldTexts = ast.selectItems.map((it, idx) => {
+      const windowAlias = windowAliasByItemIndex.get(idx);
+      if (windowAlias) return windowAlias;
       const exprText = this.exprAstToSql(it.expr) ?? "";
       return it.alias ? `${exprText} AS ${it.alias}` : exprText;
     });
 
-    const normalizedFieldTexts = ast.selectItems.map((it) => {
+    const normalizedFieldTexts = ast.selectItems.map((it, idx) => {
       if (it.alias) return it.alias;
       if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name)) {
         return it.expr.name.toLowerCase();
       }
-      if (this.isRowNumberWindowItem(it)) {
-        return rowNumberAlias ?? "row_number";
-      }
+      const windowAlias = windowAliasByItemIndex.get(idx);
+      if (windowAlias) return windowAlias;
       return this.exprAstToSql(it.expr) ?? "";
     });
 
@@ -8524,8 +8550,7 @@ export class WalrusSqlClient {
         leftField: j.onLeft,
         rightField: j.onRight,
       })),
-      rowNumberAlias,
-      rowNumberSpec,
+      windowFunctions: windowFunctions.length ? windowFunctions : undefined,
     };
   }
 
@@ -8536,7 +8561,8 @@ export class WalrusSqlClient {
 
     return ast.selectItems.map((it, idx) => {
       if (it.alias) return it.alias;
-      if (this.isRowNumberWindowItem(it)) return "row_number";
+      const windowName = (it.window?.name ?? "").toUpperCase();
+      if (this.isSupportedWindowFunctionName(windowName)) return this.defaultWindowAlias(windowName);
       if (it.expr.kind === "identifier") {
         const parts = it.expr.name.split(".");
         return parts[parts.length - 1] ?? `col${idx + 1}`;
@@ -8779,9 +8805,12 @@ export class WalrusSqlClient {
       : undefined;
 
     const rawFieldList = selectFields.split(",").map((x) => x.trim());
-    const rowNumberExpr = rawFieldList.find((f) => /^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f));
-    const rowNumberAlias = rowNumberExpr?.match(/\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i)?.[1] ?? "row_number";
-    const rowNumberSpec = rowNumberExpr ? this.parseRowNumberSpec(rowNumberExpr) : undefined;
+    const windowSpecsByIndex = new Map<number, ParsedWindowFunctionSpec>();
+    rawFieldList.forEach((field, idx) => {
+      const parsedWindow = this.parseWindowFunctionSpec(field);
+      if (parsedWindow) windowSpecsByIndex.set(idx, parsedWindow);
+    });
+    const windowFunctions = [...windowSpecsByIndex.values()];
 
     const aggregateFieldExpr = rawFieldList.find((f) =>
       /^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f),
@@ -8796,21 +8825,19 @@ export class WalrusSqlClient {
     const whereClauses = where ? this.tryParseWhere(where) : [];
     const whereTree = where ? this.parseWhereTree(where) : undefined;
 
-    const normalizedFieldList = rawFieldList.map((f) => {
+    const normalizedFieldList = rawFieldList.map((f, idx) => {
       const aliasMatch = f.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
-      if (/^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f)) {
-        return rowNumberAlias;
-      }
+      const parsedWindow = windowSpecsByIndex.get(idx);
+      if (parsedWindow) return parsedWindow.alias;
       if (aliasMatch) return aliasMatch[2];
       const agg = f.match(/^(COUNT|SUM|AVG|MIN|MAX)\((\*|[a-zA-Z_][a-zA-Z0-9_]*)\)$/i);
       if (agg) return agg[1].toLowerCase();
       return f;
     });
 
-    const outputFieldList = rawFieldList.map((f) => {
-      if (/^ROW_NUMBER\(\)\s+OVER\s*\(.+\)(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?$/i.test(f)) {
-        return rowNumberAlias;
-      }
+    const outputFieldList = rawFieldList.map((f, idx) => {
+      const parsedWindow = windowSpecsByIndex.get(idx);
+      if (parsedWindow) return parsedWindow.alias;
       return f;
     });
 
@@ -8833,8 +8860,7 @@ export class WalrusSqlClient {
         having,
         join,
         joins,
-        rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
-        rowNumberSpec,
+        windowFunctions: windowFunctions.length ? windowFunctions : undefined,
       };
     }
 
@@ -8855,8 +8881,7 @@ export class WalrusSqlClient {
         having,
         join,
         joins,
-        rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
-        rowNumberSpec,
+        windowFunctions: windowFunctions.length ? windowFunctions : undefined,
       };
     }
 
@@ -8876,8 +8901,7 @@ export class WalrusSqlClient {
       having,
       join,
       joins,
-      rowNumberAlias: rowNumberExpr ? rowNumberAlias : undefined,
-      rowNumberSpec,
+      windowFunctions: windowFunctions.length ? windowFunctions : undefined,
     };
   }
 
@@ -10525,11 +10549,8 @@ export class WalrusSqlClient {
     }
   }
 
-  private parseRowNumberSpec(rawExpr: string): ParsedSelect["rowNumberSpec"] {
-    const m = rawExpr.match(/ROW_NUMBER\(\)\s+OVER\s*\((.+)\)/i);
-    if (!m) return undefined;
-
-    const inside = m[1].trim();
+  private parseWindowOverSpec(rawOverExpr: string): Pick<ParsedWindowFunctionSpec, "partitionBy" | "orderBy"> {
+    const inside = rawOverExpr.trim();
     const pm = inside.match(/PARTITION\s+BY\s+(.+?)(?:\s+ORDER\s+BY\s+(.+))?$/i);
     const om = inside.match(/ORDER\s+BY\s+(.+)$/i);
 
@@ -10557,24 +10578,52 @@ export class WalrusSqlClient {
     return { partitionBy, orderBy };
   }
 
-  private applyRowNumber(
-    rows: SqlRow[],
-    alias: string,
-    spec?: ParsedSelect["rowNumberSpec"],
-  ): SqlRow[] {
-    if (!spec || (!spec.partitionBy.length && !spec.orderBy.length)) {
-      return rows.map((row, idx) => ({ ...row, [alias]: idx + 1 }));
-    }
+  private parseWindowFunctionSpec(rawExpr: string): ParsedWindowFunctionSpec | undefined {
+    const m = rawExpr.match(
+      /^([a-zA-Z_][a-zA-Z0-9_]*)\(\)\s+OVER\s*\((.+)\)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*))?$/i,
+    );
+    if (!m) return undefined;
+    const name = m[1]!.toUpperCase();
+    if (!this.isSupportedWindowFunctionName(name)) return undefined;
+    const alias = m[3]?.trim() || this.defaultWindowAlias(name);
+    const over = this.parseWindowOverSpec(m[2]!);
+    return {
+      name,
+      alias,
+      partitionBy: over.partitionBy,
+      orderBy: over.orderBy,
+    };
+  }
 
+  private areWindowOrderValuesEqual(
+    leftRow: SqlRow,
+    rightRow: SqlRow,
+    orderBy: ParsedWindowFunctionSpec["orderBy"],
+  ): boolean {
+    if (!orderBy.length) return true;
+    for (const ord of orderBy) {
+      const av = this.resolveRowValue(leftRow, ord.field);
+      const bv = this.resolveRowValue(rightRow, ord.field);
+      if (this.compareForOrder(av, bv, ord.direction) !== 0) return false;
+    }
+    return true;
+  }
+
+  private computeWindowFunctionValues(rows: SqlRow[], spec: ParsedWindowFunctionSpec): number[] {
+    const values = new Array<number>(rows.length);
     const groups = new Map<string, Array<{ row: SqlRow; idx: number }>>();
+
     rows.forEach((row, idx) => {
-      const key = spec.partitionBy.map((f) => String(this.resolveRowValue(row, f) ?? "")).join("||");
+      const key = spec.partitionBy.length
+        ? spec.partitionBy
+            .map((field) => this.encodeTypedKey(this.resolveRowValue(row, field), `window.partition:${spec.name}:${field}`))
+            .join("||")
+        : "__all__";
       const arr = groups.get(key) ?? [];
       arr.push({ row, idx });
       groups.set(key, arr);
     });
 
-    const byOriginalIndex = new Map<number, SqlRow>();
     for (const groupRows of groups.values()) {
       const sorted = [...groupRows].sort((a, b) => {
         for (const ord of spec.orderBy) {
@@ -10586,12 +10635,47 @@ export class WalrusSqlClient {
         return a.idx - b.idx;
       });
 
-      sorted.forEach((entry, i) => {
-        byOriginalIndex.set(entry.idx, { ...entry.row, [alias]: i + 1 });
+      let currentRank = 1;
+      let currentDenseRank = 1;
+      sorted.forEach((entry, pos) => {
+        if (spec.name === "ROW_NUMBER") {
+          values[entry.idx] = pos + 1;
+          return;
+        }
+
+        if (pos > 0) {
+          const prev = sorted[pos - 1]!;
+          const tied = this.areWindowOrderValuesEqual(prev.row, entry.row, spec.orderBy);
+          if (!tied) {
+            currentRank = pos + 1;
+            currentDenseRank += 1;
+          }
+        }
+
+        values[entry.idx] = spec.name === "RANK" ? currentRank : currentDenseRank;
       });
     }
 
-    return rows.map((_, idx) => byOriginalIndex.get(idx) ?? { ...rows[idx], [alias]: idx + 1 });
+    return values;
+  }
+
+  private applyWindowFunctions(
+    rows: SqlRow[],
+    windowFunctions: ParsedWindowFunctionSpec[],
+  ): SqlRow[] {
+    if (!windowFunctions.length) return rows;
+    const computed = windowFunctions.map((windowFn) => ({
+      alias: windowFn.alias,
+      values: this.computeWindowFunctionValues(rows, windowFn),
+    }));
+
+    return rows.map((row, idx) => {
+      const withWindowValues: SqlRow = { ...row };
+      for (const windowFn of computed) {
+        withWindowValues[windowFn.alias] = windowFn.values[idx] ?? null;
+      }
+      return withWindowValues;
+    });
   }
 
   private applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>): SqlRow[] {
