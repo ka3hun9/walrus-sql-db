@@ -15,7 +15,7 @@
 
 ## P4-A. 窗口函数与高级聚合
 
-- [ ] P4-WIN-001 语法支持：`OVER (PARTITION BY ... ORDER BY ...)` 窗口定义与绑定
+- [x] P4-WIN-001 语法支持：`OVER (PARTITION BY ... ORDER BY ...)` 窗口定义与绑定
 - [ ] P4-WIN-002 `ROW_NUMBER()` 执行语义（分区内稳定排序与编号）
 - [ ] P4-WIN-003 `RANK()` / `DENSE_RANK()` 并列语义与空洞排名一致性
 - [ ] P4-WIN-004 `LAG()` / `LEAD()` 偏移、默认值、边界行行为

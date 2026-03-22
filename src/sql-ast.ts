@@ -125,6 +125,7 @@ export type SelectItemAst = {
   kind: "select_item";
   expr: ExprAst;
   alias?: string;
+  window?: WindowFunctionAst;
 };
 
 export type OrderItemAst = {
@@ -140,3 +141,13 @@ export type ExprAst =
   | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
   | { kind: "unary"; op: string; expr: ExprAst }
   | { kind: "raw"; text: string };
+
+export type WindowFunctionAst = {
+  kind: "window_function";
+  name: string;
+  args: ExprAst[];
+  over: {
+    partitionBy: ExprAst[];
+    orderBy: OrderItemAst[];
+  };
+};

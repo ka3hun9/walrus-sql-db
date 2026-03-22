@@ -47,6 +47,7 @@ import type {
   DropIndexStatementAst,
   DropViewStatementAst,
   ExprAst,
+  SelectItemAst,
   SqlAstStatement,
   SelectStatementAst,
   SqlTransactionAction,
@@ -8406,6 +8407,28 @@ export class WalrusSqlClient {
     }
   }
 
+  private isRowNumberWindowItem(item: SelectItemAst): boolean {
+    return (item.window?.name ?? "").toUpperCase() === "ROW_NUMBER";
+  }
+
+  private windowToRowNumberSpec(window?: SelectItemAst["window"]): ParsedSelect["rowNumberSpec"] {
+    if (!window || window.name.toUpperCase() !== "ROW_NUMBER") return undefined;
+
+    const partitionBy = window.over.partitionBy
+      .map((expr) => this.exprAstToSql(expr) ?? "")
+      .map((text) => text.trim())
+      .filter(Boolean);
+
+    const orderBy = window.over.orderBy
+      .map((order) => ({
+        field: (this.exprAstToSql(order.expr) ?? "").trim(),
+        direction: order.direction,
+      }))
+      .filter((item) => item.field);
+
+    return { partitionBy, orderBy };
+  }
+
   private astSelectToParsedSelect(ast: SelectStatementAst): ParsedSelect {
     if (ast.from.kind !== "table") {
       throw sqlError("ERR_UNSUPPORTED_AST_FROM", ast.from.kind);
@@ -8429,16 +8452,12 @@ export class WalrusSqlClient {
       }))
       .filter((x) => x.field);
 
-    const rowNumberItem = ast.selectItems.find(
-      (it) => it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text),
-    );
+    const rowNumberItem = ast.selectItems.find((it) => this.isRowNumberWindowItem(it));
     const rowNumberAlias = rowNumberItem?.alias ?? (rowNumberItem ? "row_number" : undefined);
-    const rowNumberSpec = rowNumberItem?.expr.kind === "raw"
-      ? this.parseRowNumberSpec(rowNumberItem.expr.text)
-      : undefined;
+    const rowNumberSpec = this.windowToRowNumberSpec(rowNumberItem?.window);
 
     const rawFieldTexts = ast.selectItems.map((it) => {
-      if (it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text)) {
+      if (this.isRowNumberWindowItem(it)) {
         return it.alias ?? "row_number";
       }
       const exprText = this.exprAstToSql(it.expr) ?? "";
@@ -8450,7 +8469,7 @@ export class WalrusSqlClient {
       if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name)) {
         return it.expr.name.toLowerCase();
       }
-      if (it.expr.kind === "raw" && /ROW_NUMBER\(\)\s+OVER\s*\(/i.test(it.expr.text)) {
+      if (this.isRowNumberWindowItem(it)) {
         return rowNumberAlias ?? "row_number";
       }
       return this.exprAstToSql(it.expr) ?? "";
@@ -8517,6 +8536,7 @@ export class WalrusSqlClient {
 
     return ast.selectItems.map((it, idx) => {
       if (it.alias) return it.alias;
+      if (this.isRowNumberWindowItem(it)) return "row_number";
       if (it.expr.kind === "identifier") {
         const parts = it.expr.name.split(".");
         return parts[parts.length - 1] ?? `col${idx + 1}`;

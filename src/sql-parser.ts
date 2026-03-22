@@ -13,6 +13,7 @@ import type {
   SqlAstStatement,
   TransactionStatementAst,
   TableRefAst,
+  WindowFunctionAst,
 } from "./sql-ast.js";
 import { fromLiteral, type SqlPrimitive } from "./types.js";
 
@@ -448,16 +449,144 @@ function parseExpr(input: string): ExprAst {
   }
 }
 
+function findTopLevelKeywordIndex(input: string, keyword: string): number {
+  const upperKeyword = keyword.toUpperCase();
+  let quote = "";
+  let depth = 0;
+
+  for (let i = 0; i <= input.length - upperKeyword.length; i++) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth !== 0) continue;
+
+    if (input.slice(i, i + upperKeyword.length).toUpperCase() !== upperKeyword) continue;
+    const prev = input[i - 1];
+    const next = input[i + upperKeyword.length];
+    const prevBoundary = !prev || /[\s,(]/.test(prev);
+    const nextBoundary = !next || /[\s),]/.test(next);
+    if (prevBoundary && nextBoundary) return i;
+  }
+
+  return -1;
+}
+
+function parseWindowOverDefinition(rawOver: string): WindowFunctionAst["over"] {
+  const overText = rawOver.trim();
+  if (!overText) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "OVER clause requires PARTITION BY and/or ORDER BY definition",
+      token: "OVER",
+    });
+  }
+
+  let partitionByText: string | undefined;
+  let orderByText: string | undefined;
+
+  if (/^PARTITION\s+BY\s+/i.test(overText)) {
+    const rest = overText.replace(/^PARTITION\s+BY\s+/i, "").trim();
+    const orderByIndex = findTopLevelKeywordIndex(rest, "ORDER BY");
+    if (orderByIndex >= 0) {
+      partitionByText = rest.slice(0, orderByIndex).trim();
+      orderByText = rest.slice(orderByIndex + "ORDER BY".length).trim();
+    } else {
+      partitionByText = rest;
+    }
+  } else if (/^ORDER\s+BY\s+/i.test(overText)) {
+    orderByText = overText.replace(/^ORDER\s+BY\s+/i, "").trim();
+  } else {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "OVER clause must start with PARTITION BY or ORDER BY",
+      token: "OVER",
+      hint: "Use OVER (PARTITION BY ... ORDER BY ...) or OVER (ORDER BY ...)",
+    });
+  }
+
+  if (partitionByText !== undefined && !partitionByText) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "PARTITION BY requires at least one expression",
+      token: "PARTITION BY",
+    });
+  }
+
+  if (orderByText !== undefined && !orderByText) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "ORDER BY requires at least one expression in OVER clause",
+      token: "ORDER BY",
+    });
+  }
+
+  const partitionBy = partitionByText
+    ? splitCommaAware(partitionByText)
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .map(parseExpr)
+    : [];
+  const orderBy = orderByText ? (parseOrderItems(orderByText) ?? []) : [];
+
+  if (!partitionBy.length && !orderBy.length) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "OVER clause requires PARTITION BY and/or ORDER BY definition",
+      token: "OVER",
+    });
+  }
+
+  return { partitionBy, orderBy };
+}
+
+function parseWindowFunction(exprText: string): WindowFunctionAst | undefined {
+  const trimmed = exprText.trim();
+  if (!/\bOVER\s*\(/i.test(trimmed)) return undefined;
+
+  const m = trimmed.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*)\)\s+OVER\s*\(([\s\S]*)\)$/i);
+  if (!m) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "Window function requires syntax: <function>(...) OVER (...)",
+      token: "OVER",
+    });
+  }
+
+  const fnName = m[1]!.toUpperCase();
+  const argsText = m[2]!.trim();
+  const overText = m[3]!;
+  const args = argsText ? splitCommaAware(argsText).map(parseExpr) : [];
+  const over = parseWindowOverDefinition(overText);
+
+  return {
+    kind: "window_function",
+    name: fnName,
+    args,
+    over,
+  };
+}
+
 function parseSelectItems(raw: string): SelectItemAst[] {
   return splitCommaAware(raw).map((item) => {
     const m = item.match(/^(.+?)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
     if (m) {
-      const exprText = m[1]!;
-      const expr = /\bOVER\s*\(/i.test(exprText) ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
-      return { kind: "select_item", expr, alias: m[2]! };
+      const exprText = m[1]!.trim();
+      const window = parseWindowFunction(exprText);
+      const expr = window ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+      return { kind: "select_item", expr, alias: m[2]!, window };
     }
-    const expr = /\bOVER\s*\(/i.test(item) ? ({ kind: "raw", text: item } as ExprAst) : parseExpr(item);
-    return { kind: "select_item", expr };
+    const exprText = item.trim();
+    const window = parseWindowFunction(exprText);
+    const expr = window ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+    return { kind: "select_item", expr, window };
   });
 }
 
