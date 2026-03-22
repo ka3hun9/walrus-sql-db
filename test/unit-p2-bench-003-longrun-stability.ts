@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
-import { runP2LongRunStability } from "../test/benchmark/p2-benchmarks.js";
+import { runTpccLikeLongRunStability } from "./benchmark/p2-benchmarks.js";
 
-const report = await runP2LongRunStability({ durationMs: 3_000, writeEveryMs: 10 });
+const report = await runTpccLikeLongRunStability({ durationMs: 3_000, writeEveryMs: 10 });
 
 assert.equal(report.samples.length, 1);
 const sample = report.samples[0]!;

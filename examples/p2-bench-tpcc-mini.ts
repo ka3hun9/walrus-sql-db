@@ -1,6 +1,6 @@
-import { runP2TpccMiniBenchmark, writeP2BenchReport } from "../test/benchmark/p2-benchmarks.js";
+import { runTpccLikeMiniBenchmark, writeTpccLikeBenchReport } from "../test/benchmark/p2-benchmarks.js";
 
-const report = await runP2TpccMiniBenchmark({
+const report = await runTpccLikeMiniBenchmark({
   warehouses: 1,
   districtsPerWarehouse: 2,
   customersPerDistrict: 20,
@@ -8,5 +8,5 @@ const report = await runP2TpccMiniBenchmark({
   linesPerOrder: 3,
 });
 
-await writeP2BenchReport("reports/p2-bench-001-tpcc-mini.json", report);
+await writeTpccLikeBenchReport("reports/p2-bench-001-tpcc-mini.json", report);
 console.log("p2-bench-tpcc-mini ok", report.samples[0]);

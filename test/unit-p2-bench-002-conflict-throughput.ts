@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
-import { runP2ConflictBenchmark } from "../test/benchmark/p2-benchmarks.js";
+import { runTpccLikeConflictBenchmark } from "./benchmark/p2-benchmarks.js";
 
-const report = await runP2ConflictBenchmark({ rounds: 12 });
+const report = await runTpccLikeConflictBenchmark({ rounds: 12 });
 
 assert.equal(report.samples.length, 1);
 const sample = report.samples[0]!;

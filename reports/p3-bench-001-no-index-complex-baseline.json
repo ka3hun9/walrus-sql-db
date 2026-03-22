@@ -1,6 +1,6 @@
 {
   "benchmark": "p3-bench-001-no-index-complex-query-baseline",
-  "at": "2026-03-20T01:32:57.481Z",
+  "at": "2026-03-21T17:16:08.146Z",
   "config": {
     "customers": 600,
     "ordersPerCustomer": 10,
@@ -27,14 +27,14 @@
   },
   "performance": {
     "queryCount": 12,
-    "totalDurationMs": 4248.629,
-    "throughputQps": 2.824,
-    "avgLatencyMs": 354.048,
-    "minLatencyMs": 330.748,
-    "p50LatencyMs": 345.732,
-    "p95LatencyMs": 404.156,
-    "p99LatencyMs": 404.156,
-    "maxLatencyMs": 404.156
+    "totalDurationMs": 4448.773,
+    "throughputQps": 2.697,
+    "avgLatencyMs": 370.725,
+    "minLatencyMs": 296.643,
+    "p50LatencyMs": 325.932,
+    "p95LatencyMs": 636.493,
+    "p99LatencyMs": 636.493,
+    "maxLatencyMs": 636.493
   },
   "execution": {
     "resultRows": 50,

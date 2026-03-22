@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
-import { WalrusSqlClient } from "./client.js";
+import { WalrusSqlClient } from "../../src/client.js";
 
 export interface P2TpccMiniConfig {
   warehouses: number;
@@ -66,7 +66,7 @@ function shareCommittedStore(source: WalrusSqlClient, target: WalrusSqlClient): 
   dst.rowVersions = src.rowVersions;
 }
 
-export async function runP2TpccMiniBenchmark(config?: Partial<P2TpccMiniConfig>): Promise<P2BenchReport> {
+export async function runTpccLikeMiniBenchmark(config?: Partial<P2TpccMiniConfig>): Promise<P2BenchReport> {
   const c: P2TpccMiniConfig = {
     warehouses: Math.max(1, config?.warehouses ?? defaultTpccMiniConfig.warehouses),
     districtsPerWarehouse: Math.max(1, config?.districtsPerWarehouse ?? defaultTpccMiniConfig.districtsPerWarehouse),
@@ -153,7 +153,7 @@ export async function runP2TpccMiniBenchmark(config?: Partial<P2TpccMiniConfig>)
   };
 }
 
-export async function runP2ConflictBenchmark(config?: Partial<P2ConflictBenchConfig>): Promise<P2BenchReport> {
+export async function runTpccLikeConflictBenchmark(config?: Partial<P2ConflictBenchConfig>): Promise<P2BenchReport> {
   const c: P2ConflictBenchConfig = { rounds: Math.max(1, config?.rounds ?? defaultConflictConfig.rounds) };
   const s1 = mkClient();
   const s2 = mkClient();
@@ -210,7 +210,7 @@ export async function runP2ConflictBenchmark(config?: Partial<P2ConflictBenchCon
   };
 }
 
-export async function runP2LongRunStability(config?: Partial<P2LongRunConfig>): Promise<P2BenchReport> {
+export async function runTpccLikeLongRunStability(config?: Partial<P2LongRunConfig>): Promise<P2BenchReport> {
   const c: P2LongRunConfig = {
     durationMs: Math.max(2000, config?.durationMs ?? defaultLongRunConfig.durationMs),
     writeEveryMs: Math.max(5, config?.writeEveryMs ?? defaultLongRunConfig.writeEveryMs),
@@ -268,7 +268,7 @@ export async function runP2LongRunStability(config?: Partial<P2LongRunConfig>): 
   };
 }
 
-export async function writeP2BenchReport(path: string, report: P2BenchReport): Promise<void> {
+export async function writeTpccLikeBenchReport(path: string, report: P2BenchReport): Promise<void> {
   await fs.mkdir(dirname(path), { recursive: true });
   await fs.writeFile(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }

@@ -1,0 +1,45 @@
+{
+  "benchmark": "p3-test-008-longrun-stability-consistency-performance-threshold",
+  "at": "2026-03-22T00:00:31.340Z",
+  "config": {
+    "table": "p3_test8_events",
+    "view": "p3_test8_high_score",
+    "initialRows": 20000,
+    "customerBuckets": 255,
+    "targetCustomer": 77,
+    "targetRegion": 1,
+    "highScoreFloor": 900,
+    "durationMsTarget": 3500,
+    "writeIntervalMs": 5,
+    "thresholds": {
+      "minWrites": 20,
+      "minWindowSize": 6,
+      "minWritesPerSec": 0.5,
+      "degradationRatioMax": 2.5
+    }
+  },
+  "consistency": {
+    "writes": 20,
+    "errors": 0,
+    "checks": 3,
+    "expectedTotalRows": 20020,
+    "expectedTargetRows": 79,
+    "expectedTargetHighScoreRows": 8,
+    "expectedTargetRegionRows": 20
+  },
+  "performance": {
+    "samples": 20,
+    "durationMs": 17196.219,
+    "writesPerSec": 1.163,
+    "baselineAvgMs": 277.728133,
+    "tailAvgMs": 269.3317,
+    "degradationRatio": 0.969767,
+    "windowSize": 6
+  },
+  "subquery": {
+    "sql": "SELECT 1 FROM p3_test8_probe WHERE p3_test8_probe.id = outer.id AND flag = 1",
+    "probeSql": "SELECT COUNT(*) FROM p3_test8_probe WHERE EXISTS (SELECT 1 FROM p3_test8_probe WHERE p3_test8_probe.id = outer.id AND flag = 1)",
+    "probeCount": 16,
+    "correlatedExecutions": 64
+  }
+}

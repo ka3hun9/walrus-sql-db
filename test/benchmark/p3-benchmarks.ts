@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
-import { WalrusSqlClient } from "./client.js";
+import { WalrusSqlClient } from "../../src/client.js";
 
 type InternalTableStore = {
   tables: Map<string, Array<Record<string, number | string | null>>>;

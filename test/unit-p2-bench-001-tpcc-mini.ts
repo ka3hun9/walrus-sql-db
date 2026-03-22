@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
-import { runP2TpccMiniBenchmark } from "../test/benchmark/p2-benchmarks.js";
+import { runTpccLikeMiniBenchmark } from "./benchmark/p2-benchmarks.js";
 
-const report = await runP2TpccMiniBenchmark({
+const report = await runTpccLikeMiniBenchmark({
   warehouses: 1,
   districtsPerWarehouse: 2,
   customersPerDistrict: 8,

@@ -1,19 +1,21 @@
-import { runTpccLikeBenchmark, writeTpccLikeBenchmarkReport } from "../test/benchmark/p2-benchmarks.js";
+import { runTpccLikeMiniBenchmark, writeTpccLikeBenchReport } from "../test/benchmark/p2-benchmarks.js";
 
 const outputPath = process.argv[2] ?? "reports/sql-tpcc-like-benchmark.json";
-const txCountArg = Number(process.argv[3] ?? "0");
-const conflictEveryArg = Number(process.argv[4] ?? "0");
+const warehousesArg = Number(process.argv[3] ?? "0");
+const districtsArg = Number(process.argv[4] ?? "0");
 const customersArg = Number(process.argv[5] ?? "0");
+const ordersArg = Number(process.argv[6] ?? "0");
 
-const report = await runTpccLikeBenchmark({
-  transactions: Number.isFinite(txCountArg) && txCountArg > 0 ? txCountArg : undefined,
-  conflictEvery: Number.isFinite(conflictEveryArg) && conflictEveryArg >= 0 ? conflictEveryArg : undefined,
-  customersPerWarehouse: Number.isFinite(customersArg) && customersArg > 0 ? customersArg : undefined,
+const report = await runTpccLikeMiniBenchmark({
+  warehouses: Number.isFinite(warehousesArg) && warehousesArg > 0 ? warehousesArg : undefined,
+  districtsPerWarehouse: Number.isFinite(districtsArg) && districtsArg > 0 ? districtsArg : undefined,
+  customersPerDistrict: Number.isFinite(customersArg) && customersArg > 0 ? customersArg : undefined,
+  ordersPerDistrict: Number.isFinite(ordersArg) && ordersArg > 0 ? ordersArg : undefined,
 });
 
-await writeTpccLikeBenchmarkReport(outputPath, report);
+await writeTpccLikeBenchReport(outputPath, report);
 
+const sample = report.samples[0];
 console.log(`written: ${outputPath}`);
-console.log(`tx attempted=${report.attemptedTransactions}, committed=${report.committedTransactions}, aborted=${report.abortedTransactions}`);
-console.log(`throughput tps=${report.throughputTps}, latency(avg/p95/max)=${report.latencyMs.avg}/${report.latencyMs.p95}/${report.latencyMs.max}`);
-console.log(`consistency errors=${report.consistencyErrors.length}`);
+console.log(`sample=${sample?.name}, ops=${sample?.operations}, durationMs=${sample?.durationMs}, opsPerSec=${sample?.opsPerSec}`);
+console.log(`notes=${(report.notes ?? []).join("; ")}`);

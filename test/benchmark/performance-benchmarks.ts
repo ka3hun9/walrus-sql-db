@@ -1,8 +1,8 @@
 import { performance } from "node:perf_hooks";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
-import type { WalrusSqlClientOptions } from "./types.js";
-import { WalrusSqlClient } from "./client.js";
+import type { WalrusSqlClientOptions } from "../../src/types.js";
+import { WalrusSqlClient } from "../../src/client.js";
 
 export interface PerformanceBenchmarkConfig {
   writeRows: number;

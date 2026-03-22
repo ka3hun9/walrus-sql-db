@@ -1,6 +1,6 @@
 {
   "benchmark": "p3-idx-003-hash-index-equality-path",
-  "at": "2026-03-18T01:40:23.097Z",
+  "at": "2026-03-21T17:05:39.714Z",
   "queryRounds": 50,
-  "elapsedMs": 44.354
+  "elapsedMs": 126.301
 }

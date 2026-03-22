@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { promises as fs } from "node:fs";
-import { runPerformanceBenchmarks, writePerformanceBenchmarkReport } from "../test/benchmark/performance-benchmarks.js";
+import { runPerformanceBenchmarks, writePerformanceBenchmarkReport } from "./benchmark/performance-benchmarks.js";
 
 const report = await runPerformanceBenchmarks({
   writeRows: 300,

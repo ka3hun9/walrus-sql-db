@@ -1,6 +1,6 @@
 {
   "benchmark": "p3-bench-003-cbo-benefit-vs-fixed-rule-baseline",
-  "at": "2026-03-20T05:03:51.144Z",
+  "at": "2026-03-21T17:16:24.552Z",
   "config": {
     "rows": 18000,
     "scoreModulo": 4000,
@@ -34,14 +34,14 @@
     },
     "performance": {
       "queryCount": 12,
-      "totalDurationMs": 4140.271,
-      "throughputQps": 2.898,
-      "avgLatencyMs": 345.018,
-      "minLatencyMs": 320.112,
-      "p50LatencyMs": 333.412,
-      "p95LatencyMs": 429.891,
-      "p99LatencyMs": 429.891,
-      "maxLatencyMs": 429.891
+      "totalDurationMs": 4015.096,
+      "throughputQps": 2.989,
+      "avgLatencyMs": 334.586,
+      "minLatencyMs": 322.637,
+      "p50LatencyMs": 333.954,
+      "p95LatencyMs": 352.114,
+      "p99LatencyMs": 352.114,
+      "maxLatencyMs": 352.114
     },
     "execution": {
       "resultRows": 9,
@@ -73,14 +73,14 @@
     },
     "performance": {
       "queryCount": 12,
-      "totalDurationMs": 2869.115,
-      "throughputQps": 4.182,
-      "avgLatencyMs": 239.089,
-      "minLatencyMs": 225.247,
-      "p50LatencyMs": 234.212,
-      "p95LatencyMs": 258.173,
-      "p99LatencyMs": 258.173,
-      "maxLatencyMs": 258.173
+      "totalDurationMs": 2873.794,
+      "throughputQps": 4.176,
+      "avgLatencyMs": 239.479,
+      "minLatencyMs": 225.912,
+      "p50LatencyMs": 236.198,
+      "p95LatencyMs": 260.902,
+      "p99LatencyMs": 260.902,
+      "maxLatencyMs": 260.902
     },
     "execution": {
       "resultRows": 9,
@@ -100,10 +100,10 @@
     }
   },
   "gains": {
-    "throughputQpsDelta": 1.284,
-    "throughputQpsGainPct": 44.306,
-    "p95LatencyMsDelta": 171.718,
-    "p95LatencyReductionPct": 39.945,
+    "throughputQpsDelta": 1.187,
+    "throughputQpsGainPct": 39.712,
+    "p95LatencyMsDelta": 91.212,
+    "p95LatencyReductionPct": 25.904,
     "rowsVisitedPerQueryDelta": 17991,
     "rowsVisitedReductionPct": 99.95,
     "physicalCostDelta": 76127,

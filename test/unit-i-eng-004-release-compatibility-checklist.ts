@@ -8,8 +8,6 @@ const requiredExports = [
   "normalizeSql",
   "parseSqlToAst",
   "buildMoveCall",
-  "runPerformanceBenchmarks",
-  "writePerformanceBenchmarkReport",
   "createSqlError",
   "sqlError",
   "loadWalrusSqlClientOptions",
