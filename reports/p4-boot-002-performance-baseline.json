@@ -1,0 +1,91 @@
+{
+  "benchmark": "p4-boot-002-performance-baseline",
+  "at": "2026-03-22T01:30:31.169Z",
+  "nodeVersion": "v24.14.0",
+  "config": {
+    "windowRows": 1800,
+    "windowWarmupRounds": 2,
+    "windowMeasuredRounds": 12,
+    "recursiveCteProbeRounds": 36,
+    "dynamicSqlProbeRounds": 36
+  },
+  "windowFunction": {
+    "mode": "supported",
+    "sql": "SELECT grp, id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score DESC, id ASC) AS rn FROM p4_boot2_window_scores ORDER BY grp ASC, rn ASC LIMIT 180",
+    "datasetRows": 1800,
+    "warmupRounds": 2,
+    "measuredRounds": 12,
+    "resultRows": 180,
+    "performance": {
+      "operations": 12,
+      "totalDurationMs": 1564.332,
+      "throughputOpsPerSec": 7.671,
+      "avgLatencyMs": 130.357,
+      "minLatencyMs": 89.518,
+      "p50LatencyMs": 116.761,
+      "p95LatencyMs": 180.783,
+      "p99LatencyMs": 180.783,
+      "maxLatencyMs": 180.783
+    },
+    "execution": {
+      "rowsVisited": 21600,
+      "rowsVisitedPerQuery": 1800,
+      "lastRowsVisited": 1800,
+      "pipelinedExecutions": 0,
+      "materializedExecutions": 12
+    }
+  },
+  "recursiveCte": {
+    "mode": "expected_error_probe",
+    "sql": [
+      "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 16) SELECT n FROM seq"
+    ],
+    "probeRounds": 36,
+    "expectedErrorCode": "SQL_DIALECT_UNSUPPORTED_SYNTAX",
+    "rejected": 36,
+    "observedTokens": [
+      "cte"
+    ],
+    "performance": {
+      "operations": 36,
+      "totalDurationMs": 6.935,
+      "throughputOpsPerSec": 5191.359,
+      "avgLatencyMs": 0.186,
+      "minLatencyMs": 0.104,
+      "p50LatencyMs": 0.125,
+      "p95LatencyMs": 0.252,
+      "p99LatencyMs": 1.698,
+      "maxLatencyMs": 1.698
+    }
+  },
+  "dynamicSql": {
+    "mode": "expected_error_probe",
+    "sql": [
+      "PREPARE p4_boot2_stmt AS SELECT id FROM p4_boot2_window_scores",
+      "EXECUTE p4_boot2_stmt"
+    ],
+    "probeRounds": 36,
+    "expectedErrorCode": "SQL_DIALECT_UNSUPPORTED_SYNTAX",
+    "rejected": 36,
+    "observedTokens": [
+      "EXECUTE",
+      "PREPARE"
+    ],
+    "performance": {
+      "operations": 36,
+      "totalDurationMs": 8.18,
+      "throughputOpsPerSec": 4400.763,
+      "avgLatencyMs": 0.222,
+      "minLatencyMs": 0.123,
+      "p50LatencyMs": 0.218,
+      "p95LatencyMs": 0.485,
+      "p99LatencyMs": 0.644,
+      "maxLatencyMs": 0.644
+    }
+  },
+  "tracking": {
+    "reportPath": "reports/p4-boot-002-performance-baseline.json",
+    "historyPath": "reports/p4-boot-002-performance-tracking.jsonl",
+    "baselineMode": "hybrid_supported_and_expected_error"
+  }
+}

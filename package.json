@@ -49,6 +49,7 @@
     "p3:bench:002": "tsx examples/p3-bench-002-indexed-same-load-benefit.ts",
     "p3:bench:003": "tsx examples/p3-bench-003-cbo-benefit-vs-fixed-rule-baseline.ts",
     "p3:bench:004": "tsx examples/p3-bench-004-large-dataset-complex-join-subquery-stress.ts",
+    "sql:p4:bench:boot": "tsx examples/p4-boot-002-performance-baseline.ts",
     "test:ci:unit": "tsx scripts/run-ci-tests.ts unit",
     "test:ci:integration": "tsx scripts/run-ci-tests.ts integration",
     "test:ci:regression": "tsx scripts/run-ci-tests.ts regression",

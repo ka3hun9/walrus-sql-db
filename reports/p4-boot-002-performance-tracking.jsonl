@@ -1,0 +1,1 @@
+{"at":"2026-03-22T01:30:31.180Z","benchmark":"p4-boot-002-performance-baseline","windowThroughputQps":7.671,"windowP95LatencyMs":180.783,"recursiveCteRejectOpsPerSec":5191.359,"dynamicSqlRejectOpsPerSec":4400.763,"recursiveObservedTokens":["cte"],"dynamicObservedTokens":["EXECUTE","PREPARE"]}
