@@ -40,6 +40,8 @@
     "sql:logic": "tsx examples/sql-logic-runner.ts test/sqllogic/p1-basic.slt",
     "sql:logic:p2": "tsx examples/sql-logic-runner.ts test/sqllogic/p2-extended.slt",
     "sql:logic:all": "tsx test/unit-h-test-005-sqllogic-extension.ts",
+    "sql:logic:suite": "tsx examples/sql-logic-suite-runner.ts",
+    "sql:logic:p4:boot": "tsx examples/sql-logic-suite-runner.ts test/sqllogic/suites/p4-boot-001-minimal.json reports/sql92-p4-boot-001-minimal.json",
     "p2:bench:tpcc": "tsx examples/p2-bench-tpcc-mini.ts",
     "p2:bench:conflict": "tsx examples/p2-bench-conflict.ts",
     "p2:bench:longrun": "tsx examples/p2-bench-longrun.ts",

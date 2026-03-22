@@ -8,7 +8,7 @@
 
 ## P4-BOOT. 阶段四开工门槛（必须先完成）
 
-- [ ] P4-BOOT-001 提前接入 SQL-92 测试套件并跑通最小可执行子集（窗口函数/CTE 优先），形成可复用执行框架与报告路径
+- [x] P4-BOOT-001 提前接入 SQL-92 测试套件并跑通最小可执行子集（窗口函数/CTE 优先），形成可复用执行框架与报告路径
 - [ ] P4-BOOT-002 提前建立 P4 性能基线环境（窗口函数、递归 CTE、动态 SQL），产出首版基准报告并纳入持续跟踪
 
 ---
@@ -103,4 +103,3 @@
 
 - PR：`maxFailed = 0`、`maxMismatchRatio = 0`、`maxXpass = 0`
 - Nightly：`maxMismatchRatio <= 0.02`、`maxXpass = 0`
-

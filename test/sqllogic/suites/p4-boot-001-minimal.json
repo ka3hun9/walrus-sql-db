@@ -1,0 +1,25 @@
+{
+  "suiteId": "p4-boot-001-sql92-minimal",
+  "description": "Phase 4 SQL-92 bootstrap subset with window-function path and CTE boundary path.",
+  "reportPath": "reports/sql92-p4-boot-001-minimal.json",
+  "entries": [
+    {
+      "id": "window-row-number-core",
+      "file": "test/sqllogic/sql92-p4-window-core.slt",
+      "focus": [
+        "sql92",
+        "window"
+      ],
+      "note": "ROW_NUMBER baseline over partition/order and derived-set path."
+    },
+    {
+      "id": "cte-baseline-boundary",
+      "file": "test/sqllogic/sql92-p4-cte-baseline.slt",
+      "focus": [
+        "sql92",
+        "cte"
+      ],
+      "note": "Current baseline keeps CTE as deterministic expected-error before P4-CTE execution support lands."
+    }
+  ]
+}
