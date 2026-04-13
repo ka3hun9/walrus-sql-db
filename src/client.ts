@@ -5373,6 +5373,11 @@ export class WalrusSqlClient {
       this.enterSubqueryRuntimeScope();
       const tempCteViewNames: string[] = [];
       try {
+        // WITH RECURSIVE handling (before regular CTE)
+        if (/^\s*WITH\s+RECURSIVE\s+/i.test(sql)) {
+          return await this.executeRecursiveCteQuery(sql);
+        }
+
         // CTE (WITH clause) handling: expand CTEs as temporary views
         const cteResult = this.parseCteClause(sql);
         let activeSql = sql;
@@ -11316,6 +11321,125 @@ export class WalrusSqlClient {
     }
     if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
     return v;
+  }
+
+  private async executeRecursiveCteQuery(sql: string): Promise<QueryResult> {
+    const MAX_RECURSIVE_DEPTH = 100;
+    // Parse: WITH RECURSIVE name AS (body) mainSql
+    const trimmed = sql.trim();
+    const rcteHeaderMatch = trimmed.match(/^WITH\s+RECURSIVE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(/i);
+    if (!rcteHeaderMatch) throw sqlError("ERR_UNSUPPORTED_SELECT", "Invalid WITH RECURSIVE syntax");
+
+    const cteName = rcteHeaderMatch[1]!;
+    let i = rcteHeaderMatch[0].length;
+
+    // Extract the CTE body (balanced parens, already consumed the opening '(')
+    let depth = 1;
+    let inStr = "";
+    const bodyStart = i;
+    while (i < trimmed.length && depth > 0) {
+      const ch = trimmed[i]!;
+      if (inStr) {
+        if (ch === inStr) inStr = "";
+      } else if (ch === "'" || ch === '"') {
+        inStr = ch;
+      } else if (ch === "(") {
+        depth++;
+      } else if (ch === ")") {
+        depth--;
+        if (depth === 0) break;
+      }
+      i++;
+    }
+    const cteBody = trimmed.substring(bodyStart, i).trim();
+    i++; // skip closing )
+    while (i < trimmed.length && /\s/.test(trimmed[i]!)) i++;
+    const mainSql = trimmed.slice(i).trim();
+
+    // Split cteBody by top-level UNION [ALL]
+    let unionAll = false;
+    let splitIdx = -1;
+    let bd = 0;
+    const upper = cteBody.toUpperCase();
+    let si = "";
+    for (let j = 0; j < cteBody.length; j++) {
+      const ch = cteBody[j]!;
+      if (si) { if (ch === si) si = ""; continue; }
+      if (ch === "'" || ch === '"') { si = ch; continue; }
+      if (ch === "(") { bd++; continue; }
+      if (ch === ")") { bd--; continue; }
+      if (bd === 0 && upper.startsWith("UNION", j)) {
+        const afterUnion = upper.slice(j + 5).trimStart();
+        if (afterUnion.startsWith("ALL")) {
+          unionAll = true;
+          splitIdx = j;
+          break;
+        } else {
+          unionAll = false;
+          splitIdx = j;
+          break;
+        }
+      }
+    }
+    if (splitIdx < 0) throw sqlError("ERR_UNSUPPORTED_SELECT", "WITH RECURSIVE requires UNION or UNION ALL in CTE body");
+
+    const anchorSql = cteBody.substring(0, splitIdx).trim();
+    // Skip past "UNION" and optional "ALL"
+    let recursiveStart = splitIdx + 5; // after "UNION"
+    while (recursiveStart < cteBody.length && /\s/.test(cteBody[recursiveStart]!)) recursiveStart++;
+    if (cteBody.slice(recursiveStart).toUpperCase().startsWith("ALL")) recursiveStart += 3;
+    const recursiveSql = cteBody.slice(recursiveStart).trimStart();
+
+    // Execute anchor
+    const anchorResult = await this.query(anchorSql);
+    // Anchor defines the canonical column names for the CTE
+    const anchorColumns = anchorResult.rows[0] ? Object.keys(anchorResult.rows[0]) : [];
+    const normalizeRow = (row: SqlRow): SqlRow => {
+      if (anchorColumns.length === 0) return row;
+      const vals = Object.values(row);
+      const out: SqlRow = {};
+      for (let k = 0; k < anchorColumns.length && k < vals.length; k++) {
+        out[anchorColumns[k]!] = vals[k] as SqlPrimitive;
+      }
+      return out;
+    };
+
+    let accumulated: SqlRow[] = anchorResult.rows.map(normalizeRow);
+    let currentBatch: SqlRow[] = [...accumulated];
+
+    // For UNION (dedup): track seen row keys
+    const seen = new Set<string>();
+    if (!unionAll) {
+      for (const row of accumulated) seen.add(JSON.stringify(row));
+    }
+
+    const recursiveSqlNormalized = recursiveSql.trim().replace(/\s+/g, " ");
+    // Iterative recursive execution
+    for (let depth2 = 0; depth2 < MAX_RECURSIVE_DEPTH && currentBatch.length > 0; depth2++) {
+      this.tables.set(cteName, currentBatch);
+      // Invalidate cache so each iteration sees updated table
+      this.queryCache.delete(recursiveSqlNormalized);
+      const stepResult = await this.query(recursiveSql);
+      const newRows: SqlRow[] = [];
+      for (const rawRow of stepResult.rows) {
+        const row = normalizeRow(rawRow);
+        const key = JSON.stringify(row);
+        if (unionAll || !seen.has(key)) {
+          if (!unionAll) seen.add(key);
+          newRows.push(row);
+        }
+      }
+      accumulated = accumulated.concat(newRows);
+      currentBatch = newRows;
+    }
+
+    // Materialize final CTE result and execute main query
+    this.tables.set(cteName, accumulated);
+    try {
+      return await this.query(mainSql);
+    } finally {
+      this.tables.delete(cteName);
+    }
   }
 
   private parseCteClause(sql: string): { cteDefs: Array<{ name: string; querySql: string }>; mainSql: string } | null {
