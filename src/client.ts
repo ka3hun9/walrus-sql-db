@@ -698,6 +698,14 @@ export class WalrusSqlClient {
   private readonly schemas = new Map<string, TableSchema>();
   private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
   private readonly viewCatalog = new Map<string, ViewCatalogEntry>();
+  private readonly cursorCatalog = new Map<string, {
+    name: string;
+    querySql: string;
+    state: "DECLARED" | "OPEN" | "EOF" | "CLOSED";
+    rows: SqlRow[];
+    position: number;
+  }>();
+  private readonly preparedStatements = new Map<string, string>();
   private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
   private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly btreeIndexes = new Map<string, BtreeRuntimeIndexMap>();
@@ -3616,6 +3624,77 @@ export class WalrusSqlClient {
       };
     }
 
+    // Cursor: DECLARE cursor_name CURSOR FOR select_sql
+    {
+      const declareMatch = normalized.match(/^DECLARE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+CURSOR\s+FOR\s+(.+)$/i);
+      if (declareMatch) {
+        const cursorName = declareMatch[1]!.toUpperCase();
+        const querySql = declareMatch[2]!.trim();
+        if (this.cursorCatalog.has(cursorName)) {
+          throw new Error(`ERR_CURSOR_ALREADY_EXISTS: cursor '${declareMatch[1]}' already declared`);
+        }
+        this.cursorCatalog.set(cursorName, { name: cursorName, querySql, state: "DECLARED", rows: [], position: 0 });
+        return { txDigest: this.fakeDigest(normalized), statementType: "CURSOR", affectedRows: 0 };
+      }
+    }
+
+    // Cursor: OPEN cursor_name
+    {
+      const openMatch = normalized.match(/^OPEN\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+      if (openMatch) {
+        const cursorName = openMatch[1]!.toUpperCase();
+        const cursor = this.cursorCatalog.get(cursorName);
+        if (!cursor) throw new Error(`ERR_CURSOR_NOT_FOUND: cursor '${openMatch[1]}' not declared`);
+        if (cursor.state === "OPEN") throw new Error(`ERR_CURSOR_ALREADY_OPEN: cursor '${openMatch[1]}' is already open`);
+        if (cursor.state === "CLOSED") throw new Error(`ERR_CURSOR_CLOSED: cursor '${openMatch[1]}' is closed`);
+        const result = await this.query(cursor.querySql);
+        cursor.rows = result.rows;
+        cursor.position = 0;
+        cursor.state = cursor.rows.length === 0 ? "EOF" : "OPEN";
+        return { txDigest: this.fakeDigest(normalized), statementType: "CURSOR", affectedRows: 0 };
+      }
+    }
+
+    // Cursor: CLOSE cursor_name
+    {
+      const closeMatch = normalized.match(/^CLOSE\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+      if (closeMatch) {
+        const cursorName = closeMatch[1]!.toUpperCase();
+        const cursor = this.cursorCatalog.get(cursorName);
+        if (!cursor) throw new Error(`ERR_CURSOR_NOT_FOUND: cursor '${closeMatch[1]}' not declared`);
+        cursor.state = "CLOSED";
+        cursor.rows = [];
+        cursor.position = 0;
+        return { txDigest: this.fakeDigest(normalized), statementType: "CURSOR", affectedRows: 0 };
+      }
+    }
+
+    // Dynamic SQL: PREPARE stmt_name FROM 'sql'
+    {
+      const prepareMatch = normalized.match(/^PREPARE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+'([\s\S]+)'$/i);
+      if (prepareMatch) {
+        const stmtName = prepareMatch[1]!.toUpperCase();
+        const stmtSql = prepareMatch[2]!;
+        this.preparedStatements.set(stmtName, stmtSql);
+        return { txDigest: this.fakeDigest(normalized), statementType: "UNKNOWN", affectedRows: 0 };
+      }
+    }
+
+    // Dynamic SQL: EXECUTE stmt_name [USING val1, val2, ...] for DML
+    {
+      const execMatch = normalized.match(/^EXECUTE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+USING\s+(.+))?$/i);
+      if (execMatch) {
+        const stmtName = execMatch[1]!.toUpperCase();
+        const stmtSql = this.preparedStatements.get(stmtName);
+        if (!stmtSql) throw new Error(`ERR_STMT_NOT_FOUND: prepared statement '${execMatch[1]}' not found`);
+        const expandedSql = execMatch[2] ? this.bindPreparedParams(stmtSql, execMatch[2]) : stmtSql;
+        if (/^\s*SELECT\b/i.test(expandedSql)) {
+          throw new Error(`ERR_EXECUTE_USE_QUERY: use query() for SELECT prepared statements`);
+        }
+        return this.executeSimulator(expandedSql);
+      }
+    }
+
     return {
       txDigest: this.fakeDigest(normalized),
       statementType: "UNKNOWN",
@@ -5366,6 +5445,43 @@ export class WalrusSqlClient {
     try {
       this.assertTransactionNotTimedOut(normalized);
       this.assertStatementAllowedDuringTransaction(normalized);
+
+      // Cursor FETCH: FETCH cursor_name — returns the next row
+      {
+        const fetchMatch = normalized.match(/^FETCH\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+        if (fetchMatch) {
+          const cursorName = fetchMatch[1]!.toUpperCase();
+          const cursor = this.cursorCatalog.get(cursorName);
+          if (!cursor) throw new Error(`ERR_CURSOR_NOT_FOUND: cursor '${fetchMatch[1]}' not declared`);
+          if (cursor.state === "DECLARED") throw new Error(`ERR_CURSOR_NOT_OPEN: cursor '${fetchMatch[1]}' has not been opened`);
+          if (cursor.state === "CLOSED") throw new Error(`ERR_CURSOR_CLOSED: cursor '${fetchMatch[1]}' is closed`);
+          if (cursor.state === "EOF" || cursor.position >= cursor.rows.length) {
+            cursor.state = "EOF";
+            return { rows: [] };
+          }
+          const row = cursor.rows[cursor.position++]!;
+          if (cursor.position >= cursor.rows.length) cursor.state = "EOF";
+          return { rows: [row] };
+        }
+      }
+
+      // Dynamic SQL: EXECUTE stmt_name [USING val1, ...] for SELECT
+      {
+        const execMatch = normalized.match(/^EXECUTE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+USING\s+(.+))?$/i);
+        if (execMatch) {
+          const stmtName = execMatch[1]!.toUpperCase();
+          const stmtSql = this.preparedStatements.get(stmtName);
+          if (!stmtSql) throw new Error(`ERR_STMT_NOT_FOUND: prepared statement '${execMatch[1]}' not found`);
+          const expandedSql = execMatch[2] ? this.bindPreparedParams(stmtSql, execMatch[2]) : stmtSql;
+          return this.query(expandedSql);
+        }
+      }
+
+      // information_schema: materialize virtual tables for any query referencing them
+      if (/information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage)\b/i.test(normalized)) {
+        return this.executeInformationSchemaQuery(sql);
+      }
+
       const normalizedSql = sql.trim().replace(/\s+/g, " ");
       const cachedRows = this.getCachedQuery(normalizedSql);
       if (cachedRows) return { rows: cachedRows };
@@ -11328,7 +11444,7 @@ export class WalrusSqlClient {
     // Parse: WITH RECURSIVE name AS (body) mainSql
     const trimmed = sql.trim();
     const rcteHeaderMatch = trimmed.match(/^WITH\s+RECURSIVE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(/i);
-    if (!rcteHeaderMatch) throw sqlError("ERR_UNSUPPORTED_SELECT", "Invalid WITH RECURSIVE syntax");
+    if (!rcteHeaderMatch) throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", { token: "cte", message: "WITH RECURSIVE requires: WITH RECURSIVE name AS (anchor UNION ALL recursive) main" });
 
     const cteName = rcteHeaderMatch[1]!;
     let i = rcteHeaderMatch[0].length;
@@ -11440,6 +11556,155 @@ export class WalrusSqlClient {
     } finally {
       this.tables.delete(cteName);
     }
+  }
+
+  private buildInformationSchemaRows(infoTable: string): SqlRow[] {
+    const lc = infoTable.toLowerCase();
+    if (lc === "tables") {
+      const rows: SqlRow[] = [];
+      for (const [, schema] of this.schemas.entries()) {
+        rows.push({
+          table_catalog: "def",
+          table_schema: "public",
+          table_name: schema.name,
+          table_type: "BASE TABLE",
+          table_owner: "current_user",
+        });
+      }
+      for (const [viewName, entry] of this.viewCatalog.entries()) {
+        // Skip CTE temporary views (those are not user-created views)
+        if (entry.status === "ACTIVE") {
+          rows.push({
+            table_catalog: "def",
+            table_schema: "public",
+            table_name: viewName,
+            table_type: "VIEW",
+            table_owner: "current_user",
+          });
+        }
+      }
+      return rows;
+    }
+    if (lc === "columns") {
+      const rows: SqlRow[] = [];
+      for (const [, schema] of this.schemas.entries()) {
+        schema.columns.forEach((col, idx) => {
+          rows.push({
+            table_catalog: "def",
+            table_schema: "public",
+            table_name: schema.name,
+            column_name: col.name,
+            ordinal_position: idx + 1,
+            column_default: col.defaultValue ?? null,
+            is_nullable: col.notNull ? "NO" : "YES",
+            data_type: col.type.name,
+            character_maximum_length: col.type.length ?? null,
+            numeric_precision: col.type.precision ?? null,
+            numeric_scale: col.type.scale ?? null,
+          });
+        });
+      }
+      return rows;
+    }
+    if (lc === "table_constraints") {
+      const rows: SqlRow[] = [];
+      for (const [, schema] of this.schemas.entries()) {
+        // Primary key: from primaryKeyGroup or from column.primaryKey
+        const pkCols = schema.primaryKeyGroup && schema.primaryKeyGroup.length > 0
+          ? schema.primaryKeyGroup
+          : schema.columns.filter((c) => c.primaryKey).map((c) => c.name);
+        if (pkCols.length > 0) {
+          rows.push({
+            constraint_catalog: "def",
+            constraint_schema: "public",
+            constraint_name: `pk_${schema.name}`,
+            table_schema: "public",
+            table_name: schema.name,
+            constraint_type: "PRIMARY KEY",
+          });
+        }
+        for (const group of schema.uniqueGroups ?? []) {
+          rows.push({
+            constraint_catalog: "def",
+            constraint_schema: "public",
+            constraint_name: `uq_${schema.name}_${group.join("_")}`,
+            table_schema: "public",
+            table_name: schema.name,
+            constraint_type: "UNIQUE",
+          });
+        }
+        for (const fk of schema.foreignKeys ?? []) {
+          rows.push({
+            constraint_catalog: "def",
+            constraint_schema: "public",
+            constraint_name: `fk_${schema.name}_${fk.columns.join("_")}`,
+            table_schema: "public",
+            table_name: schema.name,
+            constraint_type: "FOREIGN KEY",
+          });
+        }
+      }
+      return rows;
+    }
+    if (lc === "key_column_usage") {
+      const rows: SqlRow[] = [];
+      for (const [, schema] of this.schemas.entries()) {
+        const pkCols = schema.primaryKeyGroup && schema.primaryKeyGroup.length > 0
+          ? schema.primaryKeyGroup
+          : schema.columns.filter((c) => c.primaryKey).map((c) => c.name);
+        let pos = 1;
+        for (const col of pkCols) {
+          rows.push({
+            constraint_catalog: "def",
+            constraint_schema: "public",
+            constraint_name: `pk_${schema.name}`,
+            table_schema: "public",
+            table_name: schema.name,
+            column_name: col,
+            ordinal_position: pos++,
+          });
+        }
+      }
+      return rows;
+    }
+    return [];
+  }
+
+  private async executeInformationSchemaQuery(sql: string): Promise<QueryResult> {
+    // Rewrite information_schema.X to __info_X and register as temp tables
+    const INFO_TABLE_PATTERN = /information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage)\b/gi;
+    const tempInfoTables: string[] = [];
+    const rewrittenSql = sql.replace(INFO_TABLE_PATTERN, (_match, tbl: string) => {
+      const alias = `__info_${tbl.toLowerCase()}`;
+      if (!tempInfoTables.includes(alias)) {
+        tempInfoTables.push(alias);
+        this.tables.set(alias, this.buildInformationSchemaRows(tbl));
+      }
+      return alias;
+    });
+    try {
+      return await this.query(rewrittenSql);
+    } finally {
+      for (const alias of tempInfoTables) {
+        this.tables.delete(alias);
+      }
+    }
+  }
+
+  /**
+   * Substitute `?` placeholders in a prepared statement SQL with literal values.
+   * Values from the USING clause are comma-split. NULL, numbers, and quoted strings are supported.
+   * Injection boundary: this is a simulator; no external input surfaces should reach here.
+   */
+  private bindPreparedParams(stmtSql: string, usingClause: string): string {
+    const params = usingClause.split(",").map((v) => v.trim());
+    let idx = 0;
+    return stmtSql.replace(/\?/g, () => {
+      if (idx >= params.length) throw new Error(`ERR_BIND_PARAM: not enough parameters (expected at least ${idx + 1})`);
+      const val = params[idx++]!;
+      // Already a quoted string or NULL or number — pass through as-is
+      return val;
+    });
   }
 
   private parseCteClause(sql: string): { cteDefs: Array<{ name: string; querySql: string }>; mainSql: string } | null {

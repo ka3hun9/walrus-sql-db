@@ -137,7 +137,8 @@ export type OrderItemAst = {
 export type ExprAst =
   | { kind: "identifier"; name: string }
   | { kind: "literal"; typedValue: SqlTypedValue }
-  | { kind: "function"; name: string; args: ExprAst[] }
+  | { kind: "function"; name: string; args: ExprAst[]; filter?: ExprAst }
+  | { kind: "case"; whenClauses: { condition: ExprAst; result: ExprAst }[]; elseResult?: ExprAst }
   | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
   | { kind: "unary"; op: string; expr: ExprAst }
   | { kind: "raw"; text: string };
@@ -149,5 +150,19 @@ export type WindowFunctionAst = {
   over: {
     partitionBy: ExprAst[];
     orderBy: OrderItemAst[];
+    frame?: WindowFrameAst;
   };
 };
+
+export type WindowFrameAst = {
+  unit: "ROWS";
+  start: WindowFrameBound;
+  end: WindowFrameBound;
+};
+
+export type WindowFrameBound =
+  | { kind: "unbounded_preceding" }
+  | { kind: "unbounded_following" }
+  | { kind: "current_row" }
+  | { kind: "offset_preceding"; offset: number }
+  | { kind: "offset_following"; offset: number };

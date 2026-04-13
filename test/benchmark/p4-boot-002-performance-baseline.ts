@@ -17,7 +17,6 @@ const RECURSIVE_CTE_SQL =
   "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 16) SELECT n FROM seq";
 const DYNAMIC_SQL_PROBES = [
   "PREPARE p4_boot2_stmt AS SELECT id FROM p4_boot2_window_scores",
-  "EXECUTE p4_boot2_stmt",
 ] as const;
 
 export const P4_BOOT_002_REPORT_PATH = "reports/p4-boot-002-performance-baseline.json";

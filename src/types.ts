@@ -1054,7 +1054,7 @@ export type SessionTransactionState = "idle" | "active" | "committing" | "aborte
 
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "UNKNOWN";
+  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "CURSOR" | "UNKNOWN";
   affectedRows?: number;
   tableObjectId?: string;
   raw?: unknown;

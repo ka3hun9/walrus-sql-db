@@ -36,21 +36,21 @@
 
 ## P4-C. 游标与动态 SQL
 
-- [ ] P4-CUR-001 游标语法：`DECLARE CURSOR` / `OPEN` / `FETCH` / `CLOSE`
-- [ ] P4-CUR-002 游标状态机（未打开/已打开/EOF/关闭后行为）
-- [ ] P4-CUR-003 `FETCH` 逐行读取一致性与错误码规范化
-- [ ] P4-DYN-001 `PREPARE` 预编译语义（参数占位与类型约束）
-- [ ] P4-DYN-002 `EXECUTE` 执行绑定（位置参数、NULL、类型转换）
-- [ ] P4-DYN-003 动态 SQL 与事务/权限/对象生命周期交互一致性
-- [ ] P4-DYN-004 动态 SQL 错误分层与注入边界防护（最小安全基线）
+- [x] P4-CUR-001 游标语法：`DECLARE CURSOR` / `OPEN` / `FETCH` / `CLOSE`
+- [x] P4-CUR-002 游标状态机（未打开/已打开/EOF/关闭后行为）
+- [x] P4-CUR-003 `FETCH` 逐行读取一致性与错误码规范化
+- [x] P4-DYN-001 `PREPARE` 预编译语义（参数占位与类型约束）
+- [x] P4-DYN-002 `EXECUTE` 执行绑定（位置参数、NULL、类型转换）
+- [x] P4-DYN-003 动态 SQL 与事务/权限/对象生命周期交互一致性
+- [x] P4-DYN-004 动态 SQL 错误分层与注入边界防护（最小安全基线）
 
 ## P4-D. information_schema 与系统表
 
-- [ ] P4-INFO-001 `information_schema.tables`（schema/table/type/owner 基础字段）
-- [ ] P4-INFO-002 `information_schema.columns`（列类型、nullable、default）
-- [ ] P4-INFO-003 约束与索引元数据视图（最小 SQL-92 兼容集合）
-- [ ] P4-INFO-004 元数据与 DDL 变更实时一致性（CREATE/ALTER/DROP 后可见）
-- [ ] P4-INFO-005 系统视图查询性能基线与稳定性
+- [x] P4-INFO-001 `information_schema.tables`（schema/table/type/owner 基础字段）
+- [x] P4-INFO-002 `information_schema.columns`（列类型、nullable、default）
+- [x] P4-INFO-003 约束与索引元数据视图（最小 SQL-92 兼容集合）
+- [x] P4-INFO-004 元数据与 DDL 变更实时一致性（CREATE/ALTER/DROP 后可见）
+- [x] P4-INFO-005 系统视图查询性能基线与稳定性
 
 ## P4-E. 安全与权限（可选能力）
 
