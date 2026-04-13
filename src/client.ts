@@ -5371,8 +5371,35 @@ export class WalrusSqlClient {
       if (cachedRows) return { rows: cachedRows };
 
       this.enterSubqueryRuntimeScope();
+      const tempCteViewNames: string[] = [];
       try {
-        const ast = parseSqlToAst(sql, { dialect: this.opts.dialect ?? "ansi" });
+        // CTE (WITH clause) handling: expand CTEs as temporary views
+        const cteResult = this.parseCteClause(sql);
+        let activeSql = sql;
+        let activeSqlNormalized = normalizedSql;
+        if (cteResult) {
+          activeSql = cteResult.mainSql;
+          activeSqlNormalized = activeSql.trim().replace(/\s+/g, " ");
+          for (const { name, querySql } of cteResult.cteDefs) {
+            const normalizedName = this.normalizeViewName(name);
+            if (!this.viewCatalog.has(normalizedName)) {
+              const viewEntry = {
+                name: normalizedName,
+                querySql,
+                status: "ACTIVE" as const,
+                dependencies: this.extractViewDependencies(querySql),
+              };
+              this.viewCatalog.set(normalizedName, viewEntry);
+              // Eagerly materialize into tables so subqueries can access the CTE.
+              // Store under original name (case-sensitive) so FROM/IN references resolve correctly.
+              const rows = await this.materializeViewRows(viewEntry);
+              this.tables.set(name, rows);
+              tempCteViewNames.push(name);
+            }
+          }
+        }
+
+        const ast = parseSqlToAst(activeSql, { dialect: this.opts.dialect ?? "ansi" });
 
         if (ast.kind === "union" || ast.kind === "intersect" || ast.kind === "except") {
           const setOpToken = ast.kind === "union" ? "UNION" : ast.kind === "intersect" ? "INTERSECT" : "EXCEPT";
@@ -5430,7 +5457,7 @@ export class WalrusSqlClient {
       }
     }
 
-    const parsed = this.parseSelect(normalizedSql, sql);
+    const parsed = this.parseSelect(activeSqlNormalized, activeSql);
     const planStabilityKey = parsed.explain ? normalizedSql.replace(/^EXPLAIN\s+/i, "").trim() : normalizedSql;
     const materializedViewSources = await this.materializeSelectViewSources(parsed);
     try {
@@ -5689,8 +5716,12 @@ export class WalrusSqlClient {
       this.cleanupMaterializedSelectViewSources(materializedViewSources);
     }
       } finally {
-        this.leaveSubqueryRuntimeScope();
-      }
+          for (const name of tempCteViewNames) {
+            this.viewCatalog.delete(this.normalizeViewName(name));
+            this.tables.delete(name);
+          }
+          this.leaveSubqueryRuntimeScope();
+        }
     } catch (err) {
       this.transitionTransactionToAbortedOnError(normalized);
       const wrapped = this.wrapAsyncError(err, ClientErrorCodeEnum.QueryFailed, `query() failed for SQL: ${normalized}`);
@@ -11285,6 +11316,60 @@ export class WalrusSqlClient {
     }
     if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
     return v;
+  }
+
+  private parseCteClause(sql: string): { cteDefs: Array<{ name: string; querySql: string }>; mainSql: string } | null {
+    const trimmed = sql.trim();
+    if (!/^WITH\s+/i.test(trimmed)) return null;
+    if (/^WITH\s+RECURSIVE\s+/i.test(trimmed)) return null; // handled separately
+
+    const cteDefs: Array<{ name: string; querySql: string }> = [];
+    let i = 4; // skip "WITH"
+    while (i < trimmed.length && /\s/.test(trimmed[i]!)) i++;
+
+    while (i < trimmed.length) {
+      // Parse CTE name
+      const nameMatch = trimmed.slice(i).match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(/i);
+      if (!nameMatch) break;
+      const cteName = nameMatch[1]!;
+      i += nameMatch[0].length;
+
+      // Parse balanced parentheses for the CTE body
+      let depth = 1;
+      let inStr = "";
+      const start = i;
+      while (i < trimmed.length && depth > 0) {
+        const ch = trimmed[i]!;
+        if (inStr) {
+          if (ch === inStr && trimmed[i - 1] !== "\\") inStr = "";
+        } else if (ch === "'" || ch === '"') {
+          inStr = ch;
+        } else if (ch === "(") {
+          depth++;
+        } else if (ch === ")") {
+          depth--;
+          if (depth === 0) break;
+        }
+        i++;
+      }
+      const cteSql = trimmed.substring(start, i).trim();
+      i++; // skip closing )
+
+      cteDefs.push({ name: cteName, querySql: cteSql });
+
+      // Skip whitespace and optional comma before next CTE
+      while (i < trimmed.length && /\s/.test(trimmed[i]!)) i++;
+      if (trimmed[i] === ",") {
+        i++;
+        while (i < trimmed.length && /\s/.test(trimmed[i]!)) i++;
+      } else {
+        break;
+      }
+    }
+
+    if (cteDefs.length === 0) return null;
+    const mainSql = trimmed.slice(i).trim();
+    return { cteDefs, mainSql };
   }
 
   private smartSplit(input: string): string[] {
