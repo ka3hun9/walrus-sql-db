@@ -38,7 +38,15 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       if (expr.name === "RANGE" && expr.args.length >= 2) {
         return `${exprAstToSql(expr.args[0])} AND ${exprAstToSql(expr.args[1])}`;
       }
-      return `${expr.name}(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})`;
+      const filterPart = expr.filter ? ` FILTER (WHERE ${exprAstToSql(expr.filter) ?? ""})` : "";
+      return `${expr.name}(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})${filterPart}`;
+    case "case": {
+      const clauses = expr.whenClauses
+        .map((wc) => `WHEN ${exprAstToSql(wc.condition) ?? ""} THEN ${exprAstToSql(wc.result) ?? ""}`)
+        .join(" ");
+      const elsePart = expr.elseResult ? ` ELSE ${exprAstToSql(expr.elseResult) ?? ""}` : "";
+      return `CASE ${clauses}${elsePart} END`;
+    }
     case "binary":
       return `${maybeWrap(expr.left)} ${expr.op} ${maybeWrap(expr.right)}`;
     case "unary":
@@ -261,6 +269,18 @@ export function evalExprAstTyped(
       }
 
       return typedNull(`expr.function.${fn}`);
+    }
+    case "case": {
+      for (const wc of expr.whenClauses) {
+        const condVal = evalExprAstTyped(wc.condition, resolve);
+        if (condVal.value === true) {
+          return evalExprAstTyped(wc.result, resolve);
+        }
+      }
+      if (expr.elseResult) {
+        return evalExprAstTyped(expr.elseResult, resolve);
+      }
+      return typedNull("expr.case");
     }
     case "raw":
       return typedNull("expr.raw");

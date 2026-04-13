@@ -16,12 +16,12 @@
 ## P4-A. 窗口函数与高级聚合
 
 - [x] P4-WIN-001 语法支持：`OVER (PARTITION BY ... ORDER BY ...)` 窗口定义与绑定
-- [ ] P4-WIN-002 `ROW_NUMBER()` 执行语义（分区内稳定排序与编号）
+- [x] P4-WIN-002 `ROW_NUMBER()` 执行语义（分区内稳定排序与编号）
 - [x] P4-WIN-003 `RANK()` / `DENSE_RANK()` 并列语义与空洞排名一致性
-- [ ] P4-WIN-004 `LAG()` / `LEAD()` 偏移、默认值、边界行行为
-- [ ] P4-WIN-005 窗口帧基础能力（`ROWS BETWEEN ...` 最小闭集）
-- [ ] P4-AGG-001 聚合 `FILTER (WHERE ...)` 子句
-- [ ] P4-AGG-002 `CASE WHEN` 在聚合表达式中的类型/NULL/短路语义
+- [x] P4-WIN-004 `LAG()` / `LEAD()` 偏移、默认值、边界行行为
+- [x] P4-WIN-005 窗口帧基础能力（`ROWS BETWEEN ...` 最小闭集）
+- [x] P4-AGG-001 聚合 `FILTER (WHERE ...)` 子句
+- [x] P4-AGG-002 `CASE WHEN` 在聚合表达式中的类型/NULL/短路语义
 - [ ] P4-AGG-003 窗口函数与聚合、排序、分页的组合兼容性
 
 ## P4-B. 公共表表达式（CTE）与递归查询

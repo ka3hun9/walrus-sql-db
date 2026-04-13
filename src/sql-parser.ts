@@ -14,6 +14,8 @@ import type {
   TransactionStatementAst,
   TableRefAst,
   WindowFunctionAst,
+  WindowFrameAst,
+  WindowFrameBound,
 } from "./sql-ast.js";
 import { fromLiteral, type SqlPrimitive } from "./types.js";
 
@@ -260,6 +262,11 @@ function parsePrimary(ts: TokenStream): ExprAst {
     return literalExpr(castLiteral(t));
   }
 
+  // CASE WHEN ... THEN ... [ELSE ...] END (no parentheses)
+  if (t.toUpperCase() === "CASE") {
+    return parseCaseWhen(ts);
+  }
+
   if (isIdentifierToken(t) && ts.peek() === "(") {
     const fn = t.toUpperCase();
     ts.next(); // (
@@ -289,7 +296,22 @@ function parsePrimary(ts: TokenStream): ExprAst {
       }
     }
     ts.expect(")");
-    return { kind: "function", name: fn, args };
+    const funcExpr: ExprAst = { kind: "function", name: fn, args };
+
+    // Handle FILTER (WHERE ...) clause for aggregate functions
+    if (ts.peek()?.toUpperCase() === "FILTER") {
+      ts.next(); // FILTER
+      ts.expect("(");
+      if (ts.peek()?.toUpperCase() !== "WHERE") {
+        throw new Error("expected WHERE after FILTER");
+      }
+      ts.next(); // WHERE
+      const filterExpr = parseOr(ts);
+      ts.expect(")");
+      funcExpr.filter = filterExpr;
+    }
+
+    return funcExpr;
   }
 
   if (isIdentifierToken(t)) return { kind: "identifier", name: t };
@@ -496,18 +518,45 @@ function parseWindowOverDefinition(rawOver: string): WindowFunctionAst["over"] {
 
   let partitionByText: string | undefined;
   let orderByText: string | undefined;
+  let frameText: string | undefined;
 
   if (/^PARTITION\s+BY\s+/i.test(overText)) {
     const rest = overText.replace(/^PARTITION\s+BY\s+/i, "").trim();
+    const rowsIndex = findTopLevelKeywordIndex(rest, "ROWS");
     const orderByIndex = findTopLevelKeywordIndex(rest, "ORDER BY");
-    if (orderByIndex >= 0) {
+    if (orderByIndex >= 0 && rowsIndex >= 0) {
+      if (orderByIndex < rowsIndex) {
+        partitionByText = rest.slice(0, orderByIndex).trim();
+        const afterOrderBy = rest.slice(orderByIndex + "ORDER BY".length).trim();
+        const rowsFrameIdx = findTopLevelKeywordIndex(afterOrderBy, "ROWS");
+        if (rowsFrameIdx >= 0) {
+          orderByText = afterOrderBy.slice(0, rowsFrameIdx).trim();
+          frameText = afterOrderBy.slice(rowsFrameIdx).trim(); // includes "ROWS ..."
+        } else {
+          orderByText = afterOrderBy;
+        }
+      } else {
+        partitionByText = rest.slice(0, rowsIndex).trim();
+        frameText = rest.slice(rowsIndex).trim(); // includes "ROWS ..."
+      }
+    } else if (orderByIndex >= 0) {
       partitionByText = rest.slice(0, orderByIndex).trim();
       orderByText = rest.slice(orderByIndex + "ORDER BY".length).trim();
+    } else if (rowsIndex >= 0) {
+      partitionByText = rest.slice(0, rowsIndex).trim();
+      frameText = rest.slice(rowsIndex).trim(); // includes "ROWS ..."
     } else {
       partitionByText = rest;
     }
   } else if (/^ORDER\s+BY\s+/i.test(overText)) {
-    orderByText = overText.replace(/^ORDER\s+BY\s+/i, "").trim();
+    const rest = overText.replace(/^ORDER\s+BY\s+/i, "").trim();
+    const rowsIndex = findTopLevelKeywordIndex(rest, "ROWS");
+    if (rowsIndex >= 0) {
+      orderByText = rest.slice(0, rowsIndex).trim();
+      frameText = rest.slice(rowsIndex + "ROWS".length).trim();
+    } else {
+      orderByText = rest;
+    }
   } else {
     throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
       message: "OVER clause must start with PARTITION BY or ORDER BY",
@@ -545,7 +594,56 @@ function parseWindowOverDefinition(rawOver: string): WindowFunctionAst["over"] {
     });
   }
 
-  return { partitionBy, orderBy };
+  const frame = frameText ? parseWindowFrame(frameText) : undefined;
+
+  return { partitionBy, orderBy, ...(frame ? { frame } : {}) };
+}
+
+function parseWindowFrame(text: string): WindowFrameAst | undefined {
+  const trimmed = text.trim();
+  const m = trimmed.match(/^ROWS\s+BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+  if (!m) return undefined;
+  const startBound = parseWindowFrameBound(m[1]!.trim());
+  const endBound = parseWindowFrameBound(m[2]!.trim());
+  if (!startBound || !endBound) return undefined;
+  return { unit: "ROWS", start: startBound, end: endBound };
+}
+
+function parseWindowFrameBound(text: string): WindowFrameBound | undefined {
+  const upper = text.toUpperCase().trim();
+  if (upper === "UNBOUNDED PRECEDING") return { kind: "unbounded_preceding" };
+  if (upper === "UNBOUNDED FOLLOWING") return { kind: "unbounded_following" };
+  if (upper === "CURRENT ROW") return { kind: "current_row" };
+  const precedingMatch = text.match(/^(\d+)\s+PRECEDING$/i);
+  if (precedingMatch) return { kind: "offset_preceding", offset: parseInt(precedingMatch[1]!, 10) };
+  const followingMatch = text.match(/^(\d+)\s+FOLLOWING$/i);
+  if (followingMatch) return { kind: "offset_following", offset: parseInt(followingMatch[1]!, 10) };
+  return undefined;
+}
+
+function parseCaseWhen(ts: TokenStream): ExprAst {
+  // Parse: CASE WHEN condition THEN result [WHEN ...] [ELSE result] END
+  const whenClauses: { condition: ExprAst; result: ExprAst }[] = [];
+  let elseResult: ExprAst | undefined;
+
+  while (true) {
+    if (ts.match("WHEN")) {
+      const condition = parseOr(ts);
+      ts.expect("THEN");
+      const result = parseOr(ts);
+      whenClauses.push({ condition, result });
+    } else if (ts.match("ELSE")) {
+      elseResult = parseOr(ts);
+      ts.expect("END");
+      break;
+    } else if (ts.match("END")) {
+      break;
+    } else {
+      const next = ts.peek();
+      throw new Error(`expected WHEN, ELSE, or END in CASE expression, got: ${next}`);
+    }
+  }
+  return { kind: "case", whenClauses, elseResult };
 }
 
 function parseWindowFunction(exprText: string): WindowFunctionAst | undefined {
