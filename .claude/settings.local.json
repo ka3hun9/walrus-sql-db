@@ -17,7 +17,9 @@
       "Bash(ls:*)",
       "Bash(git push:*)",
       "Bash(grep -l \"test/\\\\|examples/\\\\|scripts/\\\\|reports/\" .github/workflows/*.yml)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(git status:*)",
+      "Bash(git ls-tree:*)"
     ]
   }
 }

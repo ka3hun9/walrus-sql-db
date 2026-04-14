@@ -50,6 +50,7 @@ export enum ConstraintViolationKindEnum {
   UniqueDrop = "UNIQUE_DROP",
   DdlDependency = "DDL_DEPENDENCY",
   NotNullAddColumn = "NOT_NULL_ADD_COLUMN",
+  Check = "CHECK",
 }
 
 export type SqlErrorFamily = `${SqlErrorFamilyEnum}`;

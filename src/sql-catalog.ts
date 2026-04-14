@@ -27,12 +27,18 @@ export type ForeignKeySpec = {
   onUpdate: "NO ACTION" | "RESTRICT" | "CASCADE" | "SET NULL" | "SET DEFAULT";
 };
 
+export type CheckConstraintSpec = {
+  name?: string;
+  predicate: string; // raw expression text, evaluated via evalPredicate3VL
+};
+
 export type TableSchema = {
   name: string;
   columns: ColumnSchema[];
   uniqueGroups?: string[][];
   primaryKeyGroup?: string[];
   foreignKeys?: ForeignKeySpec[];
+  checkConstraints?: CheckConstraintSpec[];
 };
 
 export type IndexCatalogType = "HASH" | "BTREE";

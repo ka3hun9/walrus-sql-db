@@ -58,6 +58,7 @@ import { ClientErrorCodeEnum, ConstraintViolationKindEnum, sqlError, constraintE
 import { createLogger, type Logger } from "./logger.js";
 import {
   emptyConstraintCostStats,
+  type CheckConstraintSpec,
   type ColumnSchema,
   type ColumnTypeSpec,
   type ConstraintIndexCostStats,
@@ -3432,6 +3433,7 @@ export class WalrusSqlClient {
       const bucket = this.requireWritableTableForDml(table);
       const parsedInsert = this.parseInsert(normalized);
       const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
+      this.evaluateCheckConstraints(table, coerced);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
       if (this.isDmlWriteStagingActive()) {
@@ -6339,6 +6341,7 @@ export class WalrusSqlClient {
     const columns: ColumnSchema[] = [];
     const tableUniqueGroups: string[][] = [];
     const foreignKeys: ForeignKeySpec[] = [];
+    const checkConstraints: CheckConstraintSpec[] = [];
     let primaryKeyGroup: string[] | undefined;
 
     for (const d of defs) {
@@ -6369,6 +6372,24 @@ export class WalrusSqlClient {
         foreignKeys.push({
           columns: cols,
           ...refSpec,
+        });
+        continue;
+      }
+
+      const checkMatch = d.match(/^CHECK\s*\((.+)\)$/i);
+      if (checkMatch) {
+        checkConstraints.push({
+          name: undefined,
+          predicate: checkMatch[1]!.trim(),
+        });
+        continue;
+      }
+
+      const namedCheckMatch = d.match(/^CONSTRAINT\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+CHECK\s*\((.+)\)$/i);
+      if (namedCheckMatch) {
+        checkConstraints.push({
+          name: namedCheckMatch[1]!.trim(),
+          predicate: namedCheckMatch[2]!.trim(),
         });
         continue;
       }
@@ -6438,7 +6459,7 @@ export class WalrusSqlClient {
       }
     }
 
-    return { name: table, columns, uniqueGroups: tableUniqueGroups, primaryKeyGroup, foreignKeys };
+    return { name: table, columns, uniqueGroups: tableUniqueGroups, primaryKeyGroup, foreignKeys, checkConstraints };
   }
 
   private applyAlterTable(sql: string): void {
@@ -6547,6 +6568,128 @@ export class WalrusSqlClient {
       this.pruneIndexVersionObjectsForTable(table);
       this.rebuildSecondaryIndexesForTable(table);
       this.dirtyTables.add(table);
+      return;
+    }
+
+    // ALTER COLUMN SET DEFAULT
+    const alterSetDefault = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ALTER\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+SET\s+DEFAULT\s+(.+)$/i,
+    );
+    if (alterSetDefault) {
+      const table = alterSetDefault[1]!;
+      const column = alterSetDefault[2]!;
+      const defaultExpr = alterSetDefault[3]!.trim();
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+      const col = schema.columns.find((c) => c.name.toUpperCase() === column.toUpperCase());
+      if (!col) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
+      const defaultParsed = this.parseDefaultLiteral(`DEFAULT ${defaultExpr}`, `ddl.default.alter-set:${table}.${column}`);
+      if (!defaultParsed.hasDefault) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid DEFAULT expression: ${defaultExpr}`);
+      col.defaultValue = this.coerceByType(col.type, defaultParsed.typedValue ?? fromLiteral(null), `ddl.default.alter-set:${table}.${column}`);
+      return;
+    }
+
+    // ALTER COLUMN DROP DEFAULT
+    const alterDropDefault = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ALTER\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+DROP\s+DEFAULT$/i,
+    );
+    if (alterDropDefault) {
+      const table = alterDropDefault[1]!;
+      const column = alterDropDefault[2]!;
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+      const col = schema.columns.find((c) => c.name.toUpperCase() === column.toUpperCase());
+      if (!col) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
+      col.defaultValue = undefined;
+      return;
+    }
+
+    // MODIFY COLUMN (MySQL-style)
+    const modifyCol = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+MODIFY\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i,
+    );
+    if (modifyCol) {
+      const table = modifyCol[1]!;
+      const column = modifyCol[2]!;
+      const newType = this.parseSqlTypeSpec(modifyCol[3]!);
+      const consRaw = modifyCol[4]!.trim();
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+      const col = schema.columns.find((c) => c.name.toUpperCase() === column.toUpperCase());
+      if (!col) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${column}`);
+      const cons = consRaw.toUpperCase();
+      col.type = newType;
+      col.notNull = /\bNOT\s+NULL\b/.test(cons);
+      col.unique = /\bUNIQUE\b/.test(cons);
+      // Coerce existing rows to new type
+      const rows = this.requireTable(table);
+      for (const r of rows) {
+        const oldVal = r[column];
+        r[column] = this.coerceByType(newType, fromLiteral(oldVal ?? null), `ddl.modify:${table}.${column}`);
+      }
+      this.dirtyTables.add(table);
+      return;
+    }
+
+    // RENAME COLUMN
+    const renameCol = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+RENAME\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i,
+    );
+    if (renameCol) {
+      const table = renameCol[1]!;
+      const oldName = renameCol[2]!;
+      const newName = renameCol[3]!;
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+      const col = schema.columns.find((c) => c.name.toUpperCase() === oldName.toUpperCase());
+      if (!col) throw sqlError("ERR_UNSUPPORTED_DDL", `column not found: ${oldName}`);
+      if (schema.columns.some((c) => c.name.toUpperCase() === newName.toUpperCase())) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `column already exists: ${newName}`);
+      }
+      // Update column name
+      col.name = newName;
+      // Update all rows
+      const rows = this.requireTable(table);
+      for (const r of rows) {
+        const val = r[oldName];
+        delete r[oldName];
+        r[newName] = val;
+      }
+      // Update foreign key references
+      for (const s of this.schemas.values()) {
+        for (const fk of s.foreignKeys ?? []) {
+          const refIdx = fk.refColumns.findIndex((c) => c.toUpperCase() === oldName.toUpperCase());
+          if (refIdx >= 0) fk.refColumns[refIdx] = newName;
+        }
+      }
+      this.dirtyTables.add(table);
+      return;
+    }
+
+    // RENAME TO
+    const renameTable = sql.match(
+      /^ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+RENAME\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i,
+    );
+    if (renameTable) {
+      const oldName = renameTable[1]!;
+      const newName = renameTable[2]!;
+      if (!this.schemas.has(oldName)) throw sqlError("ERR_TABLE_NOT_FOUND", oldName);
+      if (this.schemas.has(newName)) throw sqlError("ERR_UNSUPPORTED_DDL", `table already exists: ${newName}`);
+      const schema = this.schemas.get(oldName)!;
+      const tableData = this.tables.get(oldName);
+      const indexes = [...this.indexCatalog.entries()].filter(([, e]) => e.table.toUpperCase() === oldName.toUpperCase());
+      this.schemas.delete(oldName);
+      this.tables.delete(oldName);
+      schema.name = newName;
+      this.schemas.set(newName, schema);
+      if (tableData) {
+        this.tables.set(newName, tableData);
+      }
+      for (const [idxName, entry] of indexes) {
+        this.indexCatalog.delete(idxName);
+        this.indexCatalog.set(idxName, { ...entry, table: newName });
+      }
+      this.dirtyTables.add(newName);
       return;
     }
 
@@ -7256,6 +7399,7 @@ export class WalrusSqlClient {
     if (!this.isDmlWriteStagingActive()) this.removeRowFromSecondaryIndexes(table, beforeImage);
     Object.keys(row).forEach((k) => delete row[k]);
     Object.assign(row, next);
+    this.evaluateCheckConstraints(table, row);
     this.addRowToUniqueIndexes(table, row);
     if (!this.isDmlWriteStagingActive()) this.addRowToSecondaryIndexes(table, row);
     this.recordTransactionLogWrite(table, "UPDATE", beforeImage, beforeImage, { ...row });
@@ -10765,6 +10909,21 @@ export class WalrusSqlClient {
 
   private valueToTruth(value: SqlPrimitive | undefined): TruthValue {
     return toTruthValue(value);
+  }
+
+  private evaluateCheckPredicate(row: SqlRow, predicate: string): boolean {
+    const node = this.parseWhereTree(predicate);
+    return this.evaluateWhereTree(row, node) === "TRUE";
+  }
+
+  private evaluateCheckConstraints(table: string, row: SqlRow): void {
+    const schema = this.schemas.get(table);
+    if (!schema?.checkConstraints?.length) return;
+    for (const cc of schema.checkConstraints) {
+      if (!this.evaluateCheckPredicate(row, cc.predicate)) {
+        throw constraintError("CHECK", cc.name ? `CHECK constraint "${cc.name}" violated` : `CHECK constraint violated on ${table}`);
+      }
+    }
   }
 
   private evaluateWhereAst(row: SqlRow, expr: ExprAst, fallbackSql?: string): TruthValue {
