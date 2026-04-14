@@ -1,77 +1,61 @@
-# walrus-sql-db (English)
+# walrus-sql-db
 
-Hub: [README.md](./README.md) | 中文: [README.zh-CN.md](./README.zh-CN.md)
+Walrus blockchain storage + SQL-92 Core Standard (90% compliance target) SDK.
 
-Pure on-chain oriented Walrus SQL SDK starter.
+## Project Goal
 
-## Features
+Build a database SDK on Walrus blockchain storage that conforms to SQL-92 Intermediate to Full level (Substantial SQL-92):
 
-- SQL capability: `WHERE(AND/OR/IN/comparators/LIKE/IS NULL)`, multi-order, group/having, aggregates, explain
-- Simulator JOIN (`INNER/LEFT/RIGHT`) + UNION/UNION ALL + `ROW_NUMBER()` (first-cut)
-- Subquery first-cut: `IN (SELECT col FROM table)`
-- On-chain replay SELECT with persistent cache (`WALRUS_SQL_REPLAY_CACHE_FILE`)
-- On-chain replay JOIN (replay left+right tables then local join)
-- Auto table discovery by `TableCreated` events
-- Gap tracking matrix: `docs/SQL_GAP_MATRIX.md`
+| Category | Coverage | Description |
+|----------|----------|-------------|
+| Data Types | 65% | INT/FLOAT/VARCHAR/DATE/TIME/TIMESTAMP/BOOLEAN/BLOB |
+| DDL | 60% | CREATE/DROP TABLE, ALTER TABLE ADD/DROP COLUMN, INDEX, VIEW |
+| DML | 75% | SELECT (subquery/JOIN/aggregation/set ops), INSERT/UPDATE/DELETE |
+| Transactions | 55% | BEGIN/COMMIT/ROLLBACK, ACID (WAL) |
+| Integrity Constraints | 70% | PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, DEFAULT |
+| Index Management | 60% | CREATE INDEX (HASH/BTREE), DROP INDEX |
+| Advanced Features | 65% | Views, Cursors, GRANT/REVOKE, Window Functions, CTE/WITH RECURSIVE |
 
-## RPC failover (testnet)
+**Current Coverage: ~63%**
+
+## Core Features
+
+- **Data Types**: Numeric (INT, BIGINT, FLOAT, DOUBLE, DECIMAL), String (VARCHAR, TEXT), Temporal (DATE, TIME, TIMESTAMP), Boolean, Binary (BLOB)
+- **Queries**: WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, FETCH, DISTINCT
+- **Joins**: INNER, LEFT, RIGHT, FULL OUTER JOIN
+- **Subqueries**: Scalar, IN, EXISTS, ANY, ALL, Correlated
+- **Set Operations**: UNION, INTERSECT, EXCEPT (with ALL variants)
+- **Aggregation**: COUNT, SUM, AVG, MIN, MAX + FILTER(WHERE) + CASE WHEN
+- **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD + OVER(PARTITION BY/ORDER BY)
+- **CTE**: WITH, WITH RECURSIVE (with depth protection)
+- **Transactions**: BEGIN/COMMIT/ROLLBACK, WAL, ACID semantics
+- **Permissions**: GRANT/REVOKE (SELECT, INSERT, UPDATE, DELETE, REFERENCES), WITH GRANT OPTION
+
+## Gap from 90% Target
+
+- CHECK constraint syntax definition
+- SAVEPOINT for nested transactions
+- ALTER TABLE full support (modify column type/default/rename)
+- RETURNING clause (get modified rows after DML)
+- TRIGGER / PROCEDURE / FUNCTION
+- Composite indexes (multi-column)
+- Isolation level settings (SERIALIZABLE/REPEATABLE READ)
+- CREATE SCHEMA
+
+## Build
+
+```bash
+npm install
+npm run build
+```
+
+## RPC Nodes (testnet)
 
 - `https://fullnode.testnet.sui.io:443`
 - `https://rpc-testnet.suiscan.xyz:443`
 - `https://testnet.suiet.app:443`
 
-## Run
-
-```bash
-npm install
-npm run build
-npm run sql:advanced
-npm run sql:join
-npm run sql:roadmap
-npm run sql:compare
-npm run sql:compare:sqlite
-npm run sql:compare:matrix
-npm run sql:compare:matrix:category -- compare
-npm run sql:compare:matrix:nightly
-npm run sql:verify:full
-npm run onchain:select-replay
-npm run onchain:join-replay
-npm run onchain:benchmark-replay
-npm run p2:bench:tpcc
-npm run p2:bench:conflict
-npm run p2:bench:longrun
-npm run sql:logic
-npm run sql:logic:p2
-```
-
-## P2 Operations Runbook
-
-- Runbook: `docs/sql-p2-operations-runbook.md`
-- Recommended P2 acceptance flow:
-
-```bash
-npm run build
-npm run test:ci
-npm run p2:bench:tpcc
-npm run p2:bench:conflict
-npm run p2:bench:longrun
-npm run sql:logic
-npm run sql:logic:p2
-```
-
-## CI / Verification
-
-- PR workflow: category-parallel matrix checks + roadmap smoke
-- Nightly workflow: extended matrix profile
-- Full local verification:
-
-```bash
-npm run sql:verify:full
-```
-
-Matrix reports include per-category summary and support XFAIL/XPASS markers.
-
-## Env
+## Environment Variables
 
 ```env
 SUI_NETWORK=testnet
@@ -80,9 +64,20 @@ SUI_OWNER_ADDRESS=0x...
 WALRUS_SQL_PACKAGE_ID=0x630e7563985686b50d05d20b73e2603b10578bbe76ce51f8b82e65c83638fe95
 WALRUS_SQL_TABLE_NAME=orders
 WALRUS_SQL_TABLE_ID=
-WALRUS_SQL_LEFT_TABLE=orders
-WALRUS_SQL_RIGHT_TABLE=users
-WALRUS_SQL_LEFT_TABLE_ID=
-WALRUS_SQL_RIGHT_TABLE_ID=
 WALRUS_SQL_REPLAY_CACHE_FILE=.cache/replay-cache.json
 ```
+
+## Core Files
+
+- `src/client.ts` - Main client (transactions/queries/permissions)
+- `src/sql-parser.ts` - SQL parser
+- `src/sql-executor.ts` - Query execution engine
+- `src/sql-catalog.ts` - Metadata catalog
+- `src/types.ts` - Type system
+- `src/sql-ast.ts` - AST definitions
+- `src/sql-errors.ts` - Error definitions
+- `src/onchain.ts` - On-chain interaction
+
+## License
+
+MIT
