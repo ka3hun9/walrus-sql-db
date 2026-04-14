@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(npx tsx:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e ':*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(node:*)",
+      "mcp__plugin_ecc_exa__web_search_exa",
+      "mcp__plugin_ecc_exa__web_fetch_exa",
+      "Bash(npx ts-node:*)",
+      "Bash(npm test:*)",
+      "Bash(ls test/unit-p4-*.ts)",
+      "Bash(ls test/unit-p1-*.ts test/unit-p2-*.ts test/unit-p3-*.ts)",
+      "Bash(ls:*)",
+      "Bash(git push:*)",
+      "Bash(grep -l \"test/\\\\|examples/\\\\|scripts/\\\\|reports/\" .github/workflows/*.yml)",
+      "Bash(grep:*)"
+    ]
+  }
+}

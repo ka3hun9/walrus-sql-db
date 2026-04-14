@@ -13,6 +13,7 @@ export enum SqlErrorCodeEnum {
   SemanticAmbiguousIdentifier = "SQL_SEMANTIC_AMBIGUOUS_IDENTIFIER",
   SemanticTypeMismatch = "SQL_SEMANTIC_TYPE_MISMATCH",
   SemanticInvalidGrouping = "SQL_SEMANTIC_INVALID_GROUPING",
+  PermissionDenied = "SQL_PERMISSION_DENIED",
   DialectUnsupportedSyntax = "SQL_DIALECT_UNSUPPORTED_SYNTAX",
   DialectUnsupportedFunction = "SQL_DIALECT_UNSUPPORTED_FUNCTION",
   DialectUnsupportedOperator = "SQL_DIALECT_UNSUPPORTED_OPERATOR",

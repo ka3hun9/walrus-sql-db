@@ -1054,7 +1054,7 @@ export type SessionTransactionState = "idle" | "active" | "committing" | "aborte
 
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "CURSOR" | "UNKNOWN";
+  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "CURSOR" | "GRANT" | "REVOKE" | "UNKNOWN";
   affectedRows?: number;
   tableObjectId?: string;
   raw?: unknown;
@@ -1349,6 +1349,7 @@ export interface WalrusSqlClientOptions {
   packageId: string;
   network: "sui-mainnet" | "sui-testnet" | "sui-devnet" | string;
   signerAddress?: string;
+  authUsername?: string;  // for SQL-layer permission checks (simulator only)
   mode?: "simulator" | "onchain";
   isolationLevel?: "read_committed";
   transactionTimeoutMs?: number;
