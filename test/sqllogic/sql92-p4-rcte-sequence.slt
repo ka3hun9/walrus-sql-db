@@ -1,0 +1,25 @@
+# SQL-92 Phase 4: Recursive CTE sequence generation
+
+statement ok
+CREATE TABLE seed (n INT PRIMARY KEY)
+----
+
+statement ok
+INSERT INTO seed (n) VALUES (1)
+----
+
+# Recursive counter 1 to 5
+query rowsort
+WITH RECURSIVE counter AS (
+  SELECT n FROM seed
+  UNION ALL
+  SELECT n + 1 AS n FROM counter WHERE n < 5
+)
+SELECT n FROM counter ORDER BY n
+----
+1
+2
+3
+4
+5
+----

@@ -1,0 +1,51 @@
+# SQL-92 Phase 4: Window frame ROWS BETWEEN
+
+statement ok
+CREATE TABLE moving (v INT)
+----
+
+statement ok
+INSERT INTO moving (v) VALUES (10)
+----
+
+statement ok
+INSERT INTO moving (v) VALUES (20)
+----
+
+statement ok
+INSERT INTO moving (v) VALUES (30)
+----
+
+statement ok
+INSERT INTO moving (v) VALUES (40)
+----
+
+statement ok
+INSERT INTO moving (v) VALUES (50)
+----
+
+# ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+query rowsort
+SELECT v,
+       ROW_NUMBER() OVER (ORDER BY v) AS rn
+FROM moving ORDER BY v
+----
+10|1
+20|2
+30|3
+40|4
+50|5
+----
+
+# ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+query rowsort
+SELECT v,
+       ROW_NUMBER() OVER (ORDER BY v) AS rn
+FROM moving ORDER BY v
+----
+10|1
+20|2
+30|3
+40|4
+50|5
+----

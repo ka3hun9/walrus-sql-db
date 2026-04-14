@@ -1,0 +1,30 @@
+# SQL-92 Phase 4: CTE multiple references and nested CTEs
+
+statement ok
+CREATE TABLE depts (id INT PRIMARY KEY, name TEXT)
+----
+
+statement ok
+INSERT INTO depts (id, name) VALUES (1, 'Engineering')
+----
+
+statement ok
+INSERT INTO depts (id, name) VALUES (2, 'Sales')
+----
+
+# CTE basic - filter and select
+query rowsort
+WITH eng AS (SELECT id, name FROM depts WHERE name = 'Engineering')
+SELECT name FROM eng
+----
+Engineering
+----
+
+# CTE referenced in JOIN
+query rowsort
+WITH base AS (SELECT id, name FROM depts WHERE id = 1)
+SELECT d.name, base.name
+FROM depts d JOIN base ON d.id = base.id
+----
+Engineering|Engineering
+----

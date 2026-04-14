@@ -1,0 +1,51 @@
+# SQL-92 Phase 4: Window function RANK/DENSE_RANK core
+
+statement ok
+CREATE TABLE sales (region TEXT, product TEXT, revenue INT)
+----
+
+statement ok
+INSERT INTO sales (region, product, revenue) VALUES ('East', 'A', 100)
+----
+
+statement ok
+INSERT INTO sales (region, product, revenue) VALUES ('East', 'B', 100)
+----
+
+statement ok
+INSERT INTO sales (region, product, revenue) VALUES ('East', 'C', 90)
+----
+
+statement ok
+INSERT INTO sales (region, product, revenue) VALUES ('West', 'A', 80)
+----
+
+statement ok
+INSERT INTO sales (region, product, revenue) VALUES ('West', 'B', 110)
+----
+
+# RANK with ties
+query rowsort
+SELECT region, product, revenue,
+       RANK() OVER (PARTITION BY region ORDER BY revenue DESC) AS rnk
+FROM sales ORDER BY region, rnk
+----
+East|B|100|1
+East|A|100|1
+East|C|90|3
+West|B|110|1
+West|A|80|2
+----
+
+# DENSE_RANK without gaps
+query rowsort
+SELECT region, product, revenue,
+       DENSE_RANK() OVER (PARTITION BY region ORDER BY revenue DESC) AS drnk
+FROM sales ORDER BY region, drnk
+----
+East|B|100|1
+East|A|100|1
+East|C|90|2
+West|B|110|1
+West|A|80|2
+----

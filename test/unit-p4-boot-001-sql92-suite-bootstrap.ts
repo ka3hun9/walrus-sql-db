@@ -46,10 +46,10 @@ try {
 
   const report = JSON.parse(readFileSync(tempReportPath, "utf8")) as SuiteReport;
   assert.equal(report.summary.suiteId, "p4-boot-001-sql92-minimal");
-  assert.equal(report.summary.entryCount, 2);
+  assert.equal(report.summary.entryCount, 6);
   assert.equal(report.summary.failedEntries, 0);
   assert.equal(report.summary.failedCases, 0);
-  assert.ok(report.summary.totalCases >= 6);
+  assert.ok(report.summary.totalCases >= 30);
   assert.equal(report.summary.passedCases, report.summary.totalCases);
 
   const byId = new Map(report.results.map((item) => [item.id, item]));
