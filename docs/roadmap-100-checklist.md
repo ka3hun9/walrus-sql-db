@@ -70,23 +70,23 @@
 - [x] P4-TEST-006 集成：PREPARE/EXECUTE 动态 SQL 参数绑定与错误码
 - [x] P4-TEST-007 集成：information_schema 元数据一致性回归
 - [x] P4-TEST-008 回归：新能力与既有 P1/P2/P3 语义兼容
-- [ ] P4-TEST-009 标准套件：SQL-92 核心一致性测试接入与报告归档（boot套件已就绪）
+- [x] P4-TEST-009 标准套件：SQL-92 核心一致性测试接入与报告归档
 
 ## P4-G. 基准与里程碑验收
 
-- [ ] P4-BENCH-001 窗口函数典型查询性能基线（吞吐/延迟/P95）
-- [ ] P4-BENCH-002 递归 CTE 层级增长压力测试（深度/宽度/资源占用）
-- [ ] P4-BENCH-003 动态 SQL 执行开销对照（prepare 命中收益）
-- [ ] P4-BENCH-004 information_schema 查询稳定性与开销报告
-- [ ] P4-MILE-001 窗口函数与高级聚合验收通过
-- [ ] P4-MILE-002 CTE / 递归 CTE 验收通过
-- [ ] P4-MILE-003 游标与动态 SQL 验收通过
-- [ ] P4-MILE-004 information_schema 验收通过
-- [ ] P4-MILE-005（可选）权限模型验收通过
-- [ ] P4-MILE-006 SQL-92 核心一致性测试通过（标准套件）
-- [ ] P4-MILE-007 功能覆盖率 ≥ 90%
-- [ ] P4-MILE-008 全测试管线绿灯（build/unit/integration/regression/bench）
-- [ ] P4-MILE-009 文档、示例、运维手册同步
+- [x] P4-BENCH-001 窗口函数典型查询性能基线（吞吐/延迟/P95）
+- [x] P4-BENCH-002 递归 CTE 层级增长压力测试（深度/宽度/资源占用）
+- [x] P4-BENCH-003 动态 SQL 执行开销对照（prepare 命中收益）
+- [x] P4-BENCH-004 information_schema 查询稳定性与开销报告
+- [x] P4-MILE-001 窗口函数与高级聚合验收通过
+- [x] P4-MILE-002 CTE / 递归 CTE 验收通过
+- [x] P4-MILE-003 游标与动态 SQL 验收通过
+- [x] P4-MILE-004 information_schema 验收通过
+- [x] P4-MILE-005（可选）权限模型验收通过
+- [x] P4-MILE-006 SQL-92 核心一致性测试通过（标准套件）
+- [x] P4-MILE-007 功能覆盖率 ≥ 90%（31/31 P4 功能已实现）
+- [x] P4-MILE-008 全测试管线绿灯（build/unit/integration/regression/bench）
+- [ ] P4-MILE-009 文档、示例、运维手册同步（窗口函数有文档，其他 P4 功能待完善）
 
 ---
 
