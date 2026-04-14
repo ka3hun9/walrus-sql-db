@@ -1054,8 +1054,10 @@ export type SessionTransactionState = "idle" | "active" | "committing" | "aborte
 
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "CURSOR" | "GRANT" | "REVOKE" | "UNKNOWN";
+  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
   affectedRows?: number;
+  /** For INSERT/UPDATE/DELETE with RETURNING clause */
+  returningRows?: SqlRow[];
   tableObjectId?: string;
   raw?: unknown;
   moveCall?: {
@@ -1351,7 +1353,7 @@ export interface WalrusSqlClientOptions {
   signerAddress?: string;
   authUsername?: string;  // for SQL-layer permission checks (simulator only)
   mode?: "simulator" | "onchain";
-  isolationLevel?: "read_committed";
+  isolationLevel?: "read_committed" | "serializable" | "repeatable_read";
   transactionTimeoutMs?: number;
   moduleName?: string;
   dialect?: "ansi" | "sqlite" | "postgres" | "mysql" | "sqlserver";

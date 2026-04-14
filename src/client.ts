@@ -43,6 +43,9 @@ import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import type {
   CreateIndexStatementAst,
+  CreateSchemaStatementAst,
+  CreateFunctionStatementAst,
+  CreateTriggerStatementAst,
   CreateViewStatementAst,
   DropIndexStatementAst,
   DropViewStatementAst,
@@ -51,6 +54,9 @@ import type {
   SqlAstStatement,
   SelectStatementAst,
   SqlTransactionAction,
+  SavepointStatementAst,
+  RollbackToSavepointStatementAst,
+  ReleaseSavepointStatementAst,
   WindowFrameAst,
 } from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
@@ -436,6 +442,12 @@ type TransactionWriteSet = {
   observedVersions: Map<string, Map<string, number>>;
 };
 
+type SavepointEntry = {
+  tables: Map<string, TransactionTableWriteSet>;
+  logEntries: TransactionLogWriteEntry[];
+  observedVersions: Map<string, Map<string, number>>;
+};
+
 type QueryCacheEntry = {
   rows: SqlRow[];
   cachedAt: number;
@@ -711,11 +723,17 @@ const SHARED_CTE_TABLES = new Set<string>();
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
-  private readonly isolationLevel: "read_committed";
+  private isolationLevel: "read_committed" | "serializable" | "repeatable_read";
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
   private readonly viewCatalog = new Map<string, ViewCatalogEntry>();
+  /** Schema namespace catalog: schemaName -> { owner, createdAt } */
+  private readonly schemaCatalog = new Map<string, { owner: string; createdAt: number }>();
+  /** Scalar function catalog: functionName -> { params, returnType, body } */
+  private readonly functionCatalog = new Map<string, { params: Array<{ name: string; typeName: string }>; returnType: string; body: string }>();
+  /** Trigger catalog: triggerName -> { name, tableName, timing, event, body } */
+  private readonly triggerCatalog = new Map<string, { name: string; tableName: string; timing: "BEFORE" | "AFTER"; event: "INSERT" | "UPDATE" | "DELETE"; body: string }>();
   private readonly cursorCatalog = new Map<string, {
     name: string;
     querySql: string;
@@ -746,6 +764,7 @@ export class WalrusSqlClient {
   private readonly logger: Logger;
   private transactionState: SessionTransactionState = "idle";
   private transactionWriteSet: TransactionWriteSet | null = null;
+  private readonly savepoints = new Map<string, SavepointEntry>();
   private transactionStartedAt: number | null = null;
   private currentTransactionLockWaitMs = 0;
   private readonly transactionObservability: TransactionObservabilityAccumulator = {
@@ -764,14 +783,14 @@ export class WalrusSqlClient {
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
     const isolation = String(opts.isolationLevel ?? "read_committed").toLowerCase();
-    if (isolation !== "read_committed") {
+    if (isolation !== "read_committed" && isolation !== "serializable" && isolation !== "repeatable_read") {
       throw sqlError(
         ClientErrorCodeEnum.TransactionState,
         `unsupported isolation level: ${String(opts.isolationLevel)}`,
         { clause: "TRANSACTION", token: String(opts.isolationLevel) },
       );
     }
-    this.isolationLevel = "read_committed";
+    this.isolationLevel = isolation as "read_committed" | "serializable" | "repeatable_read";
     this.currentUser = opts.authUsername ?? "current_user";
     this.logger = createLogger({
       level: opts.logging?.level ?? "error",
@@ -805,7 +824,7 @@ export class WalrusSqlClient {
     return this.transactionState;
   }
 
-  getIsolationLevel(): "read_committed" {
+  getIsolationLevel(): "read_committed" | "serializable" | "repeatable_read" {
     return this.isolationLevel;
   }
 
@@ -959,6 +978,253 @@ export class WalrusSqlClient {
     this.transactionWriteSet.logEntries.length = 0;
     this.transactionWriteSet.observedVersions.clear();
     this.transactionWriteSet = null;
+    this.savepoints.clear();
+  }
+
+  /** Take a snapshot of all table rows at BEGIN for SERIALIZABLE/REPEATABLE READ isolation */
+  private takeSnapshotAtBegin(): void {
+    if (!this.transactionWriteSet) return;
+    for (const [tableName, rows] of this.tables.entries()) {
+      let tableObserved = this.transactionWriteSet.observedVersions.get(tableName);
+      if (!tableObserved) {
+        tableObserved = new Map<string, number>();
+        this.transactionWriteSet.observedVersions.set(tableName, tableObserved);
+      }
+      for (const row of rows) {
+        const key = this.buildTransactionRowKey(tableName, row);
+        const encoded = this.encodeRowVersionKey(key);
+        tableObserved.set(encoded, this.getCommittedRowVersionByEncodedKey(tableName, encoded));
+      }
+    }
+  }
+
+  /** Clone a TransactionWriteSet for savepoint storage */
+  private cloneTransactionWriteSet(source: TransactionWriteSet): SavepointEntry {
+    const cloneTables = new Map<string, TransactionTableWriteSet>();
+    for (const [tableName, tableSet] of source.tables.entries()) {
+      // Deep clone uniqueIndexes: Map<string, Map<string, SqlRow>>
+      const clonedUniqueIndexes = new Map<string, Map<string, SqlRow>>();
+      for (const [colVal, rowMap] of tableSet.uniqueIndexes.entries()) {
+        clonedUniqueIndexes.set(colVal, new Map(rowMap));
+      }
+      cloneTables.set(tableName, {
+        rows: tableSet.rows.map((r) => ({ ...r })),
+        uniqueIndexes: clonedUniqueIndexes,
+        stats: { ...tableSet.stats },
+      });
+    }
+    const cloneLogEntries = source.logEntries.map((e) => ({
+      table: e.table,
+      op: e.op,
+      key: { ...e.key },
+      preImage: e.preImage ? { ...e.preImage } : null,
+      postImage: e.postImage ? { ...e.postImage } : null,
+    }));
+    const cloneObserved = new Map<string, Map<string, number>>();
+    for (const [table, observed] of source.observedVersions.entries()) {
+      cloneObserved.set(table, new Map(observed));
+    }
+    return {
+      tables: cloneTables,
+      logEntries: cloneLogEntries,
+      observedVersions: cloneObserved,
+    };
+  }
+
+  /** Restore transaction write set from a savepoint entry */
+  private restoreFromSavepoint(entry: SavepointEntry): void {
+    if (!this.transactionWriteSet) {
+      this.transactionWriteSet = this.createEmptyTransactionWriteSet();
+    }
+    // Clear current state
+    this.transactionWriteSet.tables.clear();
+    this.transactionWriteSet.logEntries.length = 0;
+    this.transactionWriteSet.observedVersions.clear();
+    // Restore from savepoint
+    for (const [tableName, tableSet] of entry.tables.entries()) {
+      // Deep clone uniqueIndexes
+      const clonedUniqueIndexes = new Map<string, Map<string, SqlRow>>();
+      for (const [colVal, rowMap] of tableSet.uniqueIndexes.entries()) {
+        clonedUniqueIndexes.set(colVal, new Map(rowMap));
+      }
+      this.transactionWriteSet.tables.set(tableName, {
+        rows: tableSet.rows.map((r) => ({ ...r })),
+        uniqueIndexes: clonedUniqueIndexes,
+        stats: { ...tableSet.stats },
+      });
+    }
+    for (const e of entry.logEntries) {
+      this.transactionWriteSet.logEntries.push({
+        table: e.table,
+        op: e.op,
+        key: { ...e.key },
+        preImage: e.preImage ? { ...e.preImage } : null,
+        postImage: e.postImage ? { ...e.postImage } : null,
+      });
+    }
+    for (const [table, observed] of entry.observedVersions.entries()) {
+      this.transactionWriteSet.observedVersions.set(table, new Map(observed));
+    }
+  }
+
+  /** Execute SAVEPOINT name */
+  private executeSavepoint(name: string): void {
+    if (this.transactionState !== "active") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `SAVEPOINT must be executed within an active transaction`,
+        { clause: "SAVEPOINT", token: name },
+      );
+    }
+    if (!this.transactionWriteSet) {
+      this.transactionWriteSet = this.createEmptyTransactionWriteSet();
+    }
+    if (this.savepoints.has(name)) {
+      // Overwrite existing savepoint with same name
+      this.savepoints.delete(name);
+    }
+    this.savepoints.set(name, this.cloneTransactionWriteSet(this.transactionWriteSet));
+  }
+
+  /** Execute ROLLBACK TO SAVEPOINT name */
+  private executeRollbackToSavepoint(name: string): void {
+    if (this.transactionState !== "active") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `ROLLBACK TO SAVEPOINT must be executed within an active transaction`,
+        { clause: "ROLLBACK", token: `TO SAVEPOINT ${name}` },
+      );
+    }
+    const entry = this.savepoints.get(name);
+    if (!entry) {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `savepoint "${name}" does not exist`,
+        { clause: "ROLLBACK", token: `TO SAVEPOINT ${name}` },
+      );
+    }
+    this.restoreFromSavepoint(entry);
+  }
+
+  /** Execute RELEASE SAVEPOINT name */
+  private executeReleaseSavepoint(name: string): void {
+    if (this.transactionState !== "active") {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `RELEASE SAVEPOINT must be executed within an active transaction`,
+        { clause: "RELEASE SAVEPOINT", token: name },
+      );
+    }
+    if (!this.savepoints.has(name)) {
+      throw sqlError(
+        ClientErrorCodeEnum.TransactionState,
+        `savepoint "${name}" does not exist`,
+        { clause: "RELEASE SAVEPOINT", token: name },
+      );
+    }
+    this.savepoints.delete(name);
+  }
+
+  /** Fire BEFORE triggers for a table event, returning potentially modified row */
+  private fireBeforeTriggers(table: string, event: "INSERT" | "UPDATE" | "DELETE", row: SqlRow, beforeImage?: SqlRow | null): SqlRow {
+    let modifiedRow = { ...row };
+    for (const [, trigger] of this.triggerCatalog.entries()) {
+      if (trigger.tableName.toLowerCase() !== table.toLowerCase()) continue;
+      if (trigger.timing !== "BEFORE") continue;
+      if (trigger.event !== event) continue;
+      // Evaluate trigger body as a predicate/constraint
+      // The body is a SQL expression like 'NEW.salary > 0' or 'NEW.active = TRUE'
+      const triggerBody = trigger.body;
+      // Substitute NEW./OLD. prefixes for row references
+      const substitutedBody = triggerBody
+        .replace(/\bNEW\./gi, "")
+        .replace(/\bOLD\./gi, "");
+      try {
+        const result = this.evaluateScalarExpression(substitutedBody, modifiedRow);
+        if (result === false) {
+          throw constraintError(
+            ConstraintViolationKindEnum.Check,
+            `BEFORE ${event} trigger "${trigger.name}" constraint violated: ${trigger.body}`,
+            { clause: "TRIGGER", token: trigger.name },
+          );
+        }
+      } catch (err) {
+        if (err instanceof SqlEngineError) throw err;
+        // If the expression fails to evaluate, treat as constraint violation
+        throw constraintError(
+          ConstraintViolationKindEnum.Check,
+          `BEFORE ${event} trigger "${trigger.name}" evaluation failed: ${trigger.body}`,
+          { clause: "TRIGGER", token: trigger.name },
+        );
+      }
+    }
+    return modifiedRow;
+  }
+
+  /** Fire AFTER triggers for a table event */
+  private fireAfterTriggers(table: string, event: "INSERT" | "UPDATE" | "DELETE", row: SqlRow): void {
+    for (const [, trigger] of this.triggerCatalog.entries()) {
+      if (trigger.tableName.toLowerCase() !== table.toLowerCase()) continue;
+      if (trigger.timing !== "AFTER") continue;
+      if (trigger.event !== event) continue;
+      // AFTER triggers can log or perform additional actions
+      // For now, just validate that the trigger body doesn't throw
+      const triggerBody = trigger.body;
+      const substitutedBody = triggerBody
+        .replace(/\bNEW\./gi, "")
+        .replace(/\bOLD\./gi, "");
+      try {
+        this.evaluateScalarExpression(substitutedBody, row);
+      } catch {
+        // AFTER trigger failures are logged but don't abort the operation
+        this.logger.warn(`AFTER ${event} trigger "${trigger.name}" failed: ${trigger.body}`);
+      }
+    }
+  }
+
+  /** Evaluate a scalar expression (e.g., 'x + 1', 'salary * 2') against a row */
+  private evaluateScalarExpression(expr: string, row: SqlRow): SqlPrimitive | boolean | null {
+    // Try to evaluate the expression as a WHERE-like predicate first
+    try {
+      const whereTree = this.parseWhereTree(expr);
+      const result = this.evaluateWhereTree(row, whereTree);
+      return result === "TRUE";
+    } catch {
+      // Not a boolean expression, try as a simple value expression
+      // Handle column references directly
+      const colMatch = expr.trim().match(/^[a-zA-Z_][a-zA-Z0-9_]*$/);
+      if (colMatch) {
+        const colName = colMatch[0]!;
+        if (colName.toUpperCase() in row) {
+          return row[colName.toUpperCase()];
+        }
+        if (colName.toLowerCase() in row) {
+          return row[colName.toLowerCase()];
+        }
+      }
+      // Try arithmetic: column +/-/* value
+      const arithMatch = expr.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*([+\-*/])\s*([0-9.]+)$/i);
+      if (arithMatch) {
+        const [, col, op, valStr] = arithMatch;
+        const colVal = row[col!.toUpperCase()] as number | undefined;
+        const numVal = parseFloat(valStr!);
+        if (colVal === null || colVal === undefined) return null;
+        switch (op) {
+          case "+": return colVal + numVal;
+          case "-": return colVal - numVal;
+          case "*": return colVal * numVal;
+          case "/": return numVal !== 0 ? colVal / numVal : null;
+        }
+      }
+      // Try literal
+      try {
+        const parsed = this.parseDefaultLiteral(`DEFAULT ${expr.trim()}`, `func.body:${expr}`);
+        if (parsed.typedValue) return parsed.typedValue.value;
+      } catch {
+        // Fall through
+      }
+      return null;
+    }
   }
 
   private getWalFilePath(): string | null {
@@ -2523,6 +2789,10 @@ export class WalrusSqlClient {
       this.currentTransactionLockWaitMs = 0;
       this.transactionObservability.started += 1;
       if (this.isSimulatorMode()) this.transactionWriteSet = this.createEmptyTransactionWriteSet();
+      // For SERIALIZABLE and REPEATABLE READ, take a snapshot of all rows at BEGIN
+      if (this.isolationLevel === "serializable" || this.isolationLevel === "repeatable_read") {
+        this.takeSnapshotAtBegin();
+      }
       return {
         txDigest: this.fakeDigest(sql),
         statementType: "BEGIN",
@@ -2599,6 +2869,21 @@ export class WalrusSqlClient {
           transactionState: this.transactionState,
         });
         return result;
+      }
+
+      // Handle savepoint statements
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind === "savepoint") {
+        this.executeSavepoint(ast.name);
+        return { txDigest: this.fakeDigest(normalized), statementType: "SAVEPOINT", affectedRows: 0 };
+      }
+      if (ast.kind === "rollback_to_savepoint") {
+        this.executeRollbackToSavepoint(ast.name);
+        return { txDigest: this.fakeDigest(normalized), statementType: "ROLLBACK", affectedRows: 0 };
+      }
+      if (ast.kind === "release_savepoint") {
+        this.executeReleaseSavepoint(ast.name);
+        return { txDigest: this.fakeDigest(normalized), statementType: "RELEASE", affectedRows: 0 };
       }
 
       this.enterSubqueryRuntimeScope();
@@ -3264,6 +3549,85 @@ export class WalrusSqlClient {
     const normalized = sql.trim().replace(/\s+/g, " ");
     const upper = normalized.toUpperCase();
 
+    // SET TRANSACTION ISOLATION LEVEL
+    const setTxnMatch = upper.match(/^SET\s+TRANSACTION\s+ISOLATION\s+LEVEL\s+(SERIALIZABLE|REPEATABLE\s+READ|READ\s+COMMITTED)$/i);
+    if (setTxnMatch) {
+      const level = setTxnMatch[1]!.toUpperCase().replace(/\s+/g, "_") as "SERIALIZABLE" | "REPEATABLE_READ" | "READ_COMMITTED";
+      const levelMap: Record<string, "serializable" | "repeatable_read" | "read_committed"> = {
+        SERIALIZABLE: "serializable",
+        REPEATABLE_READ: "repeatable_read",
+        READ_COMMITTED: "read_committed",
+      };
+      this.isolationLevel = levelMap[level];
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "SET",
+        affectedRows: 0,
+      };
+    }
+
+    // CREATE SCHEMA
+    const schemaAst = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+    if (schemaAst.kind === "create_schema") {
+      const schemaName = schemaAst.schemaName;
+      if (this.schemaCatalog.has(schemaName.toLowerCase())) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `schema "${schemaName}" already exists`);
+      }
+      if (this.tables.has(schemaName) || this.schemas.has(schemaName)) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `name "${schemaName}" conflicts with existing table`);
+      }
+      this.schemaCatalog.set(schemaName.toLowerCase(), {
+        owner: this.currentUser,
+        createdAt: Date.now(),
+      });
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    // CREATE FUNCTION
+    if (schemaAst.kind === "create_function") {
+      const fn = schemaAst.functionName;
+      if (this.functionCatalog.has(fn.toLowerCase())) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `function "${fn}" already exists`);
+      }
+      this.functionCatalog.set(fn.toLowerCase(), {
+        params: schemaAst.spec.params,
+        returnType: schemaAst.spec.returnType,
+        body: schemaAst.spec.body,
+      });
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    // CREATE TRIGGER
+    if (schemaAst.kind === "create_trigger") {
+      const trig = schemaAst.spec;
+      if (this.triggerCatalog.has(trig.name.toLowerCase())) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `trigger "${trig.name}" already exists`);
+      }
+      if (!this.tables.has(trig.tableName) && !this.schemas.has(trig.tableName)) {
+        throw sqlError("ERR_TABLE_NOT_FOUND", trig.tableName);
+      }
+      this.triggerCatalog.set(trig.name.toLowerCase(), {
+        name: trig.name,
+        tableName: trig.tableName,
+        timing: trig.timing,
+        event: trig.event,
+        body: trig.body,
+      });
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
     if (upper.startsWith("CREATE TABLE")) {
       const schema = this.parseCreateTableSchema(normalized);
       if (this.viewCatalog.has(this.normalizeViewName(schema.name))) {
@@ -3432,7 +3796,9 @@ export class WalrusSqlClient {
       this.assertTablePrivilege(table, "INSERT");
       const bucket = this.requireWritableTableForDml(table);
       const parsedInsert = this.parseInsert(normalized);
-      const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
+      let coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
+      // Fire BEFORE INSERT triggers
+      coerced = this.fireBeforeTriggers(table, "INSERT", coerced);
       this.evaluateCheckConstraints(table, coerced);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
@@ -3447,6 +3813,20 @@ export class WalrusSqlClient {
         this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
         this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
         this.invalidateReadCacheOnWrite();
+      }
+      // Fire AFTER INSERT triggers
+      this.fireAfterTriggers(table, "INSERT", coerced);
+      // Handle RETURNING clause
+      const returningCols = this.parseReturningClause(normalized);
+      const schema = this.schemas.get(table);
+      if (returningCols && schema) {
+        const returningRows = [this.applyReturningProjection(coerced, returningCols, schema)];
+        return {
+          txDigest: this.fakeDigest(normalized),
+          statementType: "INSERT",
+          affectedRows: 1,
+          returningRows,
+        };
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -3517,6 +3897,8 @@ export class WalrusSqlClient {
       const whereTree = this.parseWhereTree(plan.whereExpr);
       const targetSetField = this.resolveUpdateSetField(plan);
       const updateCounts = new Map<string, number>();
+      const returningCols = this.parseReturningClause(normalized);
+      const returningRows: SqlRow[] = [];
       for (const row of bucket) {
         const mergedHits = joinedRows.get(row);
         if (!mergedHits || mergedHits.length === 0) continue;
@@ -3543,13 +3925,24 @@ export class WalrusSqlClient {
           boundSetValue ? { [targetSetField]: boundSetValue } : {},
         );
         const beforeImage = { ...row };
-        this.assertOnUpdateActionAllowed(plan.table, beforeImage, next);
-        this.commitRowUpdate(plan.table, row, next);
+        // Fire BEFORE UPDATE trigger
+        const triggeredNext = this.fireBeforeTriggers(plan.table, "UPDATE", next, beforeImage);
+        this.assertOnUpdateActionAllowed(plan.table, beforeImage, triggeredNext);
+        this.commitRowUpdate(plan.table, row, triggeredNext);
         updateCounts.set(plan.table, (updateCounts.get(plan.table) ?? 0) + 1);
+
+        // Fire AFTER UPDATE trigger
+        this.fireAfterTriggers(plan.table, "UPDATE", triggeredNext);
 
         const cascaded = this.applyOnUpdateCascade(plan.table, beforeImage, row);
         for (const [table, count] of cascaded.entries()) {
           updateCounts.set(table, (updateCounts.get(table) ?? 0) + count);
+        }
+
+        // Collect returning rows
+        if (returningCols) {
+          const schema = this.schemas.get(plan.table);
+          if (schema) returningRows.push(this.applyReturningProjection(triggeredNext, returningCols, schema));
         }
       }
       const touched = [...updateCounts.values()].reduce((sum, count) => sum + count, 0);
@@ -3564,6 +3957,14 @@ export class WalrusSqlClient {
           if (count > 0) this.recordStorageWrite(table, "UPDATE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
+      }
+      if (returningCols) {
+        return {
+          txDigest: this.fakeDigest(normalized),
+          statementType: "UPDATE",
+          affectedRows: touched,
+          returningRows,
+        };
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -3640,9 +4041,29 @@ export class WalrusSqlClient {
         if (matched) matchedRows.push(row);
       }
 
+      // Fire BEFORE DELETE triggers (for each matched row)
+      for (const row of matchedRows) {
+        this.fireBeforeTriggers(plan.table, "DELETE", row);
+      }
+
+      // Handle RETURNING: collect rows before deletion
+      const returningCols = this.parseReturningClause(normalized);
+      const schema = returningCols ? this.schemas.get(plan.table) : undefined;
+      const returningRows: SqlRow[] = [];
+      if (returningCols && schema) {
+        for (const row of matchedRows) {
+          returningRows.push(this.applyReturningProjection(row, returningCols, schema));
+        }
+      }
+
       const deleteTargets = this.collectDeleteTargetsWithCascade(plan.table, matchedRows);
       const deleteCounts = this.applyDeleteTargets(deleteTargets);
       const touched = [...deleteCounts.values()].reduce((sum, count) => sum + count, 0);
+
+      // Fire AFTER DELETE triggers
+      for (const row of matchedRows) {
+        this.fireAfterTriggers(plan.table, "DELETE", row);
+      }
 
       if (this.isDmlWriteStagingActive()) {
         for (const [table, count] of deleteCounts.entries()) {
@@ -3655,6 +4076,14 @@ export class WalrusSqlClient {
           if (count > 0) this.recordStorageWrite(table, "DELETE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
+      }
+      if (returningCols) {
+        return {
+          txDigest: this.fakeDigest(normalized),
+          statementType: "DELETE",
+          affectedRows: touched,
+          returningRows,
+        };
       }
       return {
         txDigest: this.fakeDigest(normalized),
@@ -6087,7 +6516,7 @@ export class WalrusSqlClient {
 
   private createReadCommittedView(): ReadCommittedView {
     return {
-      isolationLevel: this.isolationLevel,
+      isolationLevel: this.isolationLevel as "read_committed",
       getTableRows: (name: string) => {
         const staged = this.getStagedTableWriteSet(name);
         if (staged) return staged.rows;
@@ -8724,6 +9153,31 @@ export class WalrusSqlClient {
     this.removeRowFromUniqueIndexes(table, previous);
     this.addRowToUniqueIndexes(table, next);
     this.bumpConstraintCost(table, { updateOps: 1 });
+  }
+
+  /**
+   * Parse RETURNING clause from DML SQL.
+   * Returns null if no RETURNING clause.
+   * Returns ["*"] if RETURNING * (all columns).
+   * Returns array of column names otherwise.
+   */
+  private parseReturningClause(sql: string): string[] | null {
+    const match = sql.match(/\bRETURNING\s+(.+)$/i);
+    if (!match) return null;
+    const cols = match[1]!.trim();
+    if (cols === "*") return ["*"];
+    return this.splitTopLevelComma(cols).map((c) => c.trim());
+  }
+
+  /** Apply RETURNING projection to a row */
+  private applyReturningProjection(row: SqlRow, columns: string[] | null, schema: TableSchema): SqlRow {
+    if (!columns) return {};
+    if (columns.includes("*")) return { ...row };
+    const projected: SqlRow = {};
+    for (const col of columns) {
+      if (col in row) projected[col] = row[col];
+    }
+    return projected;
   }
 
   private parseInsert(sql: string): { row: SqlRow; bindings: BoundColumnValues } {

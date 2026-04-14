@@ -9,6 +9,12 @@ export type SqlAstStatement =
   | IntersectStatementAst
   | ExceptStatementAst
   | TransactionStatementAst
+  | SavepointStatementAst
+  | RollbackToSavepointStatementAst
+  | ReleaseSavepointStatementAst
+  | CreateSchemaStatementAst
+  | CreateFunctionStatementAst
+  | CreateTriggerStatementAst
   | CreateIndexStatementAst
   | DropIndexStatementAst
   | CreateViewStatementAst
@@ -48,6 +54,58 @@ export type TransactionStatementAst = {
   kind: "transaction";
   action: SqlTransactionAction;
   nestedTransactionPolicy: SqlNestedTransactionPolicy;
+  rawSql: string;
+};
+
+export type SavepointStatementAst = {
+  kind: "savepoint";
+  name: string;
+  rawSql: string;
+};
+
+export type RollbackToSavepointStatementAst = {
+  kind: "rollback_to_savepoint";
+  name: string;
+  rawSql: string;
+};
+
+export type ReleaseSavepointStatementAst = {
+  kind: "release_savepoint";
+  name: string;
+  rawSql: string;
+};
+
+export type CreateSchemaStatementAst = {
+  kind: "create_schema";
+  schemaName: string;
+  rawSql: string;
+};
+
+export type ScalarFunctionSpec = {
+  name: string;
+  params: Array<{ name: string; typeName: string }>;
+  returnType: string;
+  body: string; // simple expression body
+};
+
+export type CreateFunctionStatementAst = {
+  kind: "create_function";
+  functionName: string;
+  spec: ScalarFunctionSpec;
+  rawSql: string;
+};
+
+export type TriggerSpec = {
+  name: string;
+  tableName: string;
+  timing: "BEFORE" | "AFTER";
+  event: "INSERT" | "UPDATE" | "DELETE";
+  body: string; // SQL statement(s) to execute
+};
+
+export type CreateTriggerStatementAst = {
+  kind: "create_trigger";
+  spec: TriggerSpec;
   rawSql: string;
 };
 

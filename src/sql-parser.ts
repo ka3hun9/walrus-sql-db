@@ -2,6 +2,9 @@ import { createSqlError } from "./sql-errors.js";
 import { inspectSqlGrammarSkeleton, type SqlDialectProfile, type SqlGrammarSkeleton } from "./sql-grammar-skeleton.js";
 import type {
   CreateIndexStatementAst,
+  CreateSchemaStatementAst,
+  CreateFunctionStatementAst,
+  CreateTriggerStatementAst,
   CreateViewStatementAst,
   DropIndexStatementAst,
   DropViewStatementAst,
@@ -12,6 +15,9 @@ import type {
   SelectStatementAst,
   SqlAstStatement,
   TransactionStatementAst,
+  SavepointStatementAst,
+  RollbackToSavepointStatementAst,
+  ReleaseSavepointStatementAst,
   TableRefAst,
   WindowFunctionAst,
   WindowFrameAst,
@@ -933,6 +939,130 @@ function parseTransactionStatement(base: string, rawSql: string): TransactionSta
   });
 }
 
+/**
+ * Parses SAVEPOINT, ROLLBACK TO SAVEPOINT, and RELEASE SAVEPOINT statements.
+ * Returns one of three AST types or null if the SQL doesn't match.
+ */
+function parseSavepointStatement(base: string, rawSql: string): SavepointStatementAst | RollbackToSavepointStatementAst | ReleaseSavepointStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!normalized) return null;
+
+  // SAVEPOINT name
+  const savepointMatch = normalized.match(/^SAVEPOINT\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (savepointMatch) {
+    return {
+      kind: "savepoint",
+      name: savepointMatch[1]!,
+      rawSql,
+    };
+  }
+
+  // ROLLBACK TO SAVEPOINT name (also accepts ROLLBACK WORK TO SAVEPOINT name)
+  const rollbackToMatch = normalized.match(/^ROLLBACK(?:\s+WORK)?\s+TO\s+SAVEPOINT\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (rollbackToMatch) {
+    return {
+      kind: "rollback_to_savepoint",
+      name: rollbackToMatch[1]!,
+      rawSql,
+    };
+  }
+
+  // RELEASE SAVEPOINT name (also accepts RELEASE WORK SAVEPOINT name)
+  const releaseMatch = normalized.match(/^RELEASE(?:\s+WORK)?\s+SAVEPOINT\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (releaseMatch) {
+    return {
+      kind: "release_savepoint",
+      name: releaseMatch[1]!,
+      rawSql,
+    };
+  }
+
+  return null;
+}
+
+function parseCreateSchemaStatement(base: string, rawSql: string): CreateSchemaStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!normalized) return null;
+
+  // CREATE SCHEMA schema_name
+  const match = normalized.match(/^CREATE\s+SCHEMA\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (match) {
+    return {
+      kind: "create_schema",
+      schemaName: match[1]!,
+      rawSql,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Parse CREATE FUNCTION statement.
+ * Syntax: CREATE FUNCTION name(param1 type1, ...) RETURNS type AS expression
+ * Example: CREATE FUNCTION add_one(x INT) RETURNS INT AS 'x + 1'
+ */
+function parseCreateFunctionStatement(base: string, rawSql: string): CreateFunctionStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!normalized) return null;
+
+  // CREATE FUNCTION func_name(params) RETURNS type AS 'body'
+  const match = normalized.match(
+    /^CREATE\s+FUNCTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)\s+RETURNS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+'([^']+)'$/i,
+  );
+  if (match) {
+    const paramStr = match[2]!.trim();
+    const params = paramStr
+      ? paramStr.split(",").map((p) => {
+          const [name, typeName] = p.trim().split(/\s+/);
+          return { name: name!.trim(), typeName: (typeName ?? "INT").trim() };
+        })
+      : [];
+    return {
+      kind: "create_function",
+      functionName: match[1]!,
+      spec: {
+        name: match[1]!,
+        params,
+        returnType: match[3]!,
+        body: match[4]!,
+      },
+      rawSql,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Parse CREATE TRIGGER statement.
+ * Syntax: CREATE TRIGGER name ON table [BEFORE|AFTER] [INSERT|UPDATE|DELETE] AS body
+ * Example: CREATE TRIGGER check_sal ON employees AFTER INSERT AS 'NEW.salary > 0'
+ */
+function parseCreateTriggerStatement(base: string, rawSql: string): CreateTriggerStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!normalized) return null;
+
+  const match = normalized.match(
+    /^CREATE\s+TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)\s+AS\s+'([^']+)'$/i,
+  );
+  if (match) {
+    return {
+      kind: "create_trigger",
+      spec: {
+        name: match[1]!,
+        tableName: match[2]!,
+        timing: match[3]!.toUpperCase() as "BEFORE" | "AFTER",
+        event: match[4]!.toUpperCase() as "INSERT" | "UPDATE" | "DELETE",
+        body: match[5]!,
+      },
+      rawSql,
+    };
+  }
+
+  return null;
+}
+
 function parseCreateIndexStatement(base: string, rawSql: string): CreateIndexStatementAst | null {
   const normalized = base.replace(/;\s*$/, "").trim();
   if (!/^CREATE\s+/i.test(normalized)) return null;
@@ -1163,6 +1293,18 @@ export function parseSqlToAst(
   const transaction = parseTransactionStatement(base, sql);
   if (transaction) return transaction;
 
+  const savepoint = parseSavepointStatement(base, sql);
+  if (savepoint) return savepoint;
+
+  const createSchema = parseCreateSchemaStatement(base, sql);
+  if (createSchema) return createSchema;
+
+  const createFunction = parseCreateFunctionStatement(base, sql);
+  if (createFunction) return createFunction;
+
+  const createTrigger = parseCreateTriggerStatement(base, sql);
+  if (createTrigger) return createTrigger;
+
   const createIndex = parseCreateIndexStatement(base, sql);
   if (createIndex) return createIndex;
 
@@ -1179,7 +1321,7 @@ export function parseSqlToAst(
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
       message:
-        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW statements are currently accepted by parser baseline",
+        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/SAVEPOINT/ROLLBACK TO SAVEPOINT/RELEASE SAVEPOINT/CREATE SCHEMA/CREATE FUNCTION/CREATE TRIGGER/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }
