@@ -448,7 +448,7 @@ type BtreeIndexLeafEntry = {
 };
 
 type BtreeRuntimeIndex = {
-  column: string;
+  columns: string[];
   entries: BtreeIndexLeafEntry[];
 };
 
@@ -2035,7 +2035,7 @@ export class WalrusSqlClient {
         this.rebuildSecondaryIndexesForTable(table);
         return;
       }
-      if (latest.indexType !== entry.type || latest.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) {
+      if (latest.indexType !== entry.type || entry.columns.length !== 1 || latest.column.toUpperCase() !== entry.columns[0]!.toUpperCase()) {
         this.rebuildSecondaryIndexesForTable(table);
         return;
       }
@@ -2078,7 +2078,7 @@ export class WalrusSqlClient {
 
       if (entries.length > 0) {
         restoredBtreeIndexes.set(indexName, {
-          column: latest.column,
+          columns: entry.columns,
           entries: entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC")),
         });
       }
@@ -7301,14 +7301,24 @@ export class WalrusSqlClient {
 
     for (const entry of this.getActiveIndexEntriesForTable(table)) {
       const indexName = this.normalizeIndexName(entry.name);
-      const column = entry.columns[0]!;
-      const value = this.resolveRowValue(row, column);
-      if (value === null || value === undefined) continue;
+
+      // Build composite key from all index columns
+      const keyParts: string[] = [];
+      let hasNull = false;
+      for (const col of entry.columns) {
+        const value = this.resolveRowValue(row, col);
+        if (value === null || value === undefined) {
+          hasNull = true;
+          break;
+        }
+        keyParts.push(this.encodeTypedKey(value as SqlPrimitive, `index.key:${table}.${indexName}.${col}`));
+      }
+      if (hasNull) continue;
+      const encodedKey = keyParts.join("||");
 
       if (entry.type === "HASH") {
         const tableIndexes = this.hashIndexes.get(table) ?? new Map<string, Map<string, Set<SqlRow>>>();
         const buckets = tableIndexes.get(indexName) ?? new Map<string, Set<SqlRow>>();
-        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.insert:${table}.${indexName}.${column}`);
         const bucketRows = buckets.get(encodedKey) ?? new Set<SqlRow>();
         if (!this.findRowReferenceInSetByKey(table, bucketRows, row)) {
           bucketRows.add(row);
@@ -7320,17 +7330,53 @@ export class WalrusSqlClient {
         continue;
       }
 
+      // BTREE index
       const tableIndexes = this.btreeIndexes.get(table) ?? new Map<string, BtreeRuntimeIndex>();
-      const runtime = tableIndexes.get(indexName) ?? { column, entries: [] };
-      let leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
-      if (!leaf) {
-        leaf = { key: value, rows: new Set<SqlRow>() };
-        runtime.entries.push(leaf);
-        runtime.entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
-      }
-      if (!this.findRowReferenceInSetByKey(table, leaf.rows, row)) {
-        leaf.rows.add(row);
-        changed = true;
+      const runtime = tableIndexes.get(indexName) ?? { columns: entry.columns, entries: [] };
+
+      if (entry.columns.length === 1) {
+        // Single-column: use simple path
+        const value = this.resolveRowValue(row, entry.columns[0]!);
+        if (value !== null && value !== undefined) {
+          let leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+          if (!leaf) {
+            leaf = { key: value, rows: new Set<SqlRow>() };
+            runtime.entries.push(leaf);
+            runtime.entries.sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+          }
+          if (!this.findRowReferenceInSetByKey(table, leaf.rows, row)) {
+            leaf.rows.add(row);
+            changed = true;
+          }
+        }
+      } else {
+        // Multi-column: use composite key
+        const compositeKeyObj = keyParts.map((k, i) => ({ key: this.decodeTypedKey(k, entry.columns[i]!), idx: i }));
+        let leaf = runtime.entries.find((entryLeaf) => {
+          const leafKey = entryLeaf.key as unknown as { key: SqlPrimitive; idx: number }[];
+          if (!leafKey || leafKey.length !== compositeKeyObj.length) return false;
+          for (let i = 0; i < leafKey.length; i++) {
+            if (this.compareForOrder(leafKey[i].key, compositeKeyObj[i].key, "ASC") !== 0) return false;
+          }
+          return true;
+        });
+        if (!leaf) {
+          leaf = { key: compositeKeyObj as unknown as SqlPrimitive, rows: new Set<SqlRow>() };
+          runtime.entries.push(leaf);
+          runtime.entries.sort((a, b) => {
+            const aKey = a.key as unknown as { key: SqlPrimitive; idx: number }[];
+            const bKey = b.key as unknown as { key: SqlPrimitive; idx: number }[];
+            for (let i = 0; i < aKey.length && i < bKey.length; i++) {
+              const cmp = this.compareForOrder(aKey[i].key, bKey[i].key, "ASC");
+              if (cmp !== 0) return cmp;
+            }
+            return 0;
+          });
+        }
+        if (!this.findRowReferenceInSetByKey(table, leaf.rows, row)) {
+          leaf.rows.add(row);
+          changed = true;
+        }
       }
       tableIndexes.set(indexName, runtime);
       this.btreeIndexes.set(table, tableIndexes);
@@ -7346,12 +7392,22 @@ export class WalrusSqlClient {
     if (hashIndexesForTable) {
       for (const [indexName, buckets] of [...hashIndexesForTable.entries()]) {
         const entry = this.indexCatalog.get(indexName);
-        if (!entry || entry.type !== "HASH" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+        if (!entry || entry.type !== "HASH" || entry.status !== "ACTIVE") continue;
 
-        const column = entry.columns[0]!;
-        const value = this.resolveRowValue(row, column);
-        if (value === null || value === undefined) continue;
-        const encodedKey = this.encodeTypedKey(value, `hash.index.dml.delete:${table}.${indexName}.${column}`);
+        // Build composite key
+        const keyParts: string[] = [];
+        let hasNull = false;
+        for (const col of entry.columns) {
+          const value = this.resolveRowValue(row, col);
+          if (value === null || value === undefined) {
+            hasNull = true;
+            break;
+          }
+          keyParts.push(this.encodeTypedKey(value as SqlPrimitive, `hash.index.dml.delete:${table}.${indexName}.${col}`));
+        }
+        if (hasNull) continue;
+        const encodedKey = keyParts.join("||");
+
         const bucketRows = buckets.get(encodedKey);
         if (!bucketRows) continue;
 
@@ -7370,20 +7426,46 @@ export class WalrusSqlClient {
     if (btreeIndexesForTable) {
       for (const [indexName, runtime] of [...btreeIndexesForTable.entries()]) {
         const entry = this.indexCatalog.get(indexName);
-        if (!entry || entry.type !== "BTREE" || entry.status !== "ACTIVE" || entry.columns.length !== 1) continue;
+        if (!entry || entry.type !== "BTREE" || entry.status !== "ACTIVE") continue;
 
-        const column = runtime.column;
-        const value = this.resolveRowValue(row, column);
-        if (value === null || value === undefined) continue;
-
-        const leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+        let leaf: BtreeIndexLeafEntry | undefined;
+        if (entry.columns.length === 1) {
+          // Single-column: simple lookup
+          const value = this.resolveRowValue(row, entry.columns[0]!);
+          if (value !== null && value !== undefined) {
+            leaf = runtime.entries.find((entryLeaf) => this.compareBtreeKey(entryLeaf.key, value) === 0);
+          }
+        } else {
+          // Multi-column: find by composite key
+          const keyParts: string[] = [];
+          let hasNull = false;
+          for (const col of entry.columns) {
+            const value = this.resolveRowValue(row, col);
+            if (value === null || value === undefined) {
+              hasNull = true;
+              break;
+            }
+            keyParts.push(this.encodeTypedKey(value as SqlPrimitive, `btree.index.dml.delete:${table}.${indexName}.${col}`));
+          }
+          if (!hasNull) {
+            leaf = runtime.entries.find((entryLeaf) => {
+              const leafKey = entryLeaf.key as unknown as { key: SqlPrimitive; idx: number }[];
+              if (!leafKey || leafKey.length !== keyParts.length) return false;
+              for (let i = 0; i < leafKey.length; i++) {
+                const decodedLeaf = this.decodeTypedKey(keyParts[i], entry.columns[i]!);
+                if (this.compareForOrder(leafKey[i].key, decodedLeaf, "ASC") !== 0) return false;
+              }
+              return true;
+            });
+          }
+        }
         if (!leaf) continue;
         const existing = this.findRowReferenceInSetByKey(table, leaf.rows, row);
         if (!existing) continue;
 
         leaf.rows.delete(existing);
         changed = true;
-        if (leaf.rows.size === 0) runtime.entries = runtime.entries.filter((entryLeaf) => entryLeaf !== leaf);
+        if (leaf.rows.size === 0) runtime.entries = runtime.entries.filter((entryLeaf) => entryLeaf !== leaf!);
         if (runtime.entries.length === 0) btreeIndexesForTable.delete(indexName);
       }
 
@@ -7914,20 +7996,18 @@ export class WalrusSqlClient {
       throw sqlError("ERR_UNSUPPORTED_DDL", `index already exists: ${ast.indexName}`);
     }
 
-    if (ast.columns.length !== 1) {
-      throw sqlError("ERR_UNSUPPORTED_DDL", "CREATE INDEX execution currently supports single-column BTREE indexes only");
-    }
-
-    const requestedColumn = ast.columns[0]!.trim();
-    const schemaColumn = schema.columns.find((column) => column.name.toUpperCase() === requestedColumn.toUpperCase());
-    if (!schemaColumn) {
-      throw sqlError("ERR_UNSUPPORTED_DDL", `index column not found on table ${table}: ${requestedColumn}`);
+    for (const col of ast.columns) {
+      const trimmed = col.trim();
+      const schemaColumn = schema.columns.find((c) => c.name.toUpperCase() === trimmed.toUpperCase());
+      if (!schemaColumn) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `index column not found on table ${table}: ${trimmed}`);
+      }
     }
 
     this.indexCatalog.set(indexName, {
       name: indexName,
       table,
-      columns: [schemaColumn.name],
+      columns: ast.columns.map((c) => c.trim()),
       type: "BTREE",
       unique: ast.unique,
       status: "ACTIVE",
@@ -8055,32 +8135,73 @@ export class WalrusSqlClient {
       if (entry.table.toUpperCase() !== table.toUpperCase()) continue;
       if (entry.type !== "BTREE") continue;
       if (entry.status !== "ACTIVE") continue;
-      if (entry.columns.length !== 1) continue;
 
-      const column = entry.columns[0]!;
       const leafMap = new Map<string, BtreeIndexLeafEntry>();
       for (const row of rows) {
-        const val = this.resolveRowValue(row, column);
-        if (val === null || val === undefined) continue;
+        if (entry.columns.length === 1) {
+          // Single-column: use original path
+          const column = entry.columns[0]!;
+          const val = this.resolveRowValue(row, column);
+          if (val === null || val === undefined) continue;
 
-        const encoded = this.encodeTypedKey(val, `btree.index.key:${table}.${entry.name}.${column}`);
-        const existing = leafMap.get(encoded);
-        if (existing) {
-          existing.rows.add(row);
+          const encoded = this.encodeTypedKey(val, `btree.index.key:${table}.${entry.name}.${column}`);
+          const existing = leafMap.get(encoded);
+          if (existing) {
+            existing.rows.add(row);
+          } else {
+            leafMap.set(encoded, {
+              key: val as SqlPrimitive,
+              rows: new Set<SqlRow>([row]),
+            });
+            keys += 1;
+          }
         } else {
-          leafMap.set(encoded, {
-            key: val as SqlPrimitive,
-            rows: new Set<SqlRow>([row]),
-          });
-          keys += 1;
+          // Multi-column: build composite key
+          const keyParts: string[] = [];
+          let hasNull = false;
+          for (const col of entry.columns) {
+            const val = this.resolveRowValue(row, col);
+            if (val === null || val === undefined) {
+              hasNull = true;
+              break;
+            }
+            keyParts.push(this.encodeTypedKey(val as SqlPrimitive, `btree.index.key:${table}.${entry.name}.${col}`));
+          }
+          if (hasNull) continue;
+
+          const encoded = keyParts.join("||");
+          const compositeKey = keyParts.map((k, i) => ({ key: this.decodeTypedKey(k, entry.columns[i]!), idx: i }));
+          const existing = leafMap.get(encoded);
+          if (existing) {
+            existing.rows.add(row);
+          } else {
+            leafMap.set(encoded, {
+              key: compositeKey as unknown as SqlPrimitive,
+              rows: new Set<SqlRow>([row]),
+            });
+            keys += 1;
+          }
         }
         rowsIndexed += 1;
       }
 
       if (leafMap.size === 0) continue;
-      const leaves = [...leafMap.values()].sort((a, b) => this.compareForOrder(a.key, b.key, "ASC"));
+      const leaves = [...leafMap.values()].sort((a, b) => {
+        // For single-column, key is SqlPrimitive
+        if (typeof a.key === "string" || typeof a.key === "number" || a.key === null) {
+          return this.compareForOrder(a.key, b.key, "ASC");
+        }
+        // For multi-column, key is array of typed parts
+        const aKey = a.key as unknown as { key: SqlPrimitive; idx: number }[];
+        const bKey = b.key as unknown as { key: SqlPrimitive; idx: number }[];
+        for (let i = 0; i < aKey.length && i < bKey.length; i++) {
+          const cmp = this.compareForOrder(aKey[i]!.key, bKey[i]!.key, "ASC");
+          if (cmp !== 0) return cmp;
+        }
+        return 0;
+      });
       indexesForTable.set(entry.name.toUpperCase(), {
-        column,
+        columns: entry.columns,
         entries: leaves,
       });
     }
@@ -8378,22 +8499,20 @@ export class WalrusSqlClient {
     let best: { rows: SqlRow[]; indexName: string; column: string } | null = null;
     for (const [indexName, runtime] of tableIndexes.entries()) {
       const entry = this.indexCatalog.get(indexName);
-      if (!entry || entry.columns.length !== 1) continue;
+      if (!entry) continue;
 
-      const predicate = this.extractBtreeRangePredicate(runtime.column, whereClauses);
-      if (!predicate) continue;
-      const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
-      const candidate = { rows, indexName, column: runtime.column };
-      if (!best) {
-        best = candidate;
-        continue;
+      // Single-column index optimization
+      if (entry.columns.length === 1) {
+        const predicate = this.extractBtreeRangePredicate(runtime.columns[0]!, whereClauses);
+        if (predicate) {
+          const rows = this.scanBtreeIndexRows(runtime, "ASC", predicate);
+          const candidate = { rows, indexName, column: runtime.columns[0]! };
+          if (!best || candidate.rows.length < best.rows.length) {
+            best = candidate;
+          }
+        }
       }
-      if (candidate.rows.length < best.rows.length) {
-        best = candidate;
-        continue;
-      }
-      if (candidate.rows.length > best.rows.length) continue;
-      if (this.textOrder(candidate.indexName, best.indexName) < 0) best = candidate;
+      // Multi-column indexes: full scan for now, but they're still maintained correctly
     }
 
     if (trackLookupStats && best) this.bumpIndexLookupStats(table, best.rows.length > 0);
@@ -8420,14 +8539,16 @@ export class WalrusSqlClient {
 
     let best: { rows: SqlRow[]; indexName: string; column: string; orderSatisfied: boolean } | null = null;
     for (const [indexName, runtime] of tableIndexes.entries()) {
-      if (runtime.column.toUpperCase() !== orderField.toUpperCase()) continue;
-      const predicate = this.extractBtreeRangePredicate(runtime.column, parsed.whereClauses);
+      // Only use single-column indexes for ordered scan
+      if (runtime.columns.length !== 1) continue;
+      if (runtime.columns[0]!.toUpperCase() !== orderField.toUpperCase()) continue;
+      const predicate = this.extractBtreeRangePredicate(runtime.columns[0]!, parsed.whereClauses);
       const orderedRows = this.scanBtreeIndexRows(runtime, direction, predicate ?? undefined);
 
       const isBoundByOrderColumn = Boolean(predicate && (predicate.lower || predicate.upper));
       if (!isBoundByOrderColumn) {
         const nullTail = rows.filter((row) => {
-          const value = this.resolveRowValue(row, runtime.column);
+          const value = this.resolveRowValue(row, runtime.columns[0]!);
           return value === null || value === undefined;
         });
         orderedRows.push(...nullTail);
@@ -8436,7 +8557,7 @@ export class WalrusSqlClient {
       const candidate = {
         rows: orderedRows,
         indexName,
-        column: runtime.column,
+        column: runtime.columns[0]!,
         orderSatisfied: true,
       };
       if (!best) {
@@ -10796,6 +10917,15 @@ export class WalrusSqlClient {
   private encodeTypedKey(value: SqlPrimitive | undefined, sourceContext: string): string {
     const typed = fromStorage((value ?? null) as SqlPrimitive, undefined, {}, sourceContext);
     return JSON.stringify({ type: typed.type, value: typed.value });
+  }
+
+  private decodeTypedKey(encoded: string, column: string): SqlPrimitive {
+    try {
+      const parsed = JSON.parse(encoded) as { type: string; value: SqlPrimitive };
+      return parsed.value;
+    } catch {
+      return encoded as SqlPrimitive;
+    }
   }
 
   private joinKeyEqual(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined): boolean {
