@@ -86,7 +86,7 @@
 - [x] P4-MILE-006 SQL-92 核心一致性测试通过（标准套件）
 - [x] P4-MILE-007 功能覆盖率 ≥ 90%（31/31 P4 功能已实现）
 - [x] P4-MILE-008 全测试管线绿灯（build/unit/integration/regression/bench）
-- [ ] P4-MILE-009 文档、示例、运维手册同步（窗口函数有文档，其他 P4 功能待完善）
+- [x] P4-MILE-009 文档、示例、运维手册同步（窗口函数/CTE/RCTE/游标/动态SQL/information_schema/GRANT-REVOKE均已创建文档）
 
 ---
 
