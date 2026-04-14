@@ -691,6 +691,23 @@ const DEFAULT_JOIN_MEMORY_BUDGET_ROWS = 4096;
 const CORRELATED_SUBQUERY_COST_BUDGET = 250_000;
 const CORRELATED_SUBQUERY_RESULT_CACHE_LIMIT = 512;
 
+/** Shared permission catalog — module-level so all client instances share grants */
+const SHARED_PERMISSION_CATALOG = new Map<string, {
+  grantee: string;
+  objectName: string;
+  objectType: "TABLE" | "VIEW";
+  privilege: "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REFERENCES";
+  grantOption: boolean;
+  grantor: string;
+  grantedAt: number;
+}>();
+
+/** Shared table owners map */
+const SHARED_TABLE_OWNERS = new Map<string, string>();
+
+/** Shared CTE tables set — tracks ephemeral CTE table names to skip permission checks */
+const SHARED_CTE_TABLES = new Set<string>();
+
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
   private readonly isolationLevel: "read_committed";
@@ -706,6 +723,7 @@ export class WalrusSqlClient {
     position: number;
   }>();
   private readonly preparedStatements = new Map<string, string>();
+  private currentUser: string = "current_user";
   private readonly hashIndexes = new Map<string, Map<string, Map<string, Set<SqlRow>>>>();
   private readonly hashIndexStats = new Map<string, { keys: number; rowsIndexed: number }>();
   private readonly btreeIndexes = new Map<string, BtreeRuntimeIndexMap>();
@@ -753,6 +771,7 @@ export class WalrusSqlClient {
       );
     }
     this.isolationLevel = "read_committed";
+    this.currentUser = opts.authUsername ?? "current_user";
     this.logger = createLogger({
       level: opts.logging?.level ?? "error",
       sink: opts.logging?.sink,
@@ -3255,6 +3274,21 @@ export class WalrusSqlClient {
       this.assertNoCascadeCycle(schema);
       this.tables.set(schema.name, []);
       this.schemas.set(schema.name, schema);
+      SHARED_TABLE_OWNERS.set(schema.name, this.currentUser.toUpperCase());
+      // Owner automatically gets all privileges on their table
+      const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"] as const;
+      for (const priv of ALL_PRIVS) {
+        const key = `${this.currentUser}:${schema.name}:${priv}`;
+        SHARED_PERMISSION_CATALOG.set(key, {
+          grantee: this.currentUser,
+          objectName: schema.name,
+          objectType: "TABLE",
+          privilege: priv,
+          grantOption: true,
+          grantor: this.currentUser.toUpperCase(),
+          grantedAt: Date.now(),
+        });
+      }
       this.indexCatalog.forEach((entry, indexName) => {
         if (entry.table.toUpperCase() === schema.name.toUpperCase()) this.indexCatalog.delete(indexName);
       });
@@ -3394,8 +3428,9 @@ export class WalrusSqlClient {
     if (upper.startsWith("INSERT INTO")) {
       const table = this.extractTableName(normalized, /INSERT INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.assertUpdatableViewDeferred("INSERT", table, "target");
-      const parsedInsert = this.parseInsert(normalized);
+      this.assertTablePrivilege(table, "INSERT");
       const bucket = this.requireWritableTableForDml(table);
+      const parsedInsert = this.parseInsert(normalized);
       const coerced = this.applySchemaOnWrite(table, parsedInsert.row, undefined, parsedInsert.bindings);
       bucket.push(coerced);
       this.addRowToUniqueIndexes(table, coerced);
@@ -3422,6 +3457,7 @@ export class WalrusSqlClient {
       const plan = this.planUpdate(normalized);
       this.assertUpdatableViewDeferred("UPDATE", plan.table, "target");
       if (plan.join) this.assertUpdatableViewDeferred("UPDATE", plan.join.table, "source");
+      this.assertTablePrivilege(plan.table, "UPDATE");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -3538,6 +3574,7 @@ export class WalrusSqlClient {
       const plan = this.planDelete(normalized);
       this.assertUpdatableViewDeferred("DELETE", plan.table, "target");
       if (plan.join) this.assertUpdatableViewDeferred("DELETE", plan.join.table, "source");
+      this.assertTablePrivilege(plan.table, "DELETE");
       const bucket = this.requireWritableTableForDml(plan.table);
 
       const joinedRows = plan.join
@@ -3693,6 +3730,74 @@ export class WalrusSqlClient {
         }
         return this.executeSimulator(expandedSql);
       }
+    }
+
+    // GRANT privilege(s) ON object TO grantee [WITH GRANT OPTION]
+    {
+      const grantMatch = normalized.match(
+        /^GRANT\s+(.+?)\s+ON\s+(?:TABLE\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+WITH\s+GRANT\s+OPTION)?$/i,
+      );
+      if (grantMatch) {
+        const privList = grantMatch[1]!.toUpperCase().split(",").map((p) => p.trim());
+        const objectName = grantMatch[2]!;
+        const grantee = grantMatch[3]!.toUpperCase();
+        const withGrant = /\bWITH\s+GRANT\s+OPTION\b/i.test(normalized);
+        const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"];
+        const privileges = privList[0] === "ALL"
+          ? ALL_PRIVS
+          : privList;
+        for (const priv of privileges) {
+          if (!ALL_PRIVS.includes(priv)) {
+            throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", { token: priv, message: `unexpected privilege '${priv}' in GRANT statement` });
+          }
+          const key = `${grantee}:${objectName}:${priv}`;
+          SHARED_PERMISSION_CATALOG.set(key, {
+            grantee,
+            objectName,
+            objectType: "TABLE",
+            privilege: priv as "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REFERENCES",
+            grantOption: withGrant,
+            grantor: this.currentUser.toUpperCase(),
+            grantedAt: Date.now(),
+          });
+        }
+        return { txDigest: this.fakeDigest(normalized), statementType: "GRANT", affectedRows: 0 };
+      }
+    }
+
+    // REVOKE privilege(s) ON object FROM grantee [CASCADE | RESTRICT]
+    {
+      const revokeMatch = normalized.match(
+        /^REVOKE\s+(?:GRANT\s+OPTION\s+FOR\s+)?(.+?)\s+ON\s+(?:TABLE\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(CASCADE|RESTRICT))?$/i,
+      );
+      if (revokeMatch) {
+        const privList = revokeMatch[1]!.toUpperCase().split(",").map((p) => p.trim());
+        const objectName = revokeMatch[2]!;
+        const grantee = revokeMatch[3]!.toUpperCase();
+        const cascade = revokeMatch[4]?.toUpperCase() === "CASCADE";
+        const ALL_PRIVS = ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"];
+        const privileges = privList[0] === "ALL"
+          ? ALL_PRIVS
+          : privList;
+        for (const priv of privileges) {
+          const key = `${grantee}:${objectName}:${priv}`;
+          if (cascade) {
+            for (const [k, entry] of SHARED_PERMISSION_CATALOG.entries()) {
+              if (entry.grantor === grantee && entry.objectName === objectName && entry.privilege === priv) {
+                SHARED_PERMISSION_CATALOG.delete(k);
+              }
+            }
+          }
+          SHARED_PERMISSION_CATALOG.delete(key);
+        }
+        return { txDigest: this.fakeDigest(normalized), statementType: "REVOKE", affectedRows: 0 };
+      }
+    }
+
+    // SELECT: delegate to query() to enforce permission checks
+    if (/^\s*SELECT\b/i.test(normalized)) {
+      const result = await this.query(sql);
+      return { txDigest: this.fakeDigest(normalized), statementType: "SELECT", affectedRows: result.rows.length };
     }
 
     return {
@@ -5478,8 +5583,17 @@ export class WalrusSqlClient {
       }
 
       // information_schema: materialize virtual tables for any query referencing them
-      if (/information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage)\b/i.test(normalized)) {
+      if (/information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage|table_privileges)\b/i.test(normalized)) {
         return this.executeInformationSchemaQuery(sql);
+      }
+
+      // SELECT permission check: must precede cache check so permission revocation takes effect
+      // Skip for __info_* (information_schema) and __derived_* (internal query planning) tables
+      {
+        const selectTableMatch = normalized.match(/^\s*SELECT\b[\s\S]*?\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+        if (selectTableMatch && !selectTableMatch[1]!.startsWith("__info_") && !selectTableMatch[1]!.startsWith("__derived_")) {
+          this.assertTablePrivilege(selectTableMatch[1]!, "SELECT");
+        }
       }
 
       const normalizedSql = sql.trim().replace(/\s+/g, " ");
@@ -7283,6 +7397,39 @@ export class WalrusSqlClient {
     if (!allowed?.length) return true;
     const key = this.normalizeViewName(viewName);
     return allowed.some((candidate) => this.normalizeViewName(candidate) === key);
+  }
+
+  /** Check if current user has a privilege on an object (or via PUBLIC). Throws if denied. */
+  private assertTablePrivilege(objectName: string, privilege: string): void {
+    // Views are governed by viewPolicy, not this permission system
+    const normalizedName = this.normalizeViewName(objectName);
+    if (this.viewCatalog.has(normalizedName)) return;
+
+    // Internal system tables (information_schema rewrites to __info_*,
+    // subquery materialization creates __derived_*) are always accessible
+    if (objectName.startsWith("__")) return;
+
+    // CTEs (ephemeral query-scoped tables) are tracked separately and skip permission
+    if (SHARED_CTE_TABLES.has(objectName)) return;
+
+    // User tables must be registered in SHARED_TABLE_OWNERS.
+    // If a table is registered in SHARED_TABLE_OWNERS but user is not the owner
+    // AND has no entry in SHARED_PERMISSION_CATALOG, deny access.
+    // If the table is not registered at all, let normal lookup throw ERR_TABLE_NOT_FOUND.
+    if (!SHARED_TABLE_OWNERS.has(objectName)) return; // Table not registered — let normal error handling report it
+
+    const user = this.currentUser.toUpperCase();
+    // Owner has all privileges
+    if (SHARED_TABLE_OWNERS.get(objectName)?.toUpperCase() === user) return;
+
+    // Check permission catalog
+    const key = `${user}:${objectName}:${privilege}`;
+    const pubKey = `PUBLIC:${objectName}:${privilege}`;
+    if (!SHARED_PERMISSION_CATALOG.has(key) && !SHARED_PERMISSION_CATALOG.has(pubKey)) {
+      throw createSqlError("SQL_PERMISSION_DENIED", {
+        message: `${privilege} on ${objectName} denied to ${user}`,
+      });
+    }
   }
 
   private assertViewPermission(action: ViewPolicyAction, viewName: string): void {
@@ -11447,6 +11594,8 @@ export class WalrusSqlClient {
     if (!rcteHeaderMatch) throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", { token: "cte", message: "WITH RECURSIVE requires: WITH RECURSIVE name AS (anchor UNION ALL recursive) main" });
 
     const cteName = rcteHeaderMatch[1]!;
+    // Track CTE as an internal table to skip permission checks
+    SHARED_CTE_TABLES.add(cteName);
     let i = rcteHeaderMatch[0].length;
 
     // Extract the CTE body (balanced parens, already consumed the opening '(')
@@ -11667,12 +11816,27 @@ export class WalrusSqlClient {
       }
       return rows;
     }
+    if (lc === "table_privileges") {
+      const rows: SqlRow[] = [];
+      for (const [, entry] of SHARED_PERMISSION_CATALOG.entries()) {
+        rows.push({
+          grantor: entry.grantor,
+          grantee: entry.grantee,
+          table_catalog: "def",
+          table_schema: "public",
+          table_name: entry.objectName,
+          privilege_type: entry.privilege,
+          is_grantable: entry.grantOption ? "YES" : "NO",
+        });
+      }
+      return rows;
+    }
     return [];
   }
 
   private async executeInformationSchemaQuery(sql: string): Promise<QueryResult> {
     // Rewrite information_schema.X to __info_X and register as temp tables
-    const INFO_TABLE_PATTERN = /information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage)\b/gi;
+    const INFO_TABLE_PATTERN = /information_schema\s*\.\s*(tables|columns|table_constraints|key_column_usage|table_privileges)\b/gi;
     const tempInfoTables: string[] = [];
     const rewrittenSql = sql.replace(INFO_TABLE_PATTERN, (_match, tbl: string) => {
       const alias = `__info_${tbl.toLowerCase()}`;
