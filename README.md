@@ -9,14 +9,14 @@ Walrus 链上存储 + SQL-92 核心标准（目标 90% 合规）SDK。
 | 类别 | 覆盖率 | 说明 |
 |------|--------|------|
 | 数据类型 | 65% | INT/FLOAT/VARCHAR/DATE/TIME/TIMESTAMP/BOOLEAN/BLOB 等 |
-| DDL | 60% | CREATE/DROP TABLE, ALTER TABLE ADD/DROP COLUMN, INDEX, VIEW |
-| DML | 75% | SELECT (子查询/JOIN/聚合/集合操作), INSERT/UPDATE/DELETE |
-| 事务 | 55% | BEGIN/COMMIT/ROLLBACK, ACID (WAL) |
-| 完整性约束 | 70% | PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, DEFAULT |
-| 索引管理 | 60% | CREATE INDEX (HASH/BTREE), DROP INDEX |
-| 高级特性 | 65% | 视图, 游标, GRANT/REVOKE, 窗口函数, CTE/WITH RECURSIVE |
+| DDL | 80% | CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/MODIFY/RENAME), INDEX, VIEW, SCHEMA |
+| DML | 80% | SELECT (子查询/JOIN/聚合/集合操作), INSERT/UPDATE/DELETE + RETURNING |
+| 事务 | 80% | BEGIN/COMMIT/ROLLBACK, SAVEPOINT, WAL, ACID, 隔离级别 |
+| 完整性约束 | 85% | PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, DEFAULT, CHECK, TRIGGER |
+| 索引管理 | 80% | CREATE INDEX (HASH/BTREE), DROP INDEX, 复合索引 |
+| 高级特性 | 80% | 视图, 游标, GRANT/REVOKE, 窗口函数, CTE/WITH RECURSIVE, FUNCTION |
 
-**当前覆盖率：~63%**
+**当前覆盖率：~80%**
 
 ## 核心特性
 
@@ -33,14 +33,14 @@ Walrus 链上存储 + SQL-92 核心标准（目标 90% 合规）SDK。
 
 ## 与目标差距 (距 90%)
 
-- CHECK 约束语法定义
-- SAVEPOINT 嵌套事务
-- ALTER TABLE 完整支持 (修改列类型/默认值/重命名)
-- RETURNING 子句 (DML 后返回变更行)
-- TRIGGER / PROCEDURE / FUNCTION
-- 复合索引 (多列)
-- 隔离级别设置 (SERIALIZABLE/REPEATABLE READ)
-- CREATE SCHEMA
+- INTERVAL 数据类型支持
+- TIME/TIMESTAMP WITH TIME ZONE 支持
+- CHARACTER SET / COLLATION 支持
+- TRUNCATE TABLE 语句
+- 行列子查询 (LATERAL)
+- MERGE / UPSERT 语句
+- CASE WHEN 完整语法 (WHEN OTHERS)
+- 窗口函数帧 (GROUPS/EXCLUDE)
 
 ## 构建
 

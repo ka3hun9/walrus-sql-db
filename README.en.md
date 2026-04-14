@@ -9,14 +9,14 @@ Build a database SDK on Walrus blockchain storage that conforms to SQL-92 Interm
 | Category | Coverage | Description |
 |----------|----------|-------------|
 | Data Types | 65% | INT/FLOAT/VARCHAR/DATE/TIME/TIMESTAMP/BOOLEAN/BLOB |
-| DDL | 60% | CREATE/DROP TABLE, ALTER TABLE ADD/DROP COLUMN, INDEX, VIEW |
-| DML | 75% | SELECT (subquery/JOIN/aggregation/set ops), INSERT/UPDATE/DELETE |
-| Transactions | 55% | BEGIN/COMMIT/ROLLBACK, ACID (WAL) |
-| Integrity Constraints | 70% | PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, DEFAULT |
-| Index Management | 60% | CREATE INDEX (HASH/BTREE), DROP INDEX |
-| Advanced Features | 65% | Views, Cursors, GRANT/REVOKE, Window Functions, CTE/WITH RECURSIVE |
+| DDL | 80% | CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/MODIFY/RENAME), INDEX, VIEW, SCHEMA |
+| DML | 80% | SELECT (subquery/JOIN/aggregation/set ops), INSERT/UPDATE/DELETE + RETURNING |
+| Transactions | 80% | BEGIN/COMMIT/ROLLBACK, SAVEPOINT, WAL, ACID, isolation levels |
+| Integrity Constraints | 85% | PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, DEFAULT, CHECK, TRIGGER |
+| Index Management | 80% | CREATE INDEX (HASH/BTREE), DROP INDEX, composite indexes |
+| Advanced Features | 80% | Views, Cursors, GRANT/REVOKE, Window Functions, CTE/WITH RECURSIVE, FUNCTION |
 
-**Current Coverage: ~63%**
+**Current Coverage: ~80%**
 
 ## Core Features
 
@@ -33,14 +33,14 @@ Build a database SDK on Walrus blockchain storage that conforms to SQL-92 Interm
 
 ## Gap from 90% Target
 
-- CHECK constraint syntax definition
-- SAVEPOINT for nested transactions
-- ALTER TABLE full support (modify column type/default/rename)
-- RETURNING clause (get modified rows after DML)
-- TRIGGER / PROCEDURE / FUNCTION
-- Composite indexes (multi-column)
-- Isolation level settings (SERIALIZABLE/REPEATABLE READ)
-- CREATE SCHEMA
+- INTERVAL data type support
+- TIME/TIMESTAMP WITH TIME ZONE support
+- CHARACTER SET / COLLATION support
+- TRUNCATE TABLE statement
+- LATERAL subqueries
+- MERGE / UPSERT statement
+- CASE WHEN complete syntax (WHEN OTHERS)
+- Window function frame (GROUPS/EXCLUDE)
 
 ## Build
 
