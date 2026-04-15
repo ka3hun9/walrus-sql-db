@@ -151,19 +151,21 @@ export function assignRowsToPages(
     newPageRows.push(allRows.slice(i, i + pageSize));
   }
 
-  const newPages: PageRef[] = newPageRows.map((pageRows, pageIndex) => {
-    const prevPageHash = pageIndex > 0 ? newPages[pageIndex - 1]!.objectId : null;
-    const objectId = hashHex(JSON.stringify({ pageIndex, rows: pageRows }));
-    return {
+  const newPages: PageRef[] = [];
+  for (let pi = 0; pi < newPageRows.length; pi++) {
+    const pageRows = newPageRows[pi]!;
+    const prevPageHash = pi > 0 ? newPages[pi - 1]!.objectId : null;
+    const objectId = hashHex(JSON.stringify({ pageIndex: pi, rows: pageRows }));
+    newPages.push({
       table: existingPages[0]?.table ?? "",
-      pageIndex,
+      pageIndex: pi,
       objectId,
       rowCount: pageRows.length,
-      startRowIndex: pageIndex * pageSize,
+      startRowIndex: pi * pageSize,
       prevPageHash,
       keyMerkleRoot: buildKeyMerkleRoot(pageRows),
-    };
-  });
+    });
+  }
 
   return { pages: newPages, rows: newPageRows };
 }

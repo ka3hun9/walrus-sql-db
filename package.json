@@ -7,7 +7,10 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{ recursive:true, force:true })\"",
-    "build": "npm run clean && tsc -p tsconfig.json"
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
   },
   "keywords": [
     "sui",
@@ -26,7 +29,9 @@
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "@vitest/coverage-v8": "^4.1.4",
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.4"
   }
 }
