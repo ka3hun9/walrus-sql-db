@@ -10,6 +10,7 @@
     "build": "npm run clean && tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:sqllogictest:download": "npx tsx test/sqllogictest/fetch-cli.ts",
     "coverage": "vitest run --coverage"
   },
   "keywords": [

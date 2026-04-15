@@ -2,7 +2,7 @@
  * SQLite test file acquisition utility
  *
  * Downloads and caches SQLite .test files from the SQLite source tree.
- * Uses a known-good commit hash for reproducibility.
+ * Uses a known-good tag for reproducibility.
  */
 
 import { createHash } from "node:crypto";
@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** SQLite source tree commit (sqlite-src-3450100 — a stable recent release) */
+/** SQLite source tree tag (version-3.45.0 — a stable recent release) */
 export const SQLITE_COMMIT = "version-3.45.0";
 
 /** Base URL for SQLite test files in the source tree */
@@ -87,7 +87,11 @@ export async function fetchTestFiles(testNames: string[]): Promise<Map<string, s
   return map;
 }
 
-/** Priority list of SQLite test files to download (basic SELECT tests first) */
+/**
+ * Priority list of SQLite test files (only files that exist at version-3.45.0)
+ * 39 test files covering: SELECT, WHERE, LIMIT, ORDERBY, JOIN, DISTINCT,
+ * AGG (error), SUBQUERY, VIEW, INDEX, WINDOW, TRIGGER
+ */
 export const PRIORITY_TESTS = [
   // Basic SELECT
   "select1.test",
@@ -97,9 +101,9 @@ export const PRIORITY_TESTS = [
   "select5.test",
   // WHERE
   "where.test",
-  // ORDER BY / LIMIT
+  // LIMIT
   "limit.test",
-  "orderby.test",
+  // ORDER BY
   "orderby1.test",
   // JOIN
   "join.test",
@@ -107,33 +111,24 @@ export const PRIORITY_TESTS = [
   "join3.test",
   "join4.test",
   "join5.test",
-  // Aggregate
-  "agg.test",
-  "aggfunc.test",
+  // Aggregate errors
   "aggerror.test",
   // DISTINCT
   "distinct.test",
   "distinctagg.test",
   // Subquery
   "subquery.test",
-  "select.test", // main select test aggregator
   // VIEW
   "view.test",
   // INDEX
   "index.test",
-  "index1.test",
   "index2.test",
   "index3.test",
   "index4.test",
   "index5.test",
   "index6.test",
   "index7.test",
-  // CTEs
-  "cte.test",
-  "cte0.test",
-  "cte1.test",
   // Window functions
-  "window.test",
   "window1.test",
   "window2.test",
   "window3.test",
@@ -149,8 +144,13 @@ export const PRIORITY_TESTS = [
   "trigger7.test",
   "trigger8.test",
   "trigger9.test",
-  "trigger10.test",
 ];
+
+/**
+ * NOTE: The following files return 404 at version-3.45.0 (not yet available at this tag):
+ * orderby.test, agg.test, aggfunc.test, select.test, index1.test,
+ * cte.test, cte0.test, cte1.test, window.test, trigger10.test
+ */
 
 /** Download all priority test files to cache */
 export async function downloadAllPriorityTests(): Promise<number> {
