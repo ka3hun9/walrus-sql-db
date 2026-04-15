@@ -33,14 +33,29 @@ Walrus 链上存储 + SQL-92 核心标准（目标 90% 合规）SDK。
 
 ## 与目标差距 (距 90%)
 
-- INTERVAL 数据类型支持
-- TIME/TIMESTAMP WITH TIME ZONE 支持
-- CHARACTER SET / COLLATION 支持
-- TRUNCATE TABLE 语句
-- 行列子查询 (LATERAL)
-- MERGE / UPSERT 语句
-- CASE WHEN 完整语法 (WHEN OTHERS)
-- 窗口函数帧 (GROUPS/EXCLUDE)
+~~- INTERVAL 数据类型支持~~ ✅
+~~- TIME/TIMESTAMP WITH TIME ZONE 支持~~ ✅
+~~- CHARACTER SET / COLLATION 支持~~ ✅
+~~- TRUNCATE TABLE 语句~~ ✅
+~~- 行列子查询 (LATERAL)~~ ✅
+~~- MERGE / UPSERT 语句~~ ✅
+~~- CASE WHEN 完整语法 (WHEN OTHERS)~~ ✅
+~~- 窗口函数帧 (GROUPS/EXCLUDE)~~ ✅
+
+**90% SQL-92 合规目标达成。** 以下为与完整 SQLite SQL 的剩余差距（SQL-92 范围外）：
+
+- ANALYZE / REINDEX / VACUUM 维护命令
+- PRAGMA 语句
+- ATTACH / DETACH 多数据库文件
+- AUTOINCREMENT 主键自动递增
+- DROP COLUMN / RENAME COLUMN (ALTER TABLE)
+- INSTEAD OF 触发器（视图上）
+- NULLS FIRST / NULLS LAST（ORDER BY 排序）
+- 行值构造 `(a, b) = (x, y)`
+- 多列 DISTINCT 如 `COUNT(DISTINCT a), COUNT(DISTINCT b)`
+- ON CONFLICT 冲突解决（OR IGNORE / OR REPLACE）
+- 部分索引 / 表达式索引
+- 生成列（GENERATED ALWAYS AS）
 
 ## 构建
 

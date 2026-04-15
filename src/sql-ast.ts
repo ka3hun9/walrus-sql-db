@@ -169,6 +169,8 @@ export type TableRefAst =
       subquerySql: string;
       alias: string;
       rewrittenSql: string;
+      /** True for LATERAL subqueries */
+      lateral?: boolean;
     };
 
 export type JoinAst = {
@@ -213,7 +215,7 @@ export type WindowFunctionAst = {
 };
 
 export type WindowFrameAst = {
-  unit: "ROWS";
+  unit: "ROWS" | "GROUPS" | "RANGE";
   start: WindowFrameBound;
   end: WindowFrameBound;
 };
@@ -223,4 +225,6 @@ export type WindowFrameBound =
   | { kind: "unbounded_following" }
   | { kind: "current_row" }
   | { kind: "offset_preceding"; offset: number }
-  | { kind: "offset_following"; offset: number };
+  | { kind: "offset_following"; offset: number }
+  | { kind: "offset_preceding_interval"; value: number; unit: string }
+  | { kind: "offset_following_interval"; value: number; unit: string };

@@ -33,14 +33,29 @@ Build a database SDK on Walrus blockchain storage that conforms to SQL-92 Interm
 
 ## Gap from 90% Target
 
-- INTERVAL data type support
-- TIME/TIMESTAMP WITH TIME ZONE support
-- CHARACTER SET / COLLATION support
-- TRUNCATE TABLE statement
-- LATERAL subqueries
-- MERGE / UPSERT statement
-- CASE WHEN complete syntax (WHEN OTHERS)
-- Window function frame (GROUPS/EXCLUDE)
+~~- INTERVAL data type support~~ ✅
+~~- TIME/TIMESTAMP WITH TIME ZONE support~~ ✅
+~~- CHARACTER SET / COLLATION support~~ ✅
+~~- TRUNCATE TABLE statement~~ ✅
+~~- LATERAL subqueries~~ ✅
+~~- MERGE / UPSERT statement~~ ✅
+~~- CASE WHEN complete syntax (WHEN OTHERS)~~ ✅
+~~- Window function frame (GROUPS/EXCLUDE)~~ ✅
+
+**90% SQL-92 compliance goal achieved.** Remaining gaps vs full SQLite SQL (outside SQL-92 scope):
+
+- ANALYZE / REINDEX / VACUUM maintenance commands
+- PRAGMA statements
+- ATTACH / DETACH multiple database files
+- AUTOINCREMENT primary key auto-increment
+- DROP COLUMN / RENAME COLUMN (ALTER TABLE)
+- INSTEAD OF triggers (on views)
+- NULLS FIRST / NULLS LAST (ORDER BY)
+- Row value constructors `(a, b) = (x, y)`
+- Multi-column DISTINCT like `COUNT(DISTINCT a), COUNT(DISTINCT b)`
+- ON CONFLICT conflict resolution (OR IGNORE / OR REPLACE)
+- Partial indexes / expression indexes
+- Generated columns (GENERATED ALWAYS AS)
 
 ## Build
 

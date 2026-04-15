@@ -14,6 +14,7 @@ import {
   typedValueComparator,
   typedValueOperators,
   verifyTransactionLogRecordChecksum,
+  applyCollation,
 } from "./types.js";
 import type {
   ExecuteResult,
@@ -37,10 +38,13 @@ import type {
   VersionedStorageObject,
   WalrusSqlClientOptions,
 } from "./types.js";
-import { buildMoveCall } from "./onchain.js";
+import { buildMoveCall, buildPagedMoveCall, getTableVersionHistory, PagedMoveCallRequest } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
+import { WalrusBatchCommitter, buildBatchMoveCallPayload, type BatchableDmlOp } from "./walrus-batch.js";
+import { OptimisticLockManager, type OptimisticLockOptions, OptimisticConflictError, threeWayMerge, buildRowVersionHash } from "./walrus-optimistic-lock.js";
+import { WalrusCostEstimator, type QueryCostEstimate } from "./walrus-cost.js";
 import type {
   CreateIndexStatementAst,
   CreateSchemaStatementAst,
@@ -198,10 +202,12 @@ type WindowFrameBoundSpec =
   | { kind: "unbounded_following" }
   | { kind: "current_row" }
   | { kind: "offset_preceding"; offset: number }
-  | { kind: "offset_following"; offset: number };
+  | { kind: "offset_following"; offset: number }
+  | { kind: "offset_preceding_interval"; value: number; unit: string }
+  | { kind: "offset_following_interval"; value: number; unit: string };
 
 type WindowFrameSpec = {
-  unit: "ROWS";
+  unit: "ROWS" | "GROUPS" | "RANGE";
   start: WindowFrameBoundSpec;
   end: WindowFrameBoundSpec;
 };
@@ -780,6 +786,15 @@ export class WalrusSqlClient {
   private subqueryRuntime: SubqueryRuntimeState | null = null;
   private readonly activeViewResolutionStack: string[] = [];
 
+  // ─── Phase 2: Batch Commit ───────────────────────────────
+  private readonly batchCommitter: WalrusBatchCommitter;
+
+  // ─── Phase 3: Optimistic Locking ───────────────────────
+  private readonly lockManager: OptimisticLockManager;
+
+  // ─── Phase 4: Cost Estimation ─────────────────────────
+  private readonly costEstimator: WalrusCostEstimator;
+
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
     const isolation = String(opts.isolationLevel ?? "read_committed").toLowerCase();
@@ -796,6 +811,38 @@ export class WalrusSqlClient {
       level: opts.logging?.level ?? "error",
       sink: opts.logging?.sink,
       scope: "WalrusSqlClient",
+    });
+
+    // ─── Phase 2: Batch Commit ─────────────────────────────────
+    const batchOpts = opts.batchCommit ?? {};
+    this.batchCommitter = new WalrusBatchCommitter(
+      {
+        enabled: batchOpts.enabled ?? true,
+        maxDelayMs: batchOpts.maxDelayMs ?? 200,
+        maxOperations: batchOpts.maxOperations ?? 50,
+        maxBatchRows: batchOpts.maxBatchRows ?? 5000,
+      },
+      (ops, batchId) => this.executeBatchOnchain(ops, batchId),
+    );
+
+    // ─── Phase 3: Optimistic Locking ────────────────────────────
+    const lockOpts = opts.optimisticLock ?? {};
+    this.lockManager = new OptimisticLockManager({
+      enabled: lockOpts.enabled ?? true,
+      strategy: lockOpts.strategy ?? "LAST_WRITE_WINS",
+      maxRetries: lockOpts.maxRetries ?? 3,
+      lockTimeoutMs: lockOpts.lockTimeoutMs ?? 5000,
+    });
+
+    // ─── Phase 4: Cost Estimation ───────────────────────────────
+    const costOpts = opts.costConfig ?? {};
+    this.costEstimator = new WalrusCostEstimator({
+      maxCostScore: costOpts.maxCostScore ?? 80,
+      preference: costOpts.preference ?? "balanced",
+      gasPriceUSD: costOpts.gasPriceUSD ?? 0.001,
+      onCostExceeded: costOpts.onCostExceeded ?? "warn",
+      gasPerRead: costOpts.gasPerRead ?? 10,
+      gasPerWrite: costOpts.gasPerWrite ?? 50,
     });
   }
 
@@ -2805,6 +2852,10 @@ export class WalrusSqlClient {
       this.transitionTransactionState("rollback", sql);
       if (previousState === "active") this.recordTransactionOutcome("aborted");
       this.clearTransactionWriteSet();
+      // ─── Phase 2: Clear pending batch on rollback ──────────
+      this.batchCommitter.clear();
+      // ─── Phase 3: Clear pending locks on rollback ─────────
+      this.lockManager.rollbackPending();
       this.transactionStartedAt = null;
       return {
         txDigest: this.fakeDigest(sql),
@@ -2839,6 +2890,8 @@ export class WalrusSqlClient {
       this.transitionTransactionState("commit_done", sql);
       this.recordTransactionOutcome("committed");
       this.clearTransactionWriteSet();
+      // ─── Phase 2: Flush any pending batch on commit ─────────
+      await this.batchCommitter.flush();
       this.transactionStartedAt = null;
       return {
         txDigest: this.fakeDigest(sql),
@@ -3501,6 +3554,62 @@ export class WalrusSqlClient {
       sql,
     });
 
+    const isDml = moveCall.statementType === "INSERT" || moveCall.statementType === "UPDATE" || moveCall.statementType === "DELETE";
+    const isDdl = moveCall.statementType === "CREATE";
+
+    // ─── Phase 2: Batch commit for DML ─────────────────────
+    // Batched DML is enqueued and flushed later by the batch committer timer.
+    // DDL (CREATE TABLE etc.) is always executed immediately.
+    if (isDml && this.batchCommitter && this.batchCommitter.pendingCount >= 0) {
+      // Enqueue to batch and return immediately
+      const tableName = moveCall.tableName ?? "unknown";
+      // Extract row from the SQL for optimistic lock versioning
+      const rowData = this.extractRowFromSql(sql, moveCall.statementType);
+      const objectId = rowData ? buildRowVersionHash(rowData as Record<string, unknown>) : tableName;
+
+      // Record read for optimistic lock before modification
+      if (this.opts.optimisticLock?.enabled) {
+        const history = getTableVersionHistory(tableName);
+        this.lockManager.recordRead(tableName, objectId, history.headHash);
+      }
+
+      // Enqueue for batched commit
+      const batchableOp: BatchableDmlOp =
+        moveCall.statementType === "INSERT"
+          ? { type: "INSERT", table: tableName, row: rowData ?? {} }
+          : moveCall.statementType === "UPDATE"
+            ? { type: "UPDATE", table: tableName, row: rowData ?? {}, pkField: "id", pkValue: rowData?.["id"] }
+            : { type: "DELETE", table: tableName, pkField: "id", pkValue: rowData?.["id"] };
+
+      this.batchCommitter.enqueue(batchableOp);
+
+      return {
+        txDigest: this.fakeDigest(`batch:${sql}`),
+        statementType: moveCall.statementType,
+        affectedRows: 1,
+      };
+    }
+
+    // ─── Phase 3: Optimistic lock check before immediate execution ──
+    if (isDml && this.opts.optimisticLock?.enabled && moveCall.tableName) {
+      const history = getTableVersionHistory(moveCall.tableName);
+      const conflict = this.lockManager.detectConflict(moveCall.tableName, moveCall.tableName, history.headHash);
+      if (conflict) {
+        const strategy = this.opts.optimisticLock.strategy ?? "LAST_WRITE_WINS";
+        if (strategy === "FIRST_COMMIT_WINS") {
+          throw conflict; // Fail immediately
+        }
+        // LAST_WRITE_WINS: log and proceed
+        this.logger.warn("optimistic lock conflict", {
+          table: moveCall.tableName,
+          strategy,
+          expected: conflict.expectedVersion,
+          actual: conflict.actualVersion,
+        });
+      }
+    }
+
+    // ─── Immediate execution (DDL or batch disabled) ───────────
     const result = !this.opts.onchainExecutor
       ? {
           txDigest: this.fakeDigest(`planned:${sql}`),
@@ -3514,6 +3623,16 @@ export class WalrusSqlClient {
         }
       : await this.withWalrusRetry(async () => {
           const res = await this.opts.onchainExecutor!(moveCall);
+          // Record successful commit in optimistic lock manager
+          if (isDml && moveCall.tableName && this.opts.optimisticLock?.enabled) {
+            const history = getTableVersionHistory(moveCall.tableName);
+            this.lockManager.confirmCommit(
+              moveCall.tableName,
+              moveCall.tableName,
+              history.headHash,
+              this.opts.signerAddress ?? "unknown",
+            );
+          }
           return {
             txDigest: res.digest,
             raw: res.raw,
@@ -3543,6 +3662,99 @@ export class WalrusSqlClient {
 
     this.invalidateReadCacheOnWrite();
     return result;
+  }
+
+  /**
+   * Execute a batch of DML operations as a single on-chain transaction.
+   * Called by WalrusBatchCommitter when the batch flushes.
+   */
+  private async executeBatchOnchain(
+    ops: BatchableDmlOp[],
+    batchId: string,
+  ): Promise<{ txDigest: string; raw?: unknown }> {
+    const { target, arguments: args, batchId: resolvedBatchId } = buildBatchMoveCallPayload(
+      ops,
+      this.opts.packageId,
+      this.opts.moduleName ?? "walrus_sql",
+    );
+
+    const finalTarget = target;
+    const finalArgs = args;
+
+    if (!this.opts.onchainExecutor) {
+      return { txDigest: this.fakeDigest(`batch:${resolvedBatchId}`) };
+    }
+
+    return this.withWalrusRetry(async () => {
+      const res = await this.opts.onchainExecutor!({
+        target: finalTarget,
+        arguments: finalArgs,
+        statementType: "INSERT", // batch treated as INSERT for type
+      });
+
+      // Update optimistic lock for each committed op
+      if (this.opts.optimisticLock?.enabled) {
+        for (const op of ops) {
+          const history = getTableVersionHistory(op.table);
+          this.lockManager.confirmCommit(
+            op.table,
+            op.table,
+            history.headHash,
+            this.opts.signerAddress ?? "unknown",
+          );
+        }
+      }
+
+      // Record storage writes
+      for (const op of ops) {
+        const storageOp: StorageWriteOperation =
+          op.type === "INSERT" ? "INSERT_ROW" : op.type === "UPDATE" ? "UPDATE_ROW" : "DELETE_ROW";
+        this.recordStorageWrite(op.table, storageOp, 1, "onchain");
+      }
+
+      return { txDigest: res.digest, raw: res.raw };
+    });
+  }
+
+  /** Extract row data from SQL for optimistic lock versioning */
+  private extractRowFromSql(sql: string, statementType: string): SqlRow | null {
+    if (statementType === "INSERT") {
+      const m = sql.match(/INSERT INTO\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i);
+      if (!m) return null;
+      const cols = m[1]!.split(",").map((c) => c.trim());
+      const rawVals = m[2]!;
+      // Simple split — not handling nested quotes fully
+      const vals = rawVals.split(",").map((v) => {
+        const t = v.trim();
+        if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith('"') && t.endsWith('"'))) {
+          return t.slice(1, -1);
+        }
+        if (t.toLowerCase() === "null") return null;
+        if (t === "true") return true;
+        if (t === "false") return false;
+        const n = Number(t);
+        if (!Number.isNaN(n)) return n;
+        return t;
+      });
+      const row: SqlRow = {};
+      cols.forEach((c, i) => { row[c] = vals[i] ?? null; });
+      return row;
+    }
+    if (statementType === "UPDATE") {
+      const m = sql.match(/UPDATE\s+[a-zA-Z_][a-zA-Z0-9_]*\s+SET\s+(.+?)\s+WHERE\s+(.+)$/i);
+      if (!m) return null;
+      const setPart = m[1]!;
+      const pairs: SqlRow = {};
+      for (const pair of setPart.split(",")) {
+        const [col, ...rest] = pair.split("=");
+        if (col) {
+          const val = rest.join("=").trim();
+          pairs[col.trim()] = val.replace(/^['"]|['"]$/g, "") || null;
+        }
+      }
+      return pairs;
+    }
+    return null;
   }
 
   private async executeSimulator(sql: string): Promise<ExecuteResult> {
@@ -3777,6 +3989,37 @@ export class WalrusSqlClient {
       };
     }
 
+    // TRUNCATE TABLE table_name
+    {
+      const truncateMatch = normalized.match(/^TRUNCATE\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+      if (truncateMatch) {
+        const table = truncateMatch[1]!.toUpperCase();
+        if (!this.tables.has(table)) {
+          throw sqlError("ERR_TABLE_NOT_FOUND", `table "${table}" not found`);
+        }
+        const bucket = this.requireWritableTableForDml(table);
+        const rowCount = bucket.length;
+        // Clear all rows from the table
+        bucket.length = 0;
+        // Clear secondary indexes
+        this.hashIndexes.delete(table);
+        this.hashIndexStats.delete(table);
+        this.btreeIndexes.delete(table);
+        this.btreeIndexStats.delete(table);
+        this.uniqueIndexes.delete(table);
+        this.uniqueGroupsCache.delete(table);
+        this.rowVersions.delete(table);
+        this.dirtyTables.add(table);
+        this.recordStorageWrite(table, "TRUNCATE_TABLE", rowCount, "simulator");
+        this.invalidateReadCacheOnWrite();
+        return {
+          txDigest: this.fakeDigest(normalized),
+          statementType: "TRUNCATE",
+          affectedRows: rowCount,
+        };
+      }
+    }
+
     if (upper.startsWith("ALTER TABLE")) {
       const table = this.extractTableName(normalized, /ALTER TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
       this.applyAlterTable(normalized);
@@ -3833,6 +4076,91 @@ export class WalrusSqlClient {
         statementType: "INSERT",
         affectedRows: 1,
       };
+    }
+
+    // MERGE INTO target USING source ON condition
+    //   WHEN MATCHED THEN UPDATE SET col=val,...
+    //   WHEN NOT MATCHED THEN INSERT (cols) VALUES (vals)
+    {
+      const mergeMatch = normalized.match(
+        /^MERGE\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+USING\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+(.+?)\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+(.+?)\s+WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s+\(([^)]+)\)\s+VALUES\s+\(([^)]+)\)$/i,
+      );
+      if (mergeMatch) {
+        const targetTable = mergeMatch[1]!.toUpperCase();
+        const sourceTable = mergeMatch[2]!.toUpperCase();
+        const onCondition = mergeMatch[3]!.trim();
+        const updateSetClause = mergeMatch[4]!.trim();
+        const insertColumns = mergeMatch[5]!.split(",").map((c) => c.trim());
+        const insertValues = mergeMatch[6]!.split(",").map((v) => v.trim());
+
+        this.assertTablePrivilege(targetTable, "UPDATE");
+        this.assertTablePrivilege(targetTable, "INSERT");
+        const targetBucket = this.requireWritableTableForDml(targetTable);
+        const sourceRows = this.requireTable(sourceTable);
+
+        // Parse ON condition to get join fields
+        const onParts = onCondition.match(/([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)/i);
+        if (!onParts) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", "MERGE ON condition must be field1 = field2");
+        }
+        const targetField = onParts[1]!.toUpperCase();
+        const sourceField = onParts[2]!.toUpperCase();
+
+        // Parse UPDATE SET clause: col1=val1, col2=val2
+        const updatePairs = updateSetClause.split(",").map((pair) => {
+          const [col, val] = pair.split("=").map((s) => s.trim());
+          return { col: col!.toUpperCase(), val: val! };
+        });
+
+        let matchedCount = 0;
+        let insertedCount = 0;
+
+        for (const sourceRow of sourceRows) {
+          const sourceKey = sourceRow[sourceField];
+          // Find matching target rows
+          const matchingTargets = targetBucket.filter((t) => t[targetField] === sourceKey);
+
+          if (matchingTargets.length > 0) {
+            // WHEN MATCHED - UPDATE
+            for (const targetRow of matchingTargets) {
+              for (const { col, val } of updatePairs) {
+                const evaluated = this.evalExpr(targetRow, val);
+                if (evaluated !== undefined) targetRow[col] = evaluated;
+              }
+              matchedCount++;
+            }
+          } else {
+            // WHEN NOT MATCHED - INSERT
+            const newRow: SqlRow = {};
+            for (let i = 0; i < insertColumns.length; i++) {
+              const evaluated = this.evalExpr(sourceRow, insertValues[i]!);
+              if (evaluated !== undefined) newRow[insertColumns[i]!] = evaluated;
+            }
+            const coerced = this.applySchemaOnWrite(targetTable, newRow, undefined, {});
+            this.evaluateCheckConstraints(targetTable, coerced);
+            targetBucket.push(coerced);
+            this.addRowToUniqueIndexes(targetTable, coerced);
+            if (!this.isDmlWriteStagingActive()) {
+              this.addRowToSecondaryIndexes(targetTable, coerced);
+              this.dirtyTables.add(targetTable);
+              this.applyImmediateRowVersion(targetTable, "INSERT", coerced);
+            }
+            insertedCount++;
+          }
+        }
+
+        if (!this.isDmlWriteStagingActive()) {
+          this.recordStorageWrite(targetTable, "UPDATE_ROW", matchedCount, "simulator");
+          this.recordStorageWrite(targetTable, "INSERT_ROW", insertedCount, "simulator");
+          this.invalidateReadCacheOnWrite();
+        }
+
+        return {
+          txDigest: this.fakeDigest(normalized),
+          statementType: "MERGE",
+          affectedRows: matchedCount + insertedCount,
+        };
+      }
     }
 
     if (upper.startsWith("UPDATE")) {
@@ -6625,6 +6953,15 @@ export class WalrusSqlClient {
 
   private parseSqlTypeSpec(rawType: string): ColumnTypeSpec {
     const t = rawType.trim().toUpperCase();
+
+    // Handle TIME WITH TIME ZONE and TIMESTAMP WITH TIME ZONE
+    if (/^TIME\s+WITH\s+TIME\s+ZONE$/i.test(t)) {
+      return { name: "TIME_TZ" as SqlTypeName };
+    }
+    if (/^TIMESTAMP\s+WITH\s+TIME\s+ZONE$/i.test(t)) {
+      return { name: "TIMESTAMP_TZ" as SqlTypeName };
+    }
+
     const m = t.match(/^([A-Z]+)(?:\((.+)\))?$/);
     if (!m) throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
 
@@ -11092,6 +11429,25 @@ export class WalrusSqlClient {
     if (/^TRUE$/i.test(expr)) return true;
     if (/^FALSE$/i.test(expr)) return false;
 
+    // Handle INTERVAL 'value' unit (e.g., INTERVAL '1' YEAR, INTERVAL '2' MONTH)
+    const intervalMatch = expr.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)$/i);
+    if (intervalMatch) {
+      // Store as object: { value: number, unit: string }
+      const value = Number(intervalMatch[1]);
+      const unit = intervalMatch[2]!.toUpperCase();
+      return { __interval__: true, value, unit } as unknown as SqlPrimitive;
+    }
+
+    // Handle expression COLLATE collation_name (e.g., name COLLATE NOCASE)
+    const collateMatch = expr.match(/^(.+?)\s+COLLATE\s+([A-Za-z_][A-Za-z0-9_]*)$/i);
+    if (collateMatch) {
+      const [, innerExpr, collation] = collateMatch;
+      const innerValue = this.evalExpr(row, innerExpr.trim());
+      if (innerValue === null || innerValue === undefined) return innerValue;
+      // Return a marker object that carries collation info
+      return { __collate__: true, value: innerValue, collation } as unknown as SqlPrimitive;
+    }
+
     // Handle aggregate functions: SUM(CASE WHEN...), COUNT(CASE WHEN...), etc.
     const aggMatch = expr.match(/^(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(.+)\s*\)\s*$/i);
     if (aggMatch) {
@@ -11114,9 +11470,9 @@ export class WalrusSqlClient {
     // Handle CASE WHEN in evalExpr with a smarter approach that matches balanced parens
     const caseWhenIdx = expr.search(/^CASE\b/i);
     if (caseWhenIdx === 0) {
-      // Find WHEN, THEN, ELSE, END positions accounting for nested parentheses
+      // Find WHEN, THEN, ELSE, END, OTHERS positions accounting for nested parentheses
       const upper = expr.toUpperCase();
-      let whenIdx = -1, thenIdx = -1, elseIdx = -1, endIdx = -1;
+      let whenIdx = -1, thenIdx = -1, elseIdx = -1, endIdx = -1, othersIdx = -1;
       let depth = 0;
       for (let i = 4; i < expr.length - 3; i++) { // skip "CASE"
         const ch = expr[i];
@@ -11126,6 +11482,7 @@ export class WalrusSqlClient {
           if (whenIdx < 0 && upper.startsWith("WHEN", i)) whenIdx = i;
           else if (whenIdx >= 0 && thenIdx < 0 && upper.startsWith("THEN", i)) thenIdx = i;
           else if (thenIdx >= 0 && elseIdx < 0 && upper.startsWith("ELSE", i)) elseIdx = i;
+          else if (thenIdx >= 0 && othersIdx < 0 && upper.startsWith("OTHERS", i)) othersIdx = i;
         }
       }
       // Find END (last 3 chars + space before)
@@ -11137,6 +11494,12 @@ export class WalrusSqlClient {
       }
       if (whenIdx > 0 && thenIdx > whenIdx && endIdx > thenIdx) {
         const condExpr = expr.substring(whenIdx + 4, thenIdx).trim();
+        // CASE WHEN OTHERS THEN ... END: OTHERS is like ELSE (always true)
+        if (othersIdx > thenIdx && othersIdx < endIdx) {
+          const thenExpr = expr.substring(thenIdx + 4, othersIdx).trim();
+          // WHEN OTHERS always matches
+          return this.evalExpr(row, thenExpr);
+        }
         if (elseIdx > thenIdx && endIdx > elseIdx) {
           const thenExpr = expr.substring(thenIdx + 4, elseIdx).trim();
           const elseExpr = expr.substring(elseIdx + 4, endIdx).trim();
@@ -11156,6 +11519,12 @@ export class WalrusSqlClient {
       const cond = this.evaluateWhereTree(row, this.parseWhereTree(caseMatch[1]!));
       if (cond === "TRUE") return this.evalExpr(row, caseMatch[2]!);
       return caseMatch[3] ? this.evalExpr(row, caseMatch[3]) : null;
+    }
+
+    // CASE WHEN OTHERS THEN ... END (OTHERS is always true, like ELSE)
+    const caseOthersMatch = expr.match(/^CASE\s+WHEN\s+OTHERS\s+THEN\s+(.+?)\s+END$/i);
+    if (caseOthersMatch) {
+      return this.evalExpr(row, caseOthersMatch[1]!);
     }
 
     const coalesceMatch = expr.match(/^COALESCE\((.+)\)$/i);
@@ -11404,8 +11773,29 @@ export class WalrusSqlClient {
     right: SqlPrimitive | undefined,
     sourceContext: string,
   ): [SqlTypedValue, SqlTypedValue] {
-    let leftTyped = fromStorage((left ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.left`);
-    let rightTyped = fromJs((right ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.right`);
+    // Handle COLLATE marker objects: { __collate__: true, value, collation }
+    const extractCollateValue = (v: SqlPrimitive | undefined): { value: SqlPrimitive | undefined; collation?: string } => {
+      if (v && typeof v === "object" && (v as Record<string, unknown>).__collate__ === true) {
+        const marker = v as { __collate__: true; value: SqlPrimitive; collation: string };
+        return { value: marker.value, collation: marker.collation };
+      }
+      return { value: v };
+    };
+
+    const leftExtracted = extractCollateValue(left);
+    const rightExtracted = extractCollateValue(right);
+
+    let leftTyped = fromStorage((leftExtracted.value ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.left`);
+    let rightTyped = fromJs((rightExtracted.value ?? null) as SqlPrimitive, undefined, {}, `${sourceContext}.right`);
+
+    // Apply collation if present
+    if (leftExtracted.collation) {
+      leftTyped = applyCollation(leftTyped, leftExtracted.collation);
+    }
+    if (rightExtracted.collation) {
+      rightTyped = applyCollation(rightTyped, rightExtracted.collation);
+    }
+
     if (leftTyped.value === null || rightTyped.value === null || leftTyped.type === rightTyped.type) {
       return [leftTyped, rightTyped];
     }
@@ -11798,12 +12188,13 @@ export class WalrusSqlClient {
   }
 
   private parseWindowFrameSpec(text: string): WindowFrameSpec | undefined {
-    const m = text.match(/^ROWS\s+BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+    const m = text.match(/^(GROUPS|RANGE|ROWS)\s+BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
     if (!m) return undefined;
-    const start = this.parseWindowFrameBoundSpec(m[1]!.trim());
-    const end = this.parseWindowFrameBoundSpec(m[2]!.trim());
+    const unit = m[1]!.toUpperCase() as "ROWS" | "GROUPS" | "RANGE";
+    const start = this.parseWindowFrameBoundSpec(m[2]!.trim());
+    const end = this.parseWindowFrameBoundSpec(m[3]!.trim());
     if (!start || !end) return undefined;
-    return { unit: "ROWS", start, end };
+    return { unit, start, end };
   }
 
   private parseWindowFrameBoundSpec(text: string): WindowFrameBoundSpec | undefined {
@@ -11815,6 +12206,15 @@ export class WalrusSqlClient {
     if (precedingMatch) return { kind: "offset_preceding", offset: parseInt(precedingMatch[1]!, 10) };
     const followingMatch = text.match(/^(\d+)\s+FOLLOWING$/i);
     if (followingMatch) return { kind: "offset_following", offset: parseInt(followingMatch[1]!, 10) };
+    // INTERVAL offset for RANGE: INTERVAL '1' DAY PRECEDING/FOLLOWING
+    const intervalPrecedingMatch = text.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\s+PRECEDING$/i);
+    if (intervalPrecedingMatch) {
+      return { kind: "offset_preceding_interval", value: Number(intervalPrecedingMatch[1]), unit: intervalPrecedingMatch[2]!.toUpperCase() };
+    }
+    const intervalFollowingMatch = text.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\s+FOLLOWING$/i);
+    if (intervalFollowingMatch) {
+      return { kind: "offset_following_interval", value: Number(intervalFollowingMatch[1]), unit: intervalFollowingMatch[2]!.toUpperCase() };
+    }
     return undefined;
   }
 

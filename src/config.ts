@@ -134,6 +134,129 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
     joinSpillChunkDefault,
   );
 
+  // ─── Phase 2: Batch Commit ─────────────────────────────────
+  const batchEnabled = pick(
+    overrides.batchCommit?.enabled,
+    env.WALRUS_SQL_BATCH_ENABLED !== undefined
+      ? parseBoolean(env.WALRUS_SQL_BATCH_ENABLED, true)
+      : undefined,
+    true,
+  );
+  const batchMaxDelayMs = pick(
+    overrides.batchCommit?.maxDelayMs,
+    env.WALRUS_SQL_BATCH_MAX_DELAY_MS !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_BATCH_MAX_DELAY_MS, 200)))
+      : undefined,
+    200,
+  );
+  const batchMaxOperations = pick(
+    overrides.batchCommit?.maxOperations,
+    env.WALRUS_SQL_BATCH_MAX_OPERATIONS !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_BATCH_MAX_OPERATIONS, 50)))
+      : undefined,
+    50,
+  );
+  const batchMaxRows = pick(
+    overrides.batchCommit?.maxBatchRows,
+    env.WALRUS_SQL_BATCH_MAX_ROWS !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_BATCH_MAX_ROWS, 5000)))
+      : undefined,
+    5000,
+  );
+
+  // ─── Phase 3: Optimistic Locking ───────────────────────────
+  const lockStrategy = pick(
+    overrides.optimisticLock?.strategy,
+    env.WALRUS_SQL_LOCK_STRATEGY !== undefined ? (env.WALRUS_SQL_LOCK_STRATEGY.toUpperCase() as "LAST_WRITE_WINS" | "FIRST_COMMIT_WINS" | "CLIENT_MERGE") : undefined,
+    "LAST_WRITE_WINS",
+  );
+  const lockMaxRetries = pick(
+    overrides.optimisticLock?.maxRetries,
+    env.WALRUS_SQL_LOCK_MAX_RETRIES !== undefined
+      ? Math.max(0, Math.floor(parseNumber(env.WALRUS_SQL_LOCK_MAX_RETRIES, 3)))
+      : undefined,
+    3,
+  );
+  const lockTimeoutMs = pick(
+    overrides.optimisticLock?.lockTimeoutMs,
+    env.WALRUS_SQL_LOCK_TIMEOUT_MS !== undefined
+      ? Math.max(0, Math.floor(parseNumber(env.WALRUS_SQL_LOCK_TIMEOUT_MS, 5000)))
+      : undefined,
+    5000,
+  );
+
+  // ─── Phase 4: Cost Config ─────────────────────────────────
+  const costPreference = pick(
+    overrides.costConfig?.preference,
+    env.WALRUS_SQL_COST_PREFERENCE !== undefined ? (env.WALRUS_SQL_COST_PREFERENCE.toLowerCase() as "realtime" | "cost" | "balanced") : undefined,
+    "balanced",
+  );
+  const maxCostScore = pick(
+    overrides.costConfig?.maxCostScore,
+    env.WALRUS_SQL_MAX_COST_SCORE !== undefined
+      ? Math.max(0, Math.min(100, Math.floor(parseNumber(env.WALRUS_SQL_MAX_COST_SCORE, 80))))
+      : undefined,
+    80,
+  );
+  const gasPriceUSD = pick(
+    overrides.costConfig?.gasPriceUSD,
+    env.WALRUS_SQL_GAS_PRICE_USD !== undefined
+      ? parseNumber(env.WALRUS_SQL_GAS_PRICE_USD, 0.001)
+      : undefined,
+    0.001,
+  );
+  const onCostExceeded = pick(
+    overrides.costConfig?.onCostExceeded,
+    env.WALRUS_SQL_ON_COST_EXCEEDED !== undefined ? (env.WALRUS_SQL_ON_COST_EXCEEDED.toLowerCase() as "throw" | "warn" | "proceed") : undefined,
+    "warn",
+  );
+  const gasPerRead = pick(
+    overrides.costConfig?.gasPerRead,
+    env.WALRUS_SQL_GAS_PER_READ !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_GAS_PER_READ, 10)))
+      : undefined,
+    10,
+  );
+  const gasPerWrite = pick(
+    overrides.costConfig?.gasPerWrite,
+    env.WALRUS_SQL_GAS_PER_WRITE !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_GAS_PER_WRITE, 50)))
+      : undefined,
+    50,
+  );
+
+  // ─── Phase 1: Paged Storage ────────────────────────────────
+  const pagedPageSize = pick(
+    overrides.pagedStorage?.pageSize,
+    env.WALRUS_SQL_PAGE_SIZE !== undefined
+      ? Math.max(10, Math.floor(parseNumber(env.WALRUS_SQL_PAGE_SIZE, 500)))
+      : undefined,
+    500,
+  );
+
+  // ─── Read Cache Extended ────────────────────────────────────
+  const cacheEvictionPolicy = pick(
+    overrides.readCache?.evictionPolicy,
+    env.WALRUS_SQL_CACHE_EVICTION !== undefined
+      ? (env.WALRUS_SQL_CACHE_EVICTION.toUpperCase() as "LRU" | "LFU")
+      : undefined,
+    "LRU",
+  );
+  const cacheMaxMemoryMb = pick(
+    overrides.readCache?.maxMemoryMb,
+    env.WALRUS_SQL_CACHE_MAX_MEMORY_MB !== undefined
+      ? Math.max(1, Math.floor(parseNumber(env.WALRUS_SQL_CACHE_MAX_MEMORY_MB, 64)))
+      : undefined,
+    64,
+  );
+  const cacheStaleRevalidate = pick(
+    overrides.readCache?.staleWhileRevalidate,
+    env.WALRUS_SQL_CACHE_STALE_REVALIDATE !== undefined
+      ? parseBoolean(env.WALRUS_SQL_CACHE_STALE_REVALIDATE, false)
+      : undefined,
+    false,
+  );
+
   return {
     packageId,
     network,
@@ -147,6 +270,9 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
       enabled: readCacheEnabled,
       maxEntries: readCacheMaxEntries,
       ttlMs: readCacheTtlMs,
+      evictionPolicy: cacheEvictionPolicy,
+      maxMemoryMb: cacheMaxMemoryMb,
+      staleWhileRevalidate: cacheStaleRevalidate,
     },
     walrusRetry: {
       maxAttempts: retryMaxAttempts,
@@ -160,6 +286,30 @@ export function loadWalrusSqlClientOptions(options?: LoadClientConfigOptions): W
     joinExecution: {
       memoryBudgetRows: joinMemoryBudgetRows,
       spillChunkRows: joinSpillChunkRows,
+    },
+    batchCommit: {
+      enabled: batchEnabled,
+      maxDelayMs: batchMaxDelayMs,
+      maxOperations: batchMaxOperations,
+      maxBatchRows: batchMaxRows,
+    },
+    optimisticLock: {
+      enabled: true,
+      strategy: lockStrategy,
+      maxRetries: lockMaxRetries,
+      lockTimeoutMs,
+    },
+    costConfig: {
+      maxCostScore,
+      preference: costPreference,
+      gasPriceUSD,
+      onCostExceeded,
+      gasPerRead,
+      gasPerWrite,
+    },
+    pagedStorage: {
+      enabled: false,
+      pageSize: pagedPageSize,
     },
   };
 }

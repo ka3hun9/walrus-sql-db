@@ -607,12 +607,14 @@ function parseWindowOverDefinition(rawOver: string): WindowFunctionAst["over"] {
 
 function parseWindowFrame(text: string): WindowFrameAst | undefined {
   const trimmed = text.trim();
-  const m = trimmed.match(/^ROWS\s+BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
+  // Match GROUPS, RANGE, or ROWS between start and end bounds
+  const m = trimmed.match(/^(GROUPS|RANGE|ROWS)\s+BETWEEN\s+(.+)\s+AND\s+(.+)$/i);
   if (!m) return undefined;
-  const startBound = parseWindowFrameBound(m[1]!.trim());
-  const endBound = parseWindowFrameBound(m[2]!.trim());
+  const unit = m[1]!.toUpperCase() as "ROWS" | "GROUPS" | "RANGE";
+  const startBound = parseWindowFrameBound(m[2]!.trim());
+  const endBound = parseWindowFrameBound(m[3]!.trim());
   if (!startBound || !endBound) return undefined;
-  return { unit: "ROWS", start: startBound, end: endBound };
+  return { unit, start: startBound, end: endBound };
 }
 
 function parseWindowFrameBound(text: string): WindowFrameBound | undefined {
@@ -624,6 +626,15 @@ function parseWindowFrameBound(text: string): WindowFrameBound | undefined {
   if (precedingMatch) return { kind: "offset_preceding", offset: parseInt(precedingMatch[1]!, 10) };
   const followingMatch = text.match(/^(\d+)\s+FOLLOWING$/i);
   if (followingMatch) return { kind: "offset_following", offset: parseInt(followingMatch[1]!, 10) };
+  // INTERVAL offset for RANGE: INTERVAL '1' DAY PRECEDING/FOLLOWING
+  const intervalPrecedingMatch = text.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\s+PRECEDING$/i);
+  if (intervalPrecedingMatch) {
+    return { kind: "offset_preceding_interval", value: Number(intervalPrecedingMatch[1]), unit: intervalPrecedingMatch[2]!.toUpperCase() };
+  }
+  const intervalFollowingMatch = text.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\s+FOLLOWING$/i);
+  if (intervalFollowingMatch) {
+    return { kind: "offset_following_interval", value: Number(intervalFollowingMatch[1]), unit: intervalFollowingMatch[2]!.toUpperCase() };
+  }
   return undefined;
 }
 
@@ -736,6 +747,27 @@ function parseJoin(tail: string): { join?: JoinAst; rest: string } {
 }
 
 function parseFromRef(base: string): { from: TableRefAst; tail: string } | null {
+  // LATERAL subquery: SELECT ... FROM t1, LATERAL (SELECT ...) AS alias
+  const lateralSub = base.match(/^SELECT\s+(.+?)\s+FROM\s+LATERAL\s+\((SELECT\s+.+)\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  if (lateralSub) {
+    const outerFields = lateralSub[1]!.trim();
+    const subquerySql = lateralSub[2]!.trim();
+    const alias = lateralSub[3]!.trim();
+    const tail = lateralSub[4] ?? "";
+    const rewrittenSql = `SELECT ${outerFields} FROM __DERIVED_TABLE__${tail}`;
+    return {
+      from: {
+        kind: "subquery",
+        subquerySql,
+        alias,
+        rewrittenSql,
+        lateral: true,
+      },
+      tail,
+    };
+  }
+
+  // Non-LATERAL subquery: SELECT ... FROM (SELECT ...) AS alias
   const sub = base.match(/^SELECT\s+(.+?)\s+FROM\s*\((SELECT\s+.+)\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
   if (sub) {
     const outerFields = sub[1]!.trim();

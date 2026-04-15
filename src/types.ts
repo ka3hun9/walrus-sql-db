@@ -13,11 +13,14 @@ export const SQL_RUNTIME_TYPE_CANONICAL_NAMES = [
   "DATE",
   "TIME",
   "TIMESTAMP",
+  "TIME_TZ",
+  "TIMESTAMP_TZ",
   "BOOLEAN",
   "BLOB",
   "TEXT",
   "STRING",
   "U64",
+  "INTERVAL",
 ] as const;
 
 export type SqlRuntimeTypeName = (typeof SQL_RUNTIME_TYPE_CANONICAL_NAMES)[number];
@@ -66,11 +69,14 @@ export const SqlRuntimeType = {
   DATE: "DATE",
   TIME: "TIME",
   TIMESTAMP: "TIMESTAMP",
+  TIME_TZ: "TIME_TZ",
+  TIMESTAMP_TZ: "TIMESTAMP_TZ",
   BOOLEAN: "BOOLEAN",
   BLOB: "BLOB",
   TEXT: "TEXT",
   STRING: "STRING",
   U64: "U64",
+  INTERVAL: "INTERVAL",
 } as const satisfies Record<string, SqlRuntimeTypeName>;
 
 export const SQL_RUNTIME_TYPE_ALIASES: Readonly<Record<string, SqlRuntimeTypeName>> = {
@@ -148,6 +154,11 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
     acceptsParameters: false,
     metadata: { format: "HH:MM:SS" },
   },
+  TIME_TZ: {
+    family: "TEMPORAL",
+    acceptsParameters: false,
+    metadata: { format: "HH:MM:SS[Z|±HH:MM]", hasTimeZone: true },
+  },
   TIMESTAMP: {
     family: "TEMPORAL",
     acceptsParameters: false,
@@ -155,6 +166,16 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
       hasTimeZone: true,
       format: "YYYY-MM-DD[ T]HH:MM:SS[Z|±HH:MM]",
       timezonePolicy: "assume-utc-if-absent normalize-to-utc",
+      serializationFormat: "YYYY-MM-DDTHH:MM:SSZ",
+    },
+  },
+  TIMESTAMP_TZ: {
+    family: "TEMPORAL",
+    acceptsParameters: false,
+    metadata: {
+      hasTimeZone: true,
+      format: "YYYY-MM-DD[ T]HH:MM:SS[Z|±HH:MM]",
+      timezonePolicy: "store-with-timezone",
       serializationFormat: "YYYY-MM-DDTHH:MM:SSZ",
     },
   },
@@ -172,6 +193,11 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
     family: "CHARACTER",
     acceptsParameters: false,
     metadata: { encoding: "utf8" },
+  },
+  INTERVAL: {
+    family: "TEMPORAL",
+    acceptsParameters: false,
+    metadata: { format: "INTERVAL [YEAR|MONTH|DAY|HOUR|MINUTE|SECOND]" },
   },
   STRING: {
     family: "CHARACTER",
@@ -361,6 +387,8 @@ export interface SqlTypedValueMetadata {
   runtimeType: SqlRuntimeTypeModel;
   source: SqlTypedValueSource;
   sourceContext?: string;
+  /** Collate name applied via COLLATE clause, e.g. "NOCASE", "BINARY", "utf8_general_ci" */
+  collation?: string;
 }
 
 export interface SqlTypedValue {
@@ -859,8 +887,14 @@ function compareNonNullTypedValue(left: SqlTypedValue, right: SqlTypedValue): nu
   if (isTextualType(leftType) && isTextualType(rightType)) {
     const lv = left.value as string;
     const rv = right.value as string;
-    if (lv === rv) return 0;
-    return lv < rv ? -1 : 1;
+    // COLLATE NOCASE = case-insensitive comparison; default/BINARY = case-sensitive
+    const leftCollation = left.metadata.collation?.toUpperCase();
+    const rightCollation = right.metadata.collation?.toUpperCase();
+    const isNoCase = leftCollation === "NOCASE" || rightCollation === "NOCASE";
+    const leftCompare = isNoCase ? lv.toLowerCase() : lv;
+    const rightCompare = isNoCase ? rv.toLowerCase() : rv;
+    if (leftCompare === rightCompare) return 0;
+    return leftCompare < rightCompare ? -1 : 1;
   }
 
   throw new TypeError(`incompatible typed comparison: ${leftType} vs ${rightType}`);
@@ -869,6 +903,19 @@ function compareNonNullTypedValue(left: SqlTypedValue, right: SqlTypedValue): nu
 function compareTypedValuesInternal(left: SqlTypedValue, right: SqlTypedValue): number | null {
   if (left.value === null || right.value === null) return null;
   return compareNonNullTypedValue(left, right);
+}
+
+/** Apply a COLLATE clause to a typed value, returning a new SqlTypedValue with collation metadata */
+export function applyCollation(tv: SqlTypedValue, collation: string): SqlTypedValue {
+  const collationNorm = collation.toUpperCase();
+  const newMetadata: SqlTypedValueMetadata = {
+    ...tv.metadata,
+    collation: collationNorm,
+  };
+  return Object.freeze({
+    ...tv,
+    metadata: Object.freeze(newMetadata),
+  });
 }
 
 export function typedValueEq(left: SqlTypedValue, right: SqlTypedValue): SqlThreeValuedLogic {
@@ -1054,7 +1101,7 @@ export type SessionTransactionState = "idle" | "active" | "committing" | "aborte
 
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
+  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "MERGE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
   affectedRows?: number;
   /** For INSERT/UPDATE/DELETE with RETURNING clause */
   returningRows?: SqlRow[];
@@ -1088,7 +1135,11 @@ export type StorageWriteOperation =
   | "INSERT_ROW"
   | "UPDATE_ROW"
   | "DELETE_ROW"
-  | "INDEX_REBUILD";
+  | "TRUNCATE_TABLE"
+  | "INDEX_REBUILD"
+  | "PAGE_INSERT"
+  | "PAGE_DELETE"
+  | "PAGE_UPDATE";
 
 export interface StorageWriteEvent {
   table: string;
@@ -1363,6 +1414,12 @@ export interface WalrusSqlClientOptions {
     enabled?: boolean;
     maxEntries?: number;
     ttlMs?: number;
+    /** Eviction policy: LRU (default) or LFU */
+    evictionPolicy?: "LRU" | "LFU";
+    /** Max memory budget in MB for cached page data */
+    maxMemoryMb?: number;
+    /** Serve stale cache while revalidating in background */
+    staleWhileRevalidate?: boolean;
   };
   walrusRetry?: {
     maxAttempts?: number;
@@ -1386,4 +1443,49 @@ export interface WalrusSqlClientOptions {
     spillChunkRows?: number;
   };
   viewPolicy?: WalrusSqlViewPolicyOptions;
+  /** ─── Phase 2: Batch Commit ─────────────────────────────── */
+  batchCommit?: {
+    /** Enable batched on-chain commits */
+    enabled?: boolean;
+    /** Max wait time (ms) before flushing a batch */
+    maxDelayMs?: number;
+    /** Max number of operations per batch */
+    maxOperations?: number;
+    /** Max rows affected per batch */
+    maxBatchRows?: number;
+  };
+  /** ─── Phase 3: Optimistic Locking ─────────────────────── */
+  optimisticLock?: {
+    /** Enable optimistic lock conflict detection */
+    enabled?: boolean;
+    /** Conflict resolution strategy */
+    strategy?: "LAST_WRITE_WINS" | "FIRST_COMMIT_WINS" | "CLIENT_MERGE";
+    /** Max retry attempts on conflict (0 = fail fast) */
+    maxRetries?: number;
+    /** Lock timeout in ms */
+    lockTimeoutMs?: number;
+  };
+  /** ─── Phase 4: Cost-Based Query Planning ──────────────── */
+  costConfig?: {
+    /** Max cost score (0-100) before blocking or warning */
+    maxCostScore?: number;
+    /** Query planning preference */
+    preference?: "realtime" | "cost" | "balanced";
+    /** Manual gas price in USD (overrides RPC poll) */
+    gasPriceUSD?: number;
+    /** Behavior when cost exceeds maxCostScore */
+    onCostExceeded?: "throw" | "warn" | "proceed";
+    /** Estimated gas price per operation (for cost scoring) */
+    gasPerRead?: number;
+    gasPerWrite?: number;
+    /** Estimated Sui/gas price poll interval in ms */
+    gasPricePollIntervalMs?: number;
+  };
+  /** ─── Paged Storage (Phase 1) ────────────────────────── */
+  pagedStorage?: {
+    /** Rows per page when splitting large tables (default 500) */
+    pageSize?: number;
+    /** Enable paged storage on-chain writes */
+    enabled?: boolean;
+  };
 }

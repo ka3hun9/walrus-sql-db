@@ -12,3 +12,7 @@ export * from "./sql-executor.js";
 export * from "./config.js";
 export * from "./logger.js";
 export * from "./client.js";
+export * from "./walrus-storage.js";
+export * from "./walrus-batch.js";
+export * from "./walrus-optimistic-lock.js";
+export * from "./walrus-cost.js";

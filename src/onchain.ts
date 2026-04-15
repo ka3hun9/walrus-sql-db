@@ -21,6 +21,142 @@ export type OnchainExecutor = (req: MoveCallRequest) => Promise<OnchainExecution
 
 const lastCommitHashByTable = new Map<string, string>();
 
+// ─── Paged Storage Support ───────────────────────────────────────────────────
+
+/** Page-based version tracking per table */
+interface PageVersionChain {
+  /** table → current head page hash */
+  headPageHash: string;
+  /** table → version hash of latest manifest snapshot */
+  manifestVersion: string;
+  /** table → array of page hashes in order */
+  pageChain: string[];
+}
+
+const pagedVersionChain: PageVersionChain = {
+  headPageHash: "GENESIS",
+  manifestVersion: "GENESIS",
+  pageChain: [],
+};
+
+export interface PagedMoveCallRequest extends MoveCallRequest {
+  pageIndex?: number;
+  objectId?: string;
+  pageData?: string;
+  manifest?: object;
+}
+
+export interface PageCommitPayload {
+  v: 3;
+  table: string;
+  op: "PAGE_INSERT" | "PAGE_DELETE" | "PAGE_UPDATE";
+  pageIndex: number;
+  objectId: string;
+  rows: Record<string, unknown>[];
+  previousHeadHash: string;
+  previousManifestVersion: string;
+  previousPageHash: string | null;
+  ts: number;
+}
+
+/**
+ * Build a paged (content-addressable) MoveCall that splits large tables
+ * into multiple objects, each identified by its content hash.
+ *
+ * Benefits:
+ * - Avoids oversized single objects (>1MB typical Sui/Walrus limit)
+ * - Enables content-addressed versioning (Git-like history)
+ * - Each page can be cached independently
+ * - Parallel reads of independent pages
+ */
+export function buildPagedMoveCall(params: {
+  packageId: string;
+  moduleName?: string;
+  table: string;
+  pageIndex: number;
+  rows: Record<string, unknown>[];
+  operation: "PAGE_INSERT" | "PAGE_DELETE" | "PAGE_UPDATE";
+}): PagedMoveCallRequest {
+  const moduleName = params.moduleName ?? "walrus_sql";
+  const { table, pageIndex, rows, operation } = params;
+
+  const pageData = JSON.stringify({ table, pageIndex, rows });
+  const objectId = hashHex(pageData);
+
+  // Get previous versions from chain
+  const previousHeadHash = lastCommitHashByTable.get(table) ?? "GENESIS";
+
+  const payloadBase: PageCommitPayload = {
+    v: 3,
+    table,
+    op: operation,
+    pageIndex,
+    objectId,
+    rows,
+    previousHeadHash,
+    previousManifestVersion: pagedVersionChain.manifestVersion,
+    previousPageHash: pagedVersionChain.pageChain[pagedVersionChain.pageChain.length - 1] ?? null,
+    ts: Date.now(),
+  };
+
+  const currentCommitHash = hashHex(JSON.stringify(payloadBase));
+  const payload = JSON.stringify({ ...payloadBase, currentCommitHash });
+
+  // Update paged version chain
+  lastCommitHashByTable.set(table, currentCommitHash);
+  pagedVersionChain.headPageHash = currentCommitHash;
+  pagedVersionChain.manifestVersion = hashHex(
+    JSON.stringify({
+      table,
+      manifestVersion: payloadBase.previousManifestVersion,
+      newPageHash: objectId,
+    }),
+  );
+  pagedVersionChain.pageChain.push(objectId);
+
+  return {
+    target: `${params.packageId}::${moduleName}::paged_${operation.toLowerCase()}`,
+    arguments: [objectId, payload, hashHex(`index:${table}:page:${pageIndex}`)],
+    tableName: table,
+    pageIndex,
+    objectId,
+    pageData: payload,
+    statementType: operationToStatementType(operation),
+  };
+}
+
+/**
+ * Get version history of a table — returns all past version hashes.
+ * Useful for read-repair, conflict detection, and history queries.
+ */
+export function getTableVersionHistory(table: string): {
+  headHash: string;
+  manifestVersion: string;
+  pageChain: string[];
+} {
+  const headHash = lastCommitHashByTable.get(table) ?? "GENESIS";
+  return {
+    headHash,
+    manifestVersion: pagedVersionChain.manifestVersion,
+    pageChain: [...pagedVersionChain.pageChain],
+  };
+}
+
+/** Reset version tracking for a table (used in tests or fresh state) */
+export function resetTableVersion(table: string): void {
+  lastCommitHashByTable.delete(table);
+  pagedVersionChain.pageChain = pagedVersionChain.pageChain.filter((p) => !p.startsWith(table));
+  pagedVersionChain.manifestVersion = hashHex(
+    JSON.stringify({ reset: table, at: Date.now() }),
+  );
+}
+
+function operationToStatementType(op: "PAGE_INSERT" | "PAGE_DELETE" | "PAGE_UPDATE"): OnchainStatementType {
+  if (op === "PAGE_INSERT") return "INSERT";
+  if (op === "PAGE_DELETE") return "DELETE";
+  return "UPDATE";
+}
+
 export function buildMoveCall(params: {
   packageId: string;
   moduleName?: string;
