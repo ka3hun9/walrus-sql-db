@@ -283,6 +283,7 @@ type ParsedSelect = {
   aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT";
   aggregateField?: string;
   aggregateFilter?: ExprAst;
+  aggregateSeparator?: string; // For GROUP_CONCAT custom separator
   groupBy?: string[];
   having?: string;
   join?: {
@@ -331,6 +332,7 @@ type LogicalSelectPlan = {
   aggregate?: ParsedSelect["aggregate"];
   aggregateField?: string;
   aggregateFilter?: ExprAst;
+  aggregateSeparator?: string;
   orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
   limit?: number;
   offset?: number;
@@ -4947,6 +4949,7 @@ export class WalrusSqlClient {
       aggregate: parsed.aggregate,
       aggregateField: parsed.aggregateField,
       aggregateFilter: parsed.aggregateFilter,
+      aggregateSeparator: parsed.aggregateSeparator,
       orderByList,
       limit: parsed.limit,
       offset: parsed.offset,
@@ -6747,7 +6750,7 @@ export class WalrusSqlClient {
         : baseRows;
 
       if (logicalPlan.groupBy?.length) {
-        const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField, logicalPlan.aggregateFilter);
+        const grouped = this.groupRows(filtered, logicalPlan.groupBy, logicalPlan.aggregate, logicalPlan.aggregateField, logicalPlan.aggregateFilter, logicalPlan.aggregateSeparator);
         const havingRows = parsed.havingAst
           ? grouped.filter((row) => this.evaluateWhereAst(row, parsed.havingAst!, parsed.having) === "TRUE")
           : logicalPlan.having
@@ -6775,7 +6778,7 @@ export class WalrusSqlClient {
 
       if (logicalPlan.aggregate) {
         const aggregateResult = this.buildQueryResult(normalizedSql, [
-          this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField, logicalPlan.aggregateFilter),
+          this.computeAggregateRow(filtered, logicalPlan.aggregate, logicalPlan.aggregateField, logicalPlan.aggregateFilter, logicalPlan.aggregateSeparator),
         ]);
         this.recordSelectPlanFeedback(planStabilityKey, parsed, selectPlan, aggregateResult.rows.length, bucket.length);
         this.recordSelectExecutionPipelineStats(
@@ -10299,11 +10302,14 @@ export class WalrusSqlClient {
     let aggregateField = aggregateItem?.expr.kind === "function"
       ? (this.exprAstToSql(aggregateItem.expr.args[0]) ?? "*")
       : fallbackAggregateField;
+    let aggregateSeparator: string | undefined;
     if (aggregate === "GROUP_CONCAT" && aggregateItem?.expr.kind === "function" && aggregateItem.expr.args.length >= 2) {
       const secondArg = aggregateItem.expr.args[1]!;
       if (secondArg.kind === "literal") {
         // args[1] is separator literal — use args[0] as the field
         aggregateField = this.exprAstToSql(aggregateItem.expr.args[0]) ?? "val";
+        // Extract separator value from literal
+        aggregateSeparator = String(secondArg.typedValue.value);
       }
     }
     const aggregateFilter =
@@ -10345,6 +10351,7 @@ export class WalrusSqlClient {
       aggregate,
       aggregateField,
       aggregateFilter,
+      aggregateSeparator,
       groupBy,
       having,
       join: ast.join
@@ -10632,6 +10639,7 @@ export class WalrusSqlClient {
     );
     const aggregate = aggregateMatch?.[1]?.toUpperCase() as ParsedSelect["aggregate"] | undefined;
     const aggregateField = aggregateMatch?.[2];
+    const aggregateSeparator = undefined; // Not supported in regex path
 
     const whereClauses = where ? this.tryParseWhere(where) : [];
     const whereTree = where ? this.parseWhereTree(where) : undefined;
@@ -10667,6 +10675,7 @@ export class WalrusSqlClient {
         orderByList,
         aggregate,
         aggregateField,
+        aggregateSeparator,
         groupBy,
         having,
         join,
@@ -13058,6 +13067,7 @@ export class WalrusSqlClient {
     aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
     aggregateField?: string,
     aggregateFilter?: ExprAst,
+    aggregateSeparator?: string,
   ): SqlRow[] {
     const buckets = new Map<string, SqlRow[]>();
 
@@ -13074,7 +13084,7 @@ export class WalrusSqlClient {
       for (const g of groupBy) row[g] = bucketRows[0]?.[g] ?? null;
 
       if (aggregate) {
-        Object.assign(row, this.computeAggregateRow(bucketRows, aggregate, aggregateField, aggregateFilter));
+        Object.assign(row, this.computeAggregateRow(bucketRows, aggregate, aggregateField, aggregateFilter, aggregateSeparator));
       }
 
       out.push(row);
@@ -13088,6 +13098,7 @@ export class WalrusSqlClient {
     aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
     aggregateField?: string,
     aggregateFilter?: ExprAst,
+    aggregateSeparator?: string,
   ): SqlRow {
     // Apply FILTER (WHERE ...) clause if present
     const filteredRows = aggregateFilter
@@ -13169,11 +13180,12 @@ export class WalrusSqlClient {
     }
 
     if (aggregate === "GROUP_CONCAT") {
-      // GROUP_CONCAT: concatenate all non-null values with ','
+      // GROUP_CONCAT: concatenate all non-null values with separator (default ',')
+      const separator = aggregateSeparator ?? ", ";
       const concatValues = filteredRows
         .map((r) => isSimpleField ? r[aggregateField!] : this.evalExpr(r, aggregateField!))
         .filter((v) => v !== null && v !== undefined);
-      const concatenated = concatValues.map((v) => String(v)).join(", ");
+      const concatenated = concatValues.map((v) => String(v)).join(separator);
       return { group_concat: concatenated };
     }
 
