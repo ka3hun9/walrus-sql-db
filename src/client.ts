@@ -12225,8 +12225,12 @@ export class WalrusSqlClient {
   }
 
   private evaluateWhereAst(row: SqlRow, expr: ExprAst, fallbackSql?: string): TruthValue {
-    // prefer semantic 3VL evaluator for non-raw AST
-    if (expr.kind !== "raw") return evalPredicate3VL(expr, row, "strict");
+    // Subquery expression kinds need the fallback path since they require SQL execution
+    const subqueryKinds = ["exists", "in_subquery", "scalar_subquery", "any_subquery"] as const;
+    if (!subqueryKinds.includes(expr.kind as any)) {
+      // prefer semantic 3VL evaluator for non-raw AST
+      if (expr.kind !== "raw") return evalPredicate3VL(expr, row, "strict");
+    }
 
     const sql = (fallbackSql && fallbackSql.trim()) || this.exprAstToSql(expr);
     if (!sql) return "UNKNOWN";

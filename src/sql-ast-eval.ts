@@ -66,6 +66,14 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
     case "unary":
       if (expr.op.toUpperCase() === "NOT") return `NOT (${exprAstToSql(expr.expr)})`;
       return `${expr.op}${exprAstToSql(expr.expr)}`;
+    case "exists":
+      return `${expr.negated ? "NOT " : ""}EXISTS (${expr.subquerySql})`;
+    case "in_subquery":
+      return `${exprAstToSql(expr.expr) ?? ""} ${expr.negated ? "NOT IN" : "IN"} (${expr.subquerySql})`;
+    case "scalar_subquery":
+      return `(${expr.subquerySql})`;
+    case "any_subquery":
+      return `${exprAstToSql(expr.left) ?? ""} ${expr.op} ${expr.quantifier} (${expr.subquerySql})`;
     case "raw":
       return expr.text;
     default:
