@@ -16,6 +16,7 @@ import {
   typedValueOperators,
 } from "./types.js";
 import type { OnchainQueryExecutor, OnchainQueryRequest, QueryResult, SerializedTypedValue, SqlPrimitive, SqlRow, SqlTypedValue } from "./types.js";
+import { evaluateScalarFunctionPrimitive, SCALAR_FUNCTIONS_PRIMITIVE } from "./functions/mod.js";
 
 type Payload =
   | {
@@ -319,6 +320,58 @@ function castValue(raw: string): SqlPrimitive {
   return v;
 }
 
+/**
+ * Parse a function call expression like "FUNC(a, b, c)" or "FUNC(a, F2(b))".
+ * Returns { name, args } where args is an array of argument strings (not evaluated).
+ * Returns null if expr is not a valid function call (no matching parens, etc.)
+ */
+function parseFunctionCall(expr: string): { name: string; args: string[] } | null {
+  const trimmed = expr.trim();
+  const openParen = trimmed.indexOf("(");
+  if (openParen <= 0) return null;
+  const name = trimmed.slice(0, openParen);
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/i.test(name)) return null;
+  // Find the matching closing paren
+  let depth = 0;
+  let closeParen = -1;
+  for (let i = openParen; i < trimmed.length; i++) {
+    const ch = trimmed[i]!;
+    if (ch === "(") depth++;
+    else if (ch === ")") {
+      depth--;
+      if (depth === 0) { closeParen = i; break; }
+    }
+  }
+  if (closeParen === -1) return null;
+  const inner = trimmed.slice(openParen + 1, closeParen);
+  // Parse arguments with depth-aware split
+  const args: string[] = [];
+  let buf = "";
+  let quote = "";
+  for (const ch of inner) {
+    if ((ch === "'" || ch === '"') && !quote) {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+    if (ch === quote) {
+      quote = "";
+      buf += ch;
+      continue;
+    }
+    if (ch === "," && !quote && depth === 0) {
+      args.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    if (ch === "(") { depth++; }
+    else if (ch === ")") { depth--; }
+    buf += ch;
+  }
+  if (buf.trim() || args.length > 0) args.push(buf.trim());
+  return { name, args };
+}
+
 function smartSplit(input: string): string[] {
   const out: string[] = [];
   let buf = "";
@@ -474,68 +527,20 @@ function evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
     return evalExpr(row, branch);
   }
 
-  const coalesceMatch = expr.match(/^COALESCE\((.+)\)$/i);
-  if (coalesceMatch) {
-    for (const p of smartSplit(coalesceMatch[1]!)) {
-      const v = evalExpr(row, p);
-      if (v !== null && v !== undefined) return v;
-    }
-    return null;
-  }
-
-  const nullifMatch = expr.match(/^NULLIF\((.+),(.+)\)$/i);
-  if (nullifMatch) {
-    const a = evalExpr(row, nullifMatch[1]!);
-    const b = evalExpr(row, nullifMatch[2]!);
-    return typedEquals(a, b, "replay.expr.nullif") === true ? null : a;
-  }
-
-  let castValueExpr: string | undefined;
-  let castTypeExpr: string | undefined;
-
-  const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+([A-Z]+)\)$/i);
-  if (castAsMatch) {
-    castValueExpr = castAsMatch[1]!;
-    castTypeExpr = castAsMatch[2]!;
-  } else {
-    const castFnMatch = expr.match(/^CAST\((.+)\)$/i);
-    if (castFnMatch) {
-      const parts = smartSplit(castFnMatch[1]!);
-      if (parts.length === 2) {
-        castValueExpr = parts[0]!;
-        castTypeExpr = trimQuoted(parts[1]!.trim());
-      }
-    }
-  }
-
-  if (castValueExpr && castTypeExpr) {
-    const v = evalExpr(row, castValueExpr);
-    const normalizedTarget = normalizeRuntimeTypeName(castTypeExpr);
-    if (!normalizedTarget || normalizedTarget === "NULL") {
-      throw new Error(`ERR_TYPE_CONSTRAINT: unsupported CAST target: ${castTypeExpr}`);
-    }
-    if (v == null) return null;
-    let castSource: SqlPrimitive = v;
-    if (
-      typeof castSource === "number"
-      && Number.isFinite(castSource)
-      && (normalizedTarget === "SMALLINT"
-        || normalizedTarget === "INT"
-        || normalizedTarget === "BIGINT"
-        || normalizedTarget === "U64")
-    ) {
-      castSource = Math.trunc(castSource);
-    }
-    return convertTypedValue(fromJs(castSource, undefined, {}, `replay.cast.source:${castValueExpr}`), normalizedTarget, {
-      mode: "explicit",
-      sourceContext: `replay.cast.target:${normalizedTarget}`,
-    }).value;
-  }
-
   if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return row[expr] as SqlPrimitive | undefined;
 
   const lit = castValue(expr);
   if (expr.startsWith("'") || expr.startsWith('"') || typeof lit !== "string") return lit;
+
+  // Try function registry before tokenizing (handles all registered functions)
+  const fnCall = parseFunctionCall(expr);
+  if (fnCall) {
+    const fnName = fnCall.name.toUpperCase();
+    if (SCALAR_FUNCTIONS_PRIMITIVE[fnName]) {
+      const args = fnCall.args.map((arg) => evalExpr(row, arg)).filter((a): a is SqlPrimitive => a !== undefined);
+      return evaluateScalarFunctionPrimitive(fnName, args, { row });
+    }
+  }
 
   const toks = tokenizeExpr(expr);
   if (!toks.length) return null;
@@ -568,7 +573,7 @@ function tokenizeExpr(expr: string): string[] {
       buf = "";
       continue;
     }
-    if ("()+-*/%".includes(ch)) {
+    if ("()+-*/%~".includes(ch)) {
       if (buf.trim()) out.push(buf.trim());
       out.push(ch);
       buf = "";
@@ -583,7 +588,7 @@ function tokenizeExpr(expr: string): string[] {
 function toRpn(tokens: string[]): string[] {
   const out: string[] = [];
   const ops: string[] = [];
-  const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "u-": 3 };
+  const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "u-": 3, "u~": 3 };
 
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i]!;
@@ -596,10 +601,10 @@ function toRpn(tokens: string[]): string[] {
       ops.pop();
       continue;
     }
-    if (["+", "-", "*", "/", "%"].includes(t)) {
+    if (["+", "-", "*", "/", "%", "~"].includes(t)) {
       const prev = tokens[i - 1];
-      const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%"].includes(prev!));
-      const op = unary ? "u-" : t;
+      const unary = (t === "-" || t === "~") && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%", "~"].includes(prev!));
+      const op = unary ? `u${t}` : t;
       while (ops.length && pri[ops[ops.length - 1]!] >= pri[op]) out.push(ops.pop()!);
       ops.push(op);
       continue;
@@ -620,6 +625,15 @@ function evalRpn(row: SqlRow, rpn: string[]): SqlPrimitive | undefined {
       else {
         const n = Number(a);
         st.push(Number.isFinite(n) ? -n : null);
+      }
+      continue;
+    }
+    if (t === "u~") {
+      const a = st.pop();
+      if (a == null) st.push(null);
+      else {
+        const n = Number(a);
+        st.push(Number.isFinite(n) ? ~n : null);
       }
       continue;
     }
@@ -1017,7 +1031,7 @@ function applyPage(rows: SqlRow[], offset?: number, limit?: number): SqlRow[] {
 
 function computeAggregateRow(
   rows: SqlRow[],
-  aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+  aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
   aggregateField?: string,
 ): SqlRow {
   if (aggregate === "COUNT") {
@@ -1077,6 +1091,24 @@ function computeAggregateRow(
     return { min: state.value as SqlPrimitive };
   }
 
+  if (aggregate === "TOTAL") {
+    // TOTAL: like SUM but returns 0.0 for empty set instead of null
+    if (!typedNums.length) return { total: 0.0 };
+    let total = 0;
+    for (const typed of typedNums) {
+      total += typeof typed.value === "number" ? typed.value : Number(typed.value) || 0;
+    }
+    return { total };
+  }
+
+  if (aggregate === "GROUP_CONCAT") {
+    const concatValues = rows
+      .map((r) => r[aggregateField!])
+      .filter((v) => v !== null && v !== undefined);
+    const concatenated = concatValues.map((v) => String(v)).join(", ");
+    return { group_concat: concatenated };
+  }
+
   if (!typedNums.length) return { max: null };
   let state = typedNums[0]!;
   for (let i = 1; i < typedNums.length; i++) {
@@ -1089,7 +1121,7 @@ function computeAggregateRow(
 function groupRows(
   rows: SqlRow[],
   groupBy: string[],
-  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
   aggregateField?: string,
 ): SqlRow[] {
   const buckets = new Map<string, SqlRow[]>();

@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .cache/
+.claude/
 contracts/walrus_sql/build/
 contracts/walrus_sql/Move.lock
 contracts/walrus_sql/Published.toml

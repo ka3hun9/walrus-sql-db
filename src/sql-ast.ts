@@ -19,6 +19,12 @@ export type SqlAstStatement =
   | DropIndexStatementAst
   | CreateViewStatementAst
   | DropViewStatementAst
+  | InsertStatementAst
+  | UpdateStatementAst
+  | DeleteStatementAst
+  | TruncateTableStatementAst
+  | AlterTableStatementAst
+  | CreateTableStatementAst
   | UnknownStatementAst;
 
 export type UnknownStatementAst = {
@@ -158,6 +164,54 @@ export type SelectStatementAst = {
   rawSql: string;
 };
 
+export type InsertStatementAst = {
+  kind: "insert";
+  tableName: string;
+  columns?: string[];
+  values: ExprAst[][];  // multiple value rows
+  selectSql?: string;   // INSERT ... SELECT form
+  rawSql: string;
+};
+
+export type UpdateStatementAst = {
+  kind: "update";
+  tableName: string;
+  tableAlias?: string;
+  setClause: Array<{ column: string; value: ExprAst }>;
+  where?: ExprAst;
+  join?: JoinAst;
+  rawSql: string;
+};
+
+export type DeleteStatementAst = {
+  kind: "delete";
+  tableName: string;
+  tableAlias?: string;
+  using?: string;
+  where?: ExprAst;
+  join?: JoinAst;
+  rawSql: string;
+};
+
+export type TruncateTableStatementAst = {
+  kind: "truncate_table";
+  tableName: string;
+  rawSql: string;
+};
+
+export type CreateTableStatementAst = {
+  kind: "create_table";
+  tableName: string;
+  rawSql: string;
+};
+
+export type AlterTableStatementAst = {
+  kind: "alter_table";
+  tableName: string;
+  action: string;
+  rawSql: string;
+};
+
 export type TableRefAst =
   | {
       kind: "table";
@@ -171,6 +225,8 @@ export type TableRefAst =
       rewrittenSql: string;
       /** True for LATERAL subqueries */
       lateral?: boolean;
+      /** Preserved outer SELECT items (for scalar subqueries) */
+      outerSelectItems?: SelectItemAst[];
     };
 
 export type JoinAst = {

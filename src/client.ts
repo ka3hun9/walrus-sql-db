@@ -41,6 +41,7 @@ import type {
 import { buildMoveCall, buildPagedMoveCall, getTableVersionHistory, PagedMoveCallRequest } from "./onchain.js";
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
+import { SCALAR_FUNCTIONS_PRIMITIVE, evaluateScalarFunctionPrimitive, WINDOW_FUNCTIONS } from "./functions/mod.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import { WalrusBatchCommitter, buildBatchMoveCallPayload, type BatchableDmlOp } from "./walrus-batch.js";
 import { OptimisticLockManager, type OptimisticLockOptions, OptimisticConflictError, threeWayMerge, buildRowVersionHash } from "./walrus-optimistic-lock.js";
@@ -62,6 +63,11 @@ import type {
   RollbackToSavepointStatementAst,
   ReleaseSavepointStatementAst,
   WindowFrameAst,
+  InsertStatementAst,
+  UpdateStatementAst,
+  DeleteStatementAst,
+  TruncateTableStatementAst,
+  AlterTableStatementAst,
 } from "./sql-ast.js";
 import { normalizeSql } from "./sql-executor.js";
 import { ClientErrorCodeEnum, ConstraintViolationKindEnum, sqlError, constraintError, type ClientErrorCode } from "./engine-errors.js";
@@ -233,7 +239,32 @@ type OffsetWindowFunctionSpec = {
   frame?: WindowFrameSpec;
 };
 
-type ParsedWindowFunctionSpec = RankingWindowFunctionSpec | OffsetWindowFunctionSpec;
+type ValueWindowFunctionSpec = {
+  kind: "value";
+  name: "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE";
+  alias: string;
+  partitionBy: string[];
+  orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  expr: string;
+  nth?: number; // NTH_VALUE only
+  frame?: WindowFrameSpec;
+};
+
+type DistributionWindowFunctionSpec = {
+  kind: "distribution";
+  name: "NTILE" | "PERCENT_RANK" | "CUME_DIST";
+  alias: string;
+  partitionBy: string[];
+  orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  buckets?: number; // NTILE only
+  frame?: WindowFrameSpec;
+};
+
+type ParsedWindowFunctionSpec =
+  | RankingWindowFunctionSpec
+  | OffsetWindowFunctionSpec
+  | ValueWindowFunctionSpec
+  | DistributionWindowFunctionSpec;
 
 type ParsedSelect = {
   explain: boolean;
@@ -249,7 +280,7 @@ type ParsedSelect = {
   orderBy?: string;
   orderDirection?: "ASC" | "DESC";
   orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
-  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT";
   aggregateField?: string;
   aggregateFilter?: ExprAst;
   groupBy?: string[];
@@ -2924,18 +2955,31 @@ export class WalrusSqlClient {
         return result;
       }
 
-      // Handle savepoint statements
-      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
-      if (ast.kind === "savepoint") {
-        this.executeSavepoint(ast.name);
+      // Handle savepoint statements (parsed successfully above)
+      let astForRouting: ReturnType<typeof parseSqlToAst> | undefined;
+      try {
+        astForRouting = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      } catch (err) {
+        // DML (INSERT/UPDATE/DELETE/etc.) — parseSqlToAst now handles these via AST,
+        // but falls through to executeSimulator for backward-compatibility routing.
+        // Non-DML parse errors should still propagate.
+        if (err instanceof SqlEngineError && err.code === "SQL_DIALECT_UNSUPPORTED_SYNTAX") {
+          // Fall through to executeSimulator which uses AST routing internally
+        } else {
+          throw err;
+        }
+      }
+
+      if (astForRouting?.kind === "savepoint") {
+        this.executeSavepoint(astForRouting.name);
         return { txDigest: this.fakeDigest(normalized), statementType: "SAVEPOINT", affectedRows: 0 };
       }
-      if (ast.kind === "rollback_to_savepoint") {
-        this.executeRollbackToSavepoint(ast.name);
+      if (astForRouting?.kind === "rollback_to_savepoint") {
+        this.executeRollbackToSavepoint(astForRouting.name);
         return { txDigest: this.fakeDigest(normalized), statementType: "ROLLBACK", affectedRows: 0 };
       }
-      if (ast.kind === "release_savepoint") {
-        this.executeReleaseSavepoint(ast.name);
+      if (astForRouting?.kind === "release_savepoint") {
+        this.executeReleaseSavepoint(astForRouting.name);
         return { txDigest: this.fakeDigest(normalized), statementType: "RELEASE", affectedRows: 0 };
       }
 
@@ -2960,7 +3004,7 @@ export class WalrusSqlClient {
           }
         } else {
           try {
-            result = await this.executeSimulator(sql);
+            result = await this.executeSimulator(sql, astForRouting);
           } catch (err) {
             this.transitionTransactionToAbortedOnError(normalized);
             throw err;
@@ -3757,9 +3801,35 @@ export class WalrusSqlClient {
     return null;
   }
 
-  private async executeSimulator(sql: string): Promise<ExecuteResult> {
+  private async executeSimulator(sql: string, ast?: SqlAstStatement): Promise<ExecuteResult> {
     const normalized = sql.trim().replace(/\s+/g, " ");
     const upper = normalized.toUpperCase();
+
+    // AST-driven dispatch for pre-parsed statements
+    if (ast) {
+      switch (ast.kind) {
+        case "insert":
+          return this.executeInsertStatement(ast);
+        case "update":
+          return this.executeUpdateStatement(ast);
+        case "delete":
+          return this.executeDeleteStatement(ast);
+        case "truncate_table":
+          return this.executeTruncateTable(ast);
+        case "alter_table":
+          return this.executeAlterTable(ast);
+        case "create_table":
+        case "create_schema":
+        case "create_function":
+        case "create_trigger":
+        case "create_index":
+        case "drop_index":
+        case "create_view":
+        case "drop_view":
+          // Fall through to string-matching handlers below
+          break;
+      }
+    }
 
     // SET TRANSACTION ISOLATION LEVEL
     const setTxnMatch = upper.match(/^SET\s+TRANSACTION\s+ISOLATION\s+LEVEL\s+(SERIALIZABLE|REPEATABLE\s+READ|READ\s+COMMITTED)$/i);
@@ -6433,7 +6503,39 @@ export class WalrusSqlClient {
         }
 
     if (ast.kind === "select" && ast.from.kind === "subquery") {
-      const { subquerySql, alias, rewrittenSql } = ast.from;
+      const { subquerySql, alias, rewrittenSql, outerSelectItems } = ast.from;
+
+      // Scalar-only SELECT (e.g., SELECT COALESCE(NULL, 'fallback')): the parser wraps
+      // it as subquery with subquerySql="SELECT __scalar__ FROM __scalar__" and alias="__scalar__".
+      // We must materialize the scalar expression BEFORE calling query(subquerySql), otherwise
+      // query() would recursively try to parse and materialize the scalar, causing infinite recursion.
+      if (subquerySql === "SELECT __scalar__ FROM __scalar__" && alias === "__scalar__") {
+        // Extract scalar expression from ast.rawSql (e.g., "SELECT COALESCE(NULL,'fallback') AS result" -> "COALESCE(NULL,'fallback') AS result")
+        const rawExpr = ast.rawSql.replace(/^\s*SELECT\s+/i, "").trim();
+        const scalarRows: SqlRow[] = [];
+        if (ast.selectItems.length > 0) {
+          const outRow: SqlRow = {};
+          for (const item of ast.selectItems) {
+            if (item.kind === "select_item" && item.alias) {
+              // exprStr is the scalar expression string (possibly with AS alias)
+              let exprStr = rawExpr;
+              // Strip trailing " AS <alias>" where <alias> is item.alias
+              const suffix = ` AS ${item.alias}`;
+              if (exprStr.toUpperCase().endsWith(suffix.toUpperCase())) {
+                exprStr = exprStr.slice(0, -suffix.length).trim();
+              }
+              // Store under the item's alias so the outer query (SELECT <alias>) finds it
+              outRow[item.alias] = this.evalExpr({}, exprStr) ?? null;
+              // Also store under __scalar__ key so the inner query (SELECT __scalar__ FROM __scalar__) finds it
+              outRow["__scalar__"] = outRow[item.alias];
+            }
+          }
+          if (Object.keys(outRow).length > 0) scalarRows.push(outRow);
+        }
+        if (scalarRows.length === 0) scalarRows.push({});
+        this.tables.set("__scalar__", scalarRows);
+      }
+
       const inner = await this.query(subquerySql);
       const tempTable = `__derived_${randomUUID().replace(/-/g, "")}`;
       const materialized = inner.rows.map((r) => {
@@ -6444,7 +6546,21 @@ export class WalrusSqlClient {
 
       this.tables.set(tempTable, materialized);
       try {
-        const result = await this.query(rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable));
+        // If outerSelectItems are preserved (scalar subquery case), build the outer SQL
+        // using the original outer select items instead of the subquery's normalized items.
+        let outerSql: string;
+        if (outerSelectItems && outerSelectItems.length > 0) {
+          const selectClause = outerSelectItems
+            .map((item) => {
+              const exprText = this.exprAstToSql(item.expr) ?? "";
+              return item.alias ? `${exprText} AS ${item.alias}` : exprText;
+            })
+            .join(", ");
+          outerSql = `SELECT ${selectClause} FROM ${tempTable}`;
+        } else {
+          outerSql = rewrittenSql.replace(/__DERIVED_TABLE__/g, tempTable);
+        }
+        const result = await this.query(outerSql);
         return this.buildQueryResult(normalizedSql, result.rows);
       } finally {
         this.tables.delete(tempTable);
@@ -8834,6 +8950,177 @@ export class WalrusSqlClient {
     return entry.name;
   }
 
+  // ---------------------------------------------------------------------------
+  // AST-driven DML executors (Phase 3: wired from executeSimulator dispatch)
+  // ---------------------------------------------------------------------------
+
+  private executeInsertStatement(ast: InsertStatementAst): ExecuteResult {
+    const table = ast.tableName;
+    this.assertUpdatableViewDeferred("INSERT", table, "target");
+    this.assertTablePrivilege(table, "INSERT");
+    const bucket = this.requireWritableTableForDml(table);
+
+    // When INSERT has no column list, use actual table column names in order
+    const tableSchema = this.schemas.get(table);
+    const tableColumns = tableSchema?.columns.map((c) => c.name) ?? [];
+
+    for (const rowExprs of ast.values) {
+      const row: SqlRow = {};
+      for (let i = 0; i < rowExprs.length; i++) {
+        const colName = ast.columns?.[i] ?? tableColumns[i];
+        if (!colName) continue; // Skip extra values beyond column count
+        const valSql = exprAstToSql(rowExprs[i]) ?? "NULL";
+        const evaluated = this.evalExpr({}, valSql);
+        row[colName] = evaluated ?? null;
+      }
+      let coerced = this.applySchemaOnWrite(table, row, undefined, {});
+      coerced = this.fireBeforeTriggers(table, "INSERT", coerced);
+      this.evaluateCheckConstraints(table, coerced);
+      bucket.push(coerced);
+      this.addRowToUniqueIndexes(table, coerced);
+      if (this.isDmlWriteStagingActive()) {
+        this.recordTransactionLogWrite(table, "INSERT", coerced, null, coerced);
+        this.bumpTableWriteStats(table, { insertRows: 1 });
+      } else {
+        this.addRowToSecondaryIndexes(table, coerced);
+        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
+        this.dirtyTables.add(table);
+        this.applyImmediateRowVersion(table, "INSERT", coerced);
+        this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
+        this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
+      this.fireAfterTriggers(table, "INSERT", coerced);
+    }
+
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "INSERT",
+      affectedRows: ast.values.length,
+    };
+  }
+
+  private executeUpdateStatement(ast: UpdateStatementAst): ExecuteResult {
+    const table = ast.tableName;
+    this.assertUpdatableViewDeferred("UPDATE", table, "target");
+    this.assertTablePrivilege(table, "UPDATE");
+    const bucket = this.requireWritableTableForDml(table);
+
+    // Evaluate WHERE expression against each row
+    const whereSql = ast.where ? exprAstToSql(ast.where) : "1 = 1";
+    const whereTree = this.parseWhereTree(whereSql ?? "1 = 1");
+    let touched = 0;
+
+    for (const row of bucket) {
+      if (this.evaluateWhereTree(row, whereTree) !== "TRUE") continue;
+      const setRow = { ...row };
+      for (const { column, value } of ast.setClause) {
+        const valSql = exprAstToSql(value) ?? "NULL";
+        setRow[column.toUpperCase()] = this.evalExpr(setRow, valSql) ?? null;
+      }
+      const coerced = this.applySchemaOnWrite(table, setRow, undefined, {});
+      this.fireBeforeTriggers(table, "UPDATE", coerced);
+      Object.assign(row, coerced);
+      this.addRowToUniqueIndexes(table, coerced);
+      if (!this.isDmlWriteStagingActive()) {
+        this.addRowToSecondaryIndexes(table, coerced);
+        this.dirtyTables.add(table);
+      }
+      this.fireAfterTriggers(table, "UPDATE", coerced);
+      touched++;
+    }
+
+    if (touched > 0) this.invalidateReadCacheOnWrite();
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "UPDATE",
+      affectedRows: touched,
+    };
+  }
+
+  private executeDeleteStatement(ast: DeleteStatementAst): ExecuteResult {
+    const table = ast.tableName;
+    this.assertUpdatableViewDeferred("DELETE", table, "target");
+    this.assertTablePrivilege(table, "DELETE");
+    const bucket = this.requireWritableTableForDml(table);
+
+    const whereSql = ast.where ? exprAstToSql(ast.where) : "1 = 1";
+    const whereTree = this.parseWhereTree(whereSql ?? "1 = 1");
+    const matchedRows: SqlRow[] = [];
+
+    for (const row of bucket) {
+      if (this.evaluateWhereTree(row, whereTree) === "TRUE") matchedRows.push(row);
+    }
+
+    for (const row of matchedRows) {
+      this.fireBeforeTriggers(table, "DELETE", row);
+    }
+
+    const deleteCounts = new Map<string, number>();
+    for (const row of matchedRows) {
+      const idx = bucket.indexOf(row);
+      if (idx >= 0) bucket.splice(idx, 1);
+      const count = deleteCounts.get(table) ?? 0;
+      deleteCounts.set(table, count + 1);
+    }
+
+    for (const row of matchedRows) {
+      this.fireAfterTriggers(table, "DELETE", row);
+    }
+
+    const touched = [...deleteCounts.values()].reduce((s, c) => s + c, 0);
+    for (const [t, count] of deleteCounts.entries()) {
+      if (count > 0) this.dirtyTables.add(t);
+      if (count > 0) this.recordImmutableOptimizerStatsVersionObject(t, { confirmationStatus: "confirmed" });
+      if (count > 0) this.recordStorageWrite(t, "DELETE_ROW", count, "simulator");
+    }
+    if (touched > 0) this.invalidateReadCacheOnWrite();
+
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "DELETE",
+      affectedRows: touched,
+    };
+  }
+
+  private executeTruncateTable(ast: { tableName: string; rawSql: string }): ExecuteResult {
+    const table = ast.tableName;
+    if (!this.tables.has(table)) {
+      throw sqlError("ERR_TABLE_NOT_FOUND", `table "${table}" not found`);
+    }
+    const bucket = this.requireWritableTableForDml(table);
+    const rowCount = bucket.length;
+    bucket.length = 0;
+    this.hashIndexes.delete(table);
+    this.hashIndexStats.delete(table);
+    this.btreeIndexes.delete(table);
+    this.btreeIndexStats.delete(table);
+    this.uniqueIndexes.delete(table);
+    this.uniqueGroupsCache.delete(table);
+    this.rowVersions.delete(table);
+    this.dirtyTables.add(table);
+    this.recordStorageWrite(table, "TRUNCATE_TABLE", rowCount, "simulator");
+    this.invalidateReadCacheOnWrite();
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "TRUNCATE",
+      affectedRows: rowCount,
+    };
+  }
+
+  private executeAlterTable(ast: AlterTableStatementAst): ExecuteResult {
+    const table = ast.tableName;
+    this.applyAlterTable(ast.rawSql);
+    this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
+    this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+    this.invalidateReadCacheOnWrite();
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "UPDATE",
+      affectedRows: 0,
+    };
+  }
+
   private rebuildSecondaryIndexesForTable(table: string): void {
     this.rebuildHashIndexesForTable(table);
     this.rebuildBtreeIndexesForTable(table);
@@ -9809,8 +10096,7 @@ export class WalrusSqlClient {
   }
 
   private isSupportedWindowFunctionName(name: string): name is SupportedWindowFunctionName {
-    const upper = name.toUpperCase();
-    return upper === "ROW_NUMBER" || upper === "RANK" || upper === "DENSE_RANK" || upper === "LAG" || upper === "LEAD";
+    return WINDOW_FUNCTIONS[name.toUpperCase()] !== undefined;
   }
 
   private isRankingWindowFunction(name: string): name is RankingWindowFunctionName {
@@ -9821,6 +10107,16 @@ export class WalrusSqlClient {
   private isOffsetWindowFunction(name: string): name is OffsetWindowFunctionName {
     const upper = name.toUpperCase();
     return upper === "LAG" || upper === "LEAD";
+  }
+
+  private isValueWindowFunction(name: string): name is "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" {
+    const upper = name.toUpperCase();
+    return upper === "FIRST_VALUE" || upper === "LAST_VALUE" || upper === "NTH_VALUE";
+  }
+
+  private isDistributionWindowFunction(name: string): name is "NTILE" | "PERCENT_RANK" | "CUME_DIST" {
+    const upper = name.toUpperCase();
+    return upper === "NTILE" || upper === "PERCENT_RANK" || upper === "CUME_DIST";
   }
 
   private defaultWindowAlias(name: SupportedWindowFunctionName): string {
@@ -9868,6 +10164,46 @@ export class WalrusSqlClient {
         offset: isNaN(offset) ? 1 : offset,
         frame,
       } as OffsetWindowFunctionSpec;
+    }
+
+    if (this.isValueWindowFunction(name)) {
+      // FIRST_VALUE/LAST_VALUE: args are (expr [, ignore_nulls])
+      // NTH_VALUE: args are (expr, n)
+      const expr = window.args[0] ? this.exprAstToSql(window.args[0]) ?? "" : "";
+      let nth: number | undefined;
+      if (name === "NTH_VALUE" && window.args.length >= 2) {
+        const nVal = this.astLiteralToValue(window.args[1]);
+        nth = typeof nVal === "number" ? Math.floor(nVal) : undefined;
+      }
+      return {
+        kind: "value",
+        name: name as "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE",
+        alias: explicitAlias?.trim() || this.defaultWindowAlias(name),
+        partitionBy,
+        orderBy,
+        expr,
+        nth,
+        frame,
+      } as ValueWindowFunctionSpec;
+    }
+
+    if (this.isDistributionWindowFunction(name)) {
+      // NTILE: args are (num_buckets)
+      // PERCENT_RANK, CUME_DIST: no args
+      let buckets: number | undefined;
+      if (name === "NTILE" && window.args.length >= 1) {
+        const nVal = this.astLiteralToValue(window.args[0]);
+        buckets = typeof nVal === "number" ? Math.floor(nVal) : undefined;
+      }
+      return {
+        kind: "distribution",
+        name: name as "NTILE" | "PERCENT_RANK" | "CUME_DIST",
+        alias: explicitAlias?.trim() || this.defaultWindowAlias(name),
+        partitionBy,
+        orderBy,
+        buckets,
+        frame,
+      } as DistributionWindowFunctionSpec;
     }
 
     // ROW_NUMBER, RANK, DENSE_RANK take no args
@@ -9924,17 +10260,19 @@ export class WalrusSqlClient {
     });
 
     const normalizedFieldTexts = ast.selectItems.map((it, idx) => {
-      if (it.alias) return it.alias;
-      if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name)) {
+      if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name)) {
+        // Always use canonical aggregate name, even when aliased
+        // The aggregate computation returns canonical keys (count/sum/avg/etc.)
         return it.expr.name.toLowerCase();
       }
+      if (it.alias) return it.alias;
       const windowAlias = windowAliasByItemIndex.get(idx);
       if (windowAlias) return windowAlias;
       return this.exprAstToSql(it.expr) ?? "";
     });
 
     const aggregateItem = ast.selectItems.find(
-      (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX"].includes(it.expr.name),
+      (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name),
     );
 
     // Fallback: also detect aggregate functions with CASE WHEN or complex args that are parsed as raw
@@ -9943,7 +10281,7 @@ export class WalrusSqlClient {
     if (!aggregateItem) {
       for (const it of ast.selectItems) {
         if (it.expr.kind === "raw") {
-          const m = it.expr.text.match(/^(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(.+)\s*\)\s*$/i);
+          const m = it.expr.text.match(/^(COUNT|SUM|AVG|MIN|MAX|TOTAL|GROUP_CONCAT)\s*\(\s*(.+)\s*\)\s*$/i);
           if (m) {
             fallbackAggregate = m[1]!.toUpperCase() as ParsedSelect["aggregate"];
             fallbackAggregateField = m[2]!.trim();
@@ -9956,9 +10294,18 @@ export class WalrusSqlClient {
     const aggregate = aggregateItem?.expr.kind === "function"
       ? (aggregateItem.expr.name as ParsedSelect["aggregate"])
       : fallbackAggregate;
-    const aggregateField = aggregateItem?.expr.kind === "function"
+    // For GROUP_CONCAT with 2 args, args[1] is the separator literal, not the field
+    // Only use args[1] as aggregateField if it's NOT a literal (i.e., it's an expression to evaluate)
+    let aggregateField = aggregateItem?.expr.kind === "function"
       ? (this.exprAstToSql(aggregateItem.expr.args[0]) ?? "*")
       : fallbackAggregateField;
+    if (aggregate === "GROUP_CONCAT" && aggregateItem?.expr.kind === "function" && aggregateItem.expr.args.length >= 2) {
+      const secondArg = aggregateItem.expr.args[1]!;
+      if (secondArg.kind === "literal") {
+        // args[1] is separator literal — use args[0] as the field
+        aggregateField = this.exprAstToSql(aggregateItem.expr.args[0]) ?? "val";
+      }
+    }
     const aggregateFilter =
       aggregateItem?.expr.kind === "function" ? aggregateItem.expr.filter : undefined;
 
@@ -11449,12 +11796,37 @@ export class WalrusSqlClient {
     }
 
     // Handle aggregate functions: SUM(CASE WHEN...), COUNT(CASE WHEN...), etc.
-    const aggMatch = expr.match(/^(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(.+)\s*\)\s*$/i);
+    const aggMatch = expr.match(/^(COUNT|SUM|AVG|MIN|MAX|TOTAL|GROUP_CONCAT)\s*\(\s*(.+)\s*\)\s*$/i);
     if (aggMatch) {
-      const [, aggFn, argExpr] = aggMatch;
-      const fnUpper = aggFn.toUpperCase() as "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
-      const evaluatedArg = this.evalExpr(row, argExpr.trim());
-      // Apply aggregate: COUNT counts non-null, SUM/AVG/MIN/MAX need numeric
+      const [, aggFn, rest] = aggMatch;
+      const fnUpper = aggFn.toUpperCase() as "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT";
+      // GROUP_CONCAT has optional SEPARATOR: GROUP_CONCAT(expr, SEPARATOR ',')
+      if (fnUpper === "GROUP_CONCAT") {
+        const sepMatch = rest.match(/^(.+?)\s*,\s*SEPARATOR\s+(.+)$/i);
+        let argExpr: string;
+        let separator = ", ";
+        if (sepMatch) {
+          argExpr = sepMatch[1]!.trim();
+          separator = sepMatch[2]!.trim().replace(/^['"]|['"]$/g, "");
+        } else {
+          argExpr = rest.trim();
+        }
+        const evaluatedArg = this.evalExpr(row, argExpr);
+        if (evaluatedArg === null || evaluatedArg === undefined) return "";
+        return String(evaluatedArg);
+      }
+      // TOTAL: returns 0.0 for null/empty (unlike SUM which returns null)
+      if (fnUpper === "TOTAL") {
+        if (rest.trim().toUpperCase() === "*") return 0.0;
+        const evaluatedArg = this.evalExpr(row, rest.trim());
+        if (evaluatedArg === null || evaluatedArg === undefined) return 0.0;
+        const num = typeof evaluatedArg === "number" ? evaluatedArg : Number(evaluatedArg);
+        if (Number.isNaN(num)) return 0.0;
+        return num;
+      }
+      // COUNT(*)
+      if (fnUpper === "COUNT" && rest.trim() === "*") return 1;
+      const evaluatedArg = this.evalExpr(row, rest.trim());
       if (fnUpper === "COUNT") {
         return evaluatedArg !== null && evaluatedArg !== undefined ? 1 : 0;
       }
@@ -11527,83 +11899,26 @@ export class WalrusSqlClient {
       return this.evalExpr(row, caseOthersMatch[1]!);
     }
 
-    const coalesceMatch = expr.match(/^COALESCE\((.+)\)$/i);
-    if (coalesceMatch) {
-      for (const p of this.smartSplit(coalesceMatch[1]!)) {
-        const v = this.evalExpr(row, p);
-        if (v !== null && v !== undefined) return v;
-      }
-      return null;
-    }
-
-    const nullifMatch = expr.match(/^NULLIF\((.+),(.+)\)$/i);
-    if (nullifMatch) {
-      const a = this.evalExpr(row, nullifMatch[1]!);
-      const b = this.evalExpr(row, nullifMatch[2]!);
-      const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(a, b, "expr.nullif");
-      const eq = typedValueComparator.eq(leftTyped, rightTyped);
-      return eq === true ? null : a;
-    }
-
-    let castValueExpr: string | undefined;
-    let castTypeExpr: string | undefined;
-
-    const castAsMatch = expr.match(/^CAST\((.+)\s+AS\s+([A-Z]+)\)$/i);
-    if (castAsMatch) {
-      castValueExpr = castAsMatch[1]!;
-      castTypeExpr = castAsMatch[2]!;
-    } else {
-      const castFnMatch = expr.match(/^CAST\((.+)\)$/i);
-      if (castFnMatch) {
-        const parts = this.smartSplit(castFnMatch[1]!);
-        if (parts.length === 2) {
-          castValueExpr = parts[0]!;
-          castTypeExpr = this.trimQuoted(parts[1]!.trim());
-        }
-      }
-    }
-
-    if (castValueExpr && castTypeExpr) {
-      const v = this.evalExpr(row, castValueExpr);
-      const normalizedTarget = normalizeRuntimeTypeName(castTypeExpr);
-      if (!normalizedTarget || normalizedTarget === "NULL") {
-        throw sqlError("ERR_TYPE_CONSTRAINT", `unsupported CAST target: ${castTypeExpr}`);
-      }
-      if (v === null || v === undefined) return null;
-      try {
-        let castSource: SqlPrimitive = v;
-        if (
-          typeof castSource === "number"
-          && Number.isFinite(castSource)
-          && (normalizedTarget === "SMALLINT"
-            || normalizedTarget === "INT"
-            || normalizedTarget === "BIGINT"
-            || normalizedTarget === "U64")
-        ) {
-          castSource = Math.trunc(castSource);
-        }
-        const casted = convertTypedValue(
-          fromJs(castSource, undefined, {}, `expr.cast.source:${castValueExpr}`),
-          normalizedTarget,
-          {
-            mode: "explicit",
-            sourceContext: `expr.cast.target:${normalizedTarget}`,
-          },
-        );
-        return casted.value;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/CAST .* not allowed/i.test(msg)) {
-          throw sqlError("ERR_TYPE_CONSTRAINT", msg);
-        }
-        throw sqlError("ERR_TYPE_CONSTRAINT", `invalid CAST to ${normalizedTarget}: ${String(v)}`);
-      }
-    }
-
     if (/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(expr)) return this.resolveRowValue(row, expr);
 
     const lit = this.castValue(expr);
     if (expr.startsWith("'") || expr.startsWith('"') || typeof lit !== "string") return lit;
+
+    // Handle CAST(expr AS type) — special case: parseFunctionCall gives args as single
+    // string "expr AS type", so we need to handle this specially before the general dispatch
+    if (/^CAST\s*\(/i.test(expr)) {
+      return this.evalExprCast(row, expr);
+    }
+
+    // Try function registry before tokenizing (handles all registered functions)
+    const fnCall = this.parseFunctionCall(expr);
+    if (fnCall) {
+      const fnName = fnCall.name.toUpperCase();
+      if (SCALAR_FUNCTIONS_PRIMITIVE[fnName]) {
+        const args = fnCall.args.map((arg: string) => this.evalExpr(row, arg)).filter((a): a is SqlPrimitive => a !== undefined);
+        return evaluateScalarFunctionPrimitive(fnName, args, { row });
+      }
+    }
 
     const toks = this.tokenizeExpr(expr);
     if (toks.length === 0) return null;
@@ -12249,6 +12564,49 @@ export class WalrusSqlClient {
       } as OffsetWindowFunctionSpec;
     }
 
+    if (this.isValueWindowFunction(name)) {
+      // FIRST_VALUE/LAST_VALUE: (expr [, ignore_nulls])
+      // NTH_VALUE: (expr, n)
+      const argsStr = m[2]!.trim();
+      const args = argsStr ? argsStr.split(",").map((a) => a.trim()) : [];
+      const expr = args[0] ?? "";
+      let nth: number | undefined;
+      if (name === "NTH_VALUE" && args.length >= 2) {
+        const nVal = this.parseLiteralValue(args[1]);
+        nth = typeof nVal === "number" ? Math.floor(nVal) : undefined;
+      }
+      return {
+        kind: "value",
+        name: name as "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE",
+        alias,
+        partitionBy: over.partitionBy,
+        orderBy: over.orderBy,
+        expr,
+        nth,
+        frame: over.frame,
+      } as ValueWindowFunctionSpec;
+    }
+
+    if (this.isDistributionWindowFunction(name)) {
+      // NTILE: (num_buckets)
+      // PERCENT_RANK, CUME_DIST: no args
+      const argsStr = m[2]!.trim();
+      let buckets: number | undefined;
+      if (name === "NTILE" && argsStr) {
+        const nVal = this.parseLiteralValue(argsStr);
+        buckets = typeof nVal === "number" ? Math.floor(nVal) : undefined;
+      }
+      return {
+        kind: "distribution",
+        name: name as "NTILE" | "PERCENT_RANK" | "CUME_DIST",
+        alias,
+        partitionBy: over.partitionBy,
+        orderBy: over.orderBy,
+        buckets,
+        frame: over.frame,
+      } as DistributionWindowFunctionSpec;
+    }
+
     // ROW_NUMBER, RANK, DENSE_RANK take no args
     const argsStr = m[2]!.trim();
     if (argsStr) {
@@ -12465,6 +12823,127 @@ export class WalrusSqlClient {
     return values;
   }
 
+  private computeValueWindowFunctionValues(rows: SqlRow[], spec: ValueWindowFunctionSpec): SqlPrimitive[] {
+    const values = new Array<SqlPrimitive>(rows.length);
+    const groups = new Map<string, Array<{ row: SqlRow; idx: number }>>();
+
+    rows.forEach((row, idx) => {
+      const key = spec.partitionBy.length
+        ? spec.partitionBy
+            .map((field) => this.encodeTypedKey(this.resolveRowValue(row, field), `window.partition:${spec.name}:${field}`))
+            .join("||")
+        : "__all__";
+      const arr = groups.get(key) ?? [];
+      arr.push({ row, idx });
+      groups.set(key, arr);
+    });
+
+    for (const groupRows of groups.values()) {
+      const sorted = [...groupRows].sort((a, b) => {
+        for (const ord of spec.orderBy) {
+          const av = this.resolveRowValue(a.row, ord.field);
+          const bv = this.resolveRowValue(b.row, ord.field);
+          const c = this.compareForOrder(av, bv, ord.direction);
+          if (c !== 0) return c;
+        }
+        return a.idx - b.idx;
+      });
+
+      sorted.forEach((entry, pos) => {
+        // Compute frame bounds — SQL standard default is:
+        // RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // (unless overridden by an explicit frame clause)
+        let frameStart = 0;
+        let frameEnd = pos; // default: CURRENT ROW
+        if (spec.frame) {
+          const bounds = this.getFrameBounds(sorted.length, pos, spec.frame);
+          frameStart = bounds.start;
+          frameEnd = bounds.end;
+        }
+
+        if (frameStart > frameEnd || frameStart < 0 || frameEnd >= sorted.length) {
+          values[entry.idx] = null;
+          return;
+        }
+
+        if (spec.name === "FIRST_VALUE") {
+          values[entry.idx] = this.resolveRowValue(sorted[frameStart]!.row, spec.expr) ?? null;
+        } else if (spec.name === "LAST_VALUE") {
+          values[entry.idx] = this.resolveRowValue(sorted[frameEnd]!.row, spec.expr) ?? null;
+        } else if (spec.name === "NTH_VALUE") {
+          const n = spec.nth ?? 1;
+          const targetPos = frameStart + n - 1;
+          if (targetPos >= frameStart && targetPos <= frameEnd && targetPos < sorted.length) {
+            values[entry.idx] = this.resolveRowValue(sorted[targetPos]!.row, spec.expr) ?? null;
+          } else {
+            values[entry.idx] = null;
+          }
+        }
+      });
+    }
+
+    return values;
+  }
+
+  private computeDistributionWindowFunctionValues(rows: SqlRow[], spec: DistributionWindowFunctionSpec): SqlPrimitive[] {
+    const values = new Array<SqlPrimitive>(rows.length);
+    const groups = new Map<string, Array<{ row: SqlRow; idx: number }>>();
+
+    rows.forEach((row, idx) => {
+      const key = spec.partitionBy.length
+        ? spec.partitionBy
+            .map((field) => this.encodeTypedKey(this.resolveRowValue(row, field), `window.partition:${spec.name}:${field}`))
+            .join("||")
+        : "__all__";
+      const arr = groups.get(key) ?? [];
+      arr.push({ row, idx });
+      groups.set(key, arr);
+    });
+
+    for (const groupRows of groups.values()) {
+      const sorted = [...groupRows].sort((a, b) => {
+        for (const ord of spec.orderBy) {
+          const av = this.resolveRowValue(a.row, ord.field);
+          const bv = this.resolveRowValue(b.row, ord.field);
+          const c = this.compareForOrder(av, bv, ord.direction);
+          if (c !== 0) return c;
+        }
+        return a.idx - b.idx;
+      });
+
+      const totalRows = sorted.length;
+
+      sorted.forEach((entry, pos) => {
+        if (spec.name === "NTILE") {
+          const buckets = spec.buckets ?? 1;
+          const bucketSize = totalRows / buckets;
+          const bucket = Math.floor(pos / bucketSize) + 1;
+          values[entry.idx] = Math.min(bucket, buckets);
+        } else if (spec.name === "PERCENT_RANK") {
+          if (totalRows <= 1) {
+            values[entry.idx] = 0;
+          } else {
+            let rank = 1;
+            for (let i = 0; i < pos; i++) {
+              if (!this.areWindowOrderValuesEqual(sorted[i]!.row, entry.row, spec.orderBy)) rank++;
+            }
+            values[entry.idx] = (rank - 1) / (totalRows - 1);
+          }
+        } else if (spec.name === "CUME_DIST") {
+          let countLTE = 0;
+          for (let i = 0; i < totalRows; i++) {
+            if (this.areWindowOrderValuesEqual(sorted[i]!.row, entry.row, spec.orderBy)) {
+              countLTE++;
+            }
+          }
+          values[entry.idx] = countLTE / totalRows;
+        }
+      });
+    }
+
+    return values;
+  }
+
   private parseLiteralValue(literal: string): SqlPrimitive {
     const trimmed = literal.trim();
     if (trimmed.toUpperCase() === "NULL") return null;
@@ -12508,6 +12987,18 @@ export class WalrusSqlClient {
         return {
           alias: windowFn.alias,
           values: this.computeOffsetWindowFunctionValues(rows, windowFn),
+        };
+      }
+      if (windowFn.kind === "value") {
+        return {
+          alias: windowFn.alias,
+          values: this.computeValueWindowFunctionValues(rows, windowFn),
+        };
+      }
+      if (windowFn.kind === "distribution") {
+        return {
+          alias: windowFn.alias,
+          values: this.computeDistributionWindowFunctionValues(rows, windowFn),
         };
       }
       return {
@@ -12564,7 +13055,7 @@ export class WalrusSqlClient {
   private groupRows(
     rows: SqlRow[],
     groupBy: string[],
-    aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+    aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
     aggregateField?: string,
     aggregateFilter?: ExprAst,
   ): SqlRow[] {
@@ -12594,7 +13085,7 @@ export class WalrusSqlClient {
 
   private computeAggregateRow(
     rows: SqlRow[],
-    aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX",
+    aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT",
     aggregateField?: string,
     aggregateFilter?: ExprAst,
   ): SqlRow {
@@ -12667,6 +13158,25 @@ export class WalrusSqlClient {
       return { min: state.value as SqlPrimitive };
     }
 
+    if (aggregate === "TOTAL") {
+      // TOTAL: like SUM but returns 0.0 for empty set instead of null
+      if (!typedNums.length) return { total: 0.0 };
+      let total = 0;
+      for (const typed of typedNums) {
+        total += typeof typed.value === "number" ? typed.value : Number(typed.value) || 0;
+      }
+      return { total };
+    }
+
+    if (aggregate === "GROUP_CONCAT") {
+      // GROUP_CONCAT: concatenate all non-null values with ','
+      const concatValues = filteredRows
+        .map((r) => isSimpleField ? r[aggregateField!] : this.evalExpr(r, aggregateField!))
+        .filter((v) => v !== null && v !== undefined);
+      const concatenated = concatValues.map((v) => String(v)).join(", ");
+      return { group_concat: concatenated };
+    }
+
     if (!typedNums.length) return { max: null };
     let state = typedNums[0]!;
     for (let i = 1; i < typedNums.length; i++) {
@@ -12727,6 +13237,101 @@ export class WalrusSqlClient {
     }
     if (!Number.isNaN(Number(v)) && v !== "") return Number(v);
     return v;
+  }
+
+  // Handle CAST(expr AS type) — called from evalExpr when expr matches CAST(
+  // parseFunctionCall gives args as "expr AS type" (single string), so we parse
+  // the inner expression and type separately
+  private evalExprCast(row: SqlRow, expr: string): SqlPrimitive | undefined {
+    // Extract content between CAST( and the final )
+    const openParen = expr.indexOf("(");
+    const closeParen = expr.lastIndexOf(")");
+    if (openParen < 0 || closeParen < 0 || closeParen <= openParen + 1) return null;
+    const inner = expr.substring(openParen + 1, closeParen).trim();
+    // Find "AS" keyword at top level (not inside nested parens or quotes)
+    let asIdx = -1;
+    let depth = 0;
+    let quote = "";
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i]!;
+      if ((ch === "'" || ch === '"') && (i === 0 || inner[i - 1] !== "\\")) {
+        quote = quote === ch ? "" : ch;
+      } else if (!quote && ch === "(") {
+        depth++;
+      } else if (!quote && ch === ")") {
+        depth--;
+      } else if (!quote && depth === 0 && inner.substring(i, i + 3).toUpperCase() === "AS ") {
+        asIdx = i;
+        break;
+      }
+    }
+    if (asIdx < 0) return null;
+    const innerExpr = inner.substring(0, asIdx).trim();
+    let typeRaw = inner.substring(asIdx + 2).trim();
+    // Strip surrounding quotes if the type is quoted (e.g., 'INTEGER' or "INTEGER")
+    if ((typeRaw.startsWith("'") && typeRaw.endsWith("'")) ||
+        (typeRaw.startsWith('"') && typeRaw.endsWith('"'))) {
+      typeRaw = typeRaw.slice(1, -1);
+    }
+    const typeUpper = typeRaw.toUpperCase().replace(/\s+/g, "_");
+    const targetType = normalizeRuntimeTypeName(typeUpper);
+    if (!targetType) return null;
+    const evaluated = this.evalExpr(row, innerExpr);
+    if (evaluated === null || evaluated === undefined) return null;
+    return this.applyPrimitiveCast(evaluated, targetType);
+  }
+
+  private applyPrimitiveCast(value: SqlPrimitive, targetType: string): SqlPrimitive | null {
+    switch (targetType) {
+      case "TEXT":
+      case "CHAR":
+      case "CHARACTER":
+      case "VARCHAR":
+      case "NVARCHAR":
+      case "CLOB":
+        return String(value);
+      case "INTEGER":
+      case "INT":
+      case "BIGINT":
+      case "SMALLINT":
+      case "TINYINT":
+      case "U64": {
+        if (value === null || value === undefined) return null;
+        const num = typeof value === "number" ? value : Number(value);
+        if (Number.isNaN(num)) return null;
+        return Math.trunc(num);
+      }
+      case "REAL":
+      case "DOUBLE":
+      case "FLOAT":
+      case "NUMERIC":
+      case "DECIMAL": {
+        if (value === null || value === undefined) return null;
+        const num = typeof value === "number" ? value : Number(value);
+        if (Number.isNaN(num)) return null;
+        return num;
+      }
+      case "BLOB":
+      case "BINARY": {
+        if (typeof value === "string") {
+          return [...Buffer.from(value, "utf8")].map(b => b.toString(16).padStart(2, "0")).join("");
+        }
+        return value;
+      }
+      case "BOOLEAN": {
+        if (value === null || value === undefined) return null;
+        if (typeof value === "boolean") return value;
+        if (typeof value === "number") return value !== 0;
+        if (typeof value === "string") {
+          const l = value.toLowerCase();
+          if (l === "true" || l === "1") return true;
+          if (l === "false" || l === "0") return false;
+        }
+        return null;
+      }
+      default:
+        return null;
+    }
   }
 
   private async executeRecursiveCteQuery(sql: string): Promise<QueryResult> {
@@ -13066,6 +13671,35 @@ export class WalrusSqlClient {
     if (cteDefs.length === 0) return null;
     const mainSql = trimmed.slice(i).trim();
     return { cteDefs, mainSql };
+  }
+
+  private parseFunctionCall(expr: string): { name: string; args: string[] } | null {
+    const trimmed = expr.trim();
+    const openParen = trimmed.indexOf("(");
+    if (openParen <= 0) return null;
+    const name = trimmed.slice(0, openParen);
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/i.test(name)) return null;
+    let depth = 0;
+    let closeParen = -1;
+    for (let i = openParen; i < trimmed.length; i++) {
+      const ch = trimmed[i]!;
+      if (ch === "(") depth++;
+      else if (ch === ")") { depth--; if (depth === 0) { closeParen = i; break; } }
+    }
+    if (closeParen === -1) return null;
+    const inner = trimmed.slice(openParen + 1, closeParen);
+    const args: string[] = [];
+    let buf = "";
+    let quote = "";
+    for (const ch of inner) {
+      if ((ch === "'" || ch === '"') && !quote) { quote = ch; buf += ch; continue; }
+      if (ch === quote) { quote = ""; buf += ch; continue; }
+      if (ch === "," && !quote && depth === 0) { args.push(buf.trim()); buf = ""; continue; }
+      if (ch === "(") { depth++; } else if (ch === ")") { depth--; }
+      buf += ch;
+    }
+    if (buf.trim() || args.length > 0) args.push(buf.trim());
+    return { name, args };
   }
 
   private smartSplit(input: string): string[] {

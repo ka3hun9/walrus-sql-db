@@ -9,6 +9,12 @@ import type {
   DropIndexStatementAst,
   DropViewStatementAst,
   ExprAst,
+  InsertStatementAst,
+  UpdateStatementAst,
+  DeleteStatementAst,
+  TruncateTableStatementAst,
+  AlterTableStatementAst,
+  CreateTableStatementAst,
   JoinAst,
   OrderItemAst,
   SelectItemAst,
@@ -56,7 +62,7 @@ function detectUnsupportedDialectOperator(sql: string, dialect: SqlDialectProfil
   const hasRegexp = /\bREGEXP\b/.test(textUpper);
   if (hasRegexp && !(dialect === "mysql" || dialect === "sqlite")) return "REGEXP";
 
-  const hasPostgresRegexOp = /!~\*|!~|~\*/.test(sql) || /(^|[^!])~([^*]|$)/.test(sql);
+  const hasPostgresRegexOp = /!~\*|!~|~\*/.test(sql);
   if (hasPostgresRegexOp && dialect !== "postgres") return "~";
 
   return null;
@@ -86,7 +92,7 @@ function normalizeDialectQuotedIdentifiers(sql: string, dialect: SqlDialectProfi
   const hasBacktickQuoted = /`[^`]+`/.test(sql);
   const hasBracketQuoted = /\[[^\]]+\]/.test(sql);
 
-  if (hasBacktickQuoted && dialect !== "mysql") {
+  if (hasBacktickQuoted && dialect !== "mysql" && dialect !== "sqlite") {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
       message: "Backtick-quoted identifiers are only enabled for mysql dialect profile",
       token: "`",
@@ -103,7 +109,7 @@ function normalizeDialectQuotedIdentifiers(sql: string, dialect: SqlDialectProfi
   }
 
   let out = sql;
-  if (dialect === "mysql") {
+  if (dialect === "mysql" || dialect === "sqlite") {
     out = out.replace(/`([a-zA-Z_][a-zA-Z0-9_]*)`/g, "$1");
   }
   if (dialect === "sqlserver") {
@@ -290,6 +296,62 @@ function parsePrimary(ts: TokenStream): ExprAst {
       };
     }
 
+    if (fn === "GROUP_CONCAT") {
+      // GROUP_CONCAT(expr [SEPARATOR 's'])
+      // SEPARATOR is a keyword, not a regular argument — handle specially
+      const args2: ExprAst[] = [];
+      let separatorVal: string | undefined;
+      while (!ts.eof()) {
+        const tok = ts.peek();
+        if (!tok) break;
+        // Check for SEPARATOR keyword (may appear at top level or after comma)
+        if (tok.toUpperCase() === "SEPARATOR") {
+          ts.next(); // consume SEPARATOR
+          const sepTok = ts.next(); // consume the string literal
+          if (sepTok && /^'.*'$/.test(sepTok)) {
+            separatorVal = castLiteral(sepTok) as string;
+          } else if (sepTok && /^".*"$/.test(sepTok)) {
+            separatorVal = castLiteral(sepTok) as string;
+          }
+          break;
+        }
+        const argExpr = parseOr(ts);
+        // Check if this is a bare SEPARATOR expression (case like: GROUP_CONCAT val SEPARATOR 'x')
+        if (argExpr.kind === "identifier" && argExpr.name.toUpperCase() === "SEPARATOR") {
+          const sepTok = ts.next();
+          if (sepTok && /^'.*'$/.test(sepTok)) {
+            separatorVal = castLiteral(sepTok) as string;
+          } else if (sepTok && /^".*"$/.test(sepTok)) {
+            separatorVal = castLiteral(sepTok) as string;
+          }
+          break;
+        }
+        args2.push(argExpr);
+        if (ts.peek() === ",") {
+          ts.next(); // consume comma
+          // Check if next token is SEPARATOR (handle: GROUP_CONCAT(expr, SEPARATOR 's'))
+          if (ts.peek()?.toUpperCase() === "SEPARATOR") {
+            ts.next(); // consume SEPARATOR
+            const sepTok = ts.next();
+            if (sepTok && /^'.*'$/.test(sepTok)) {
+              separatorVal = castLiteral(sepTok) as string;
+            } else if (sepTok && /^".*"$/.test(sepTok)) {
+              separatorVal = castLiteral(sepTok) as string;
+            }
+            break;
+          }
+          continue;
+        }
+        break;
+      }
+      ts.expect(")");
+      if (separatorVal !== undefined) {
+        // args[0] = expr, args[1] = separator literal
+        return { kind: "function", name: fn, args: [...args2, literalExpr(separatorVal)] };
+      }
+      return { kind: "function", name: fn, args: args2 };
+    }
+
     const args: ExprAst[] = [];
     if (ts.peek() !== ")") {
       while (!ts.eof()) {
@@ -331,6 +393,9 @@ function parseUnary(ts: TokenStream): ExprAst {
   }
   if (ts.match("+")) {
     return { kind: "unary", op: "+", expr: parseUnary(ts) };
+  }
+  if (ts.match("~")) {
+    return { kind: "unary", op: "~", expr: parseUnary(ts) };
   }
   return parsePrimary(ts);
 }
@@ -467,6 +532,12 @@ function parseExpr(input: string): ExprAst {
     return { kind: "raw", text: s };
   }
 
+  // Handle GROUP_CONCAT with SEPARATOR specially (SEPARATOR is a keyword, not an identifier)
+  // e.g., GROUP_CONCAT(val SEPARATOR '|') — SEPARATOR is a top-level keyword here
+  if (/^\s*GROUP_CONCAT\s*\([^)]+\s+SEPARATOR\s+/i.test(s)) {
+    return parseGroupConcatWithSeparator(s);
+  }
+
   const ts = new TokenStream(tokenizeExpr(s));
   try {
     const expr = parseOr(ts);
@@ -475,6 +546,51 @@ function parseExpr(input: string): ExprAst {
   } catch {
     return { kind: "raw", text: s };
   }
+}
+
+function parseGroupConcatWithSeparator(input: string): ExprAst {
+  // Parse: GROUP_CONCAT(expr [SEPARATOR 's'])
+  // Strip outer parens if present
+  const trimmed = input.trim();
+  const match = trimmed.match(/^GROUP_CONCAT\s*\(\s*(.+?)\s*\)\s*$/i);
+  if (!match) return { kind: "raw", text: input };
+
+  const inner = match[1]!;
+
+  // Find SEPARATOR at top level (not inside nested parens or quotes)
+  let sepIdx = -1;
+  let quote = "";
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i]!;
+    if ((ch === "'" || ch === '"') && (i === 0 || inner[i - 1] !== "\\")) {
+      quote = quote === ch ? "" : ch;
+    } else if (!quote && ch === "(") {
+      depth++;
+    } else if (!quote && ch === ")") {
+      depth = Math.max(0, depth - 1);
+    } else if (!quote && depth === 0 && inner.substring(i, i + 9).toUpperCase() === "SEPARATOR") {
+      sepIdx = i;
+      break;
+    }
+  }
+
+  let separatorVal = ",";
+  let exprStr = inner;
+  if (sepIdx >= 0) {
+    exprStr = inner.substring(0, sepIdx).trim();
+    // Strip any trailing comma from exprStr — comma precedes SEPARATOR and is not part of the expression
+    exprStr = exprStr.replace(/,\s*$/, "");
+    const sepPart = inner.substring(sepIdx + 9).trim(); // skip "SEPARATOR"
+    const sepMatch = sepPart.match(/^['"](.*?)['"]/);
+    if (sepMatch) {
+      separatorVal = sepMatch[1]!;
+    }
+  }
+
+  const expr = parseExpr(exprStr);
+  const args: ExprAst[] = [expr, { kind: "literal", typedValue: fromLiteral(separatorVal) }];
+  return { kind: "function", name: "GROUP_CONCAT", args };
 }
 
 function findTopLevelKeywordIndex(input: string, keyword: string): number {
@@ -721,21 +837,45 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
   let rest = tail;
 
   while (true) {
+    // Try ON clause first: JOIN ... ON t1.col = t2.col
     const jm = rest.match(
       /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
     );
-    if (!jm) break;
+    if (jm) {
+      const joinType = (jm[1]?.toUpperCase() ?? "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
+      joins.push({
+        kind: "join",
+        joinType,
+        table: jm[2]!,
+        onLeft: jm[4]!,
+        onRight: jm[5]!,
+      });
+      rest = jm[6] ?? "";
+      continue;
+    }
 
-    const joinType = (jm[1]?.toUpperCase() ?? "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
-    joins.push({
-      kind: "join",
-      joinType,
-      table: jm[2]!,
-      onLeft: jm[4]!,
-      onRight: jm[5]!,
-    });
+    // Try USING clause: JOIN ... USING (col1, col2)
+    const usingMatch = rest.match(
+      /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+USING\s*\(([^)]+)\)\s*(.*)$/i,
+    );
+    if (usingMatch) {
+      const joinType = (usingMatch[1]?.toUpperCase() ?? "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
+      const columns = usingMatch[4]!.split(",").map((c) => c.trim());
+      // For USING with multiple columns, create a separate join AST for each column
+      // For simplicity, use the first column; multi-column USING requires schema resolution
+      const firstCol = columns[0]!;
+      joins.push({
+        kind: "join",
+        joinType,
+        table: usingMatch[2]!,
+        onLeft: firstCol,
+        onRight: firstCol,
+      });
+      rest = usingMatch[5] ?? "";
+      continue;
+    }
 
-    rest = jm[6] ?? "";
+    break;
   }
 
   return { joins, rest };
@@ -1226,6 +1366,203 @@ function parseDropViewStatement(base: string, rawSql: string): DropViewStatement
   };
 }
 
+function parseInsertStatement(base: string, rawSql: string): InsertStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^INSERT\s+INTO\b/i.test(normalized)) return null;
+
+  // INSERT INTO table (col1, col2) VALUES (val1, val2), ...
+  // or INSERT INTO table VALUES (val1, val2), ...
+  const match = normalized.match(
+    /^INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(([^)]+)\))?\s+VALUES\s*(.+)$/i,
+  );
+  if (!match) {
+    // INSERT INTO table SELECT ...
+    const selectMatch = normalized.match(/^INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(([^)]+)\))?\s+SELECT\b/i);
+    if (selectMatch) {
+      return {
+        kind: "insert",
+        tableName: selectMatch[1]!,
+        columns: selectMatch[2] ? selectMatch[2].split(",").map(c => c.trim()) : undefined,
+        values: [],
+        selectSql: normalized.slice(normalized.toUpperCase().search(/SELECT\b/)),
+        rawSql,
+      };
+    }
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "INSERT requires VALUES or SELECT clause",
+      token: "INSERT",
+    });
+  }
+
+  const tableName = match[1]!;
+  const columns = match[2] ? match[2].split(",").map(c => c.trim()) : undefined;
+
+  // Parse multiple value rows: (val1, val2), (val3, val4), ...
+  const valuesText = match[3]!;
+  const valueRows: ExprAst[][] = [];
+  const valueRowMatches = [...valuesText.matchAll(/\(([^)]+)\)/g)];
+  for (const rowMatch of valueRowMatches) {
+    const rowValues = splitCommaAware(rowMatch[1]!).map(v => parseExpr(v.trim()));
+    valueRows.push(rowValues);
+  }
+
+  return {
+    kind: "insert",
+    tableName,
+    columns,
+    values: valueRows,
+    rawSql,
+  };
+}
+
+function parseUpdateStatement(base: string, rawSql: string): UpdateStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^UPDATE\b/i.test(normalized)) return null;
+
+  // UPDATE table [AS alias] SET col1=val1, col2=val2 [WHERE ...]
+  // UPDATE table [AS alias] [INNER|LEFT|RIGHT|FULL JOIN ... ON ...] SET col=val [WHERE ...]
+  const match = normalized.match(
+    /^UPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*))?\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$/i,
+  );
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "UPDATE requires SET clause with column=value assignments",
+      token: "UPDATE",
+    });
+  }
+
+  const tableName = match[1]!;
+  const tableAlias = match[2];
+  const joinType = match[3]?.toUpperCase() as "INNER" | "LEFT" | "RIGHT" | "FULL" | undefined;
+  const joinTable = match[4];
+  const joinAlias = match[5];
+  const joinLeftField = match[6];
+  const joinRightField = match[7];
+  const setClauseText = match[8]!;
+  const whereText = match[9]?.trim();
+
+  const setItems = splitCommaAware(setClauseText).map(item => {
+    const [col, ...valParts] = item.split("=");
+    return {
+      column: col.trim(),
+      value: parseExpr(valParts.join("=").trim()),
+    };
+  });
+
+  const join: JoinAst | undefined = joinType && joinTable
+    ? { kind: "join", joinType: joinType as "INNER" | "LEFT" | "RIGHT" | "FULL", table: joinTable, onLeft: joinLeftField!, onRight: joinRightField! }
+    : undefined;
+
+  return {
+    kind: "update",
+    tableName,
+    tableAlias,
+    setClause: setItems,
+    where: whereText ? parseExpr(whereText) : undefined,
+    join,
+    rawSql,
+  };
+}
+
+function parseDeleteStatement(base: string, rawSql: string): DeleteStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DELETE\s+FROM\b/i.test(normalized)) return null;
+
+  // DELETE FROM table [AS alias] [USING ...] [WHERE ...]
+  // DELETE FROM table [AS alias] [INNER|LEFT|RIGHT|FULL JOIN ... ON ...] [WHERE ...]
+  const match = normalized.match(
+    /^DELETE\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+USING\s+([a-zA-Z_][a-zA-Z0-9_,\s]+))?(?:\s+(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?)\s+JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*))?\s*(?:WHERE\s+(.+))?$/i,
+  );
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "DELETE requires FROM clause with table name",
+      token: "DELETE",
+    });
+  }
+
+  const tableName = match[1]!;
+  const tableAlias = match[2];
+  const using = match[3]?.trim();
+  const joinType = match[4]?.toUpperCase() as "INNER" | "LEFT" | "RIGHT" | "FULL" | undefined;
+  const joinTable = match[5];
+  const joinAlias = match[6];
+  const joinLeftField = match[7];
+  const joinRightField = match[8];
+  const whereText = match[9]?.trim();
+
+  const join: JoinAst | undefined = joinType && joinTable
+    ? { kind: "join", joinType: joinType as "INNER" | "LEFT" | "RIGHT" | "FULL", table: joinTable, onLeft: joinLeftField!, onRight: joinRightField! }
+    : undefined;
+
+  return {
+    kind: "delete",
+    tableName,
+    tableAlias,
+    using,
+    where: whereText ? parseExpr(whereText) : undefined,
+    join,
+    rawSql,
+  };
+}
+
+function parseTruncateTableStatement(base: string, rawSql: string): TruncateTableStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^TRUNCATE\s+TABLE\b/i.test(normalized)) return null;
+
+  const match = normalized.match(/^TRUNCATE\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "TRUNCATE TABLE requires a table name",
+      token: "TRUNCATE",
+    });
+  }
+
+  return {
+    kind: "truncate_table",
+    tableName: match[1]!,
+    rawSql,
+  };
+}
+
+function parseAlterTableStatement(base: string, rawSql: string): AlterTableStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^ALTER\s+TABLE\b/i.test(normalized)) return null;
+
+  const match = normalized.match(/^ALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(.+)$/i);
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "ALTER TABLE requires a table name and action",
+      token: "ALTER",
+    });
+  }
+
+  return {
+    kind: "alter_table",
+    tableName: match[1]!,
+    action: match[2]!.trim(),
+    rawSql,
+  };
+}
+
+function parseCreateTableStatement(base: string, rawSql: string): CreateTableStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+TABLE\b/i.test(normalized)) return null;
+  const match = normalized.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "CREATE TABLE requires a table name",
+      token: "TABLE",
+    });
+  }
+  return {
+    kind: "create_table",
+    tableName: match[1]!,
+    rawSql,
+  };
+}
+
 export type ParseSqlToAstOptions = {
   dialect?: SqlDialectProfile;
 };
@@ -1349,6 +1686,24 @@ export function parseSqlToAst(
   const dropView = parseDropViewStatement(base, sql);
   if (dropView) return dropView;
 
+  const insert = parseInsertStatement(base, sql);
+  if (insert) return insert;
+
+  const update = parseUpdateStatement(base, sql);
+  if (update) return update;
+
+  const del = parseDeleteStatement(base, sql);
+  if (del) return del;
+
+  const truncate = parseTruncateTableStatement(base, sql);
+  if (truncate) return truncate;
+
+  const alter = parseAlterTableStatement(base, sql);
+  if (alter) return alter;
+
+  const createTable = parseCreateTableStatement(base, sql);
+  if (createTable) return createTable;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
@@ -1358,24 +1713,55 @@ export function parseSqlToAst(
     });
   }
 
-  const fromParsed = parseFromRef(base);
-  if (!fromParsed) {
-    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-      message: "SELECT statement is missing or has invalid FROM clause",
-      token: "FROM",
-    });
-  }
-
-  const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+/i);
-  if (!m) {
-    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-      message: "SELECT list is missing or malformed before FROM",
-      token: "SELECT",
-    });
-  }
-
-  let selectFields = m[1]!.trim();
+  // Check if this is a SELECT without FROM (scalar expression query like SQLite's SELECT <expr>)
+  const hasFrom = /\bFROM\b/i.test(base);
+  let fromParsed: { from: TableRefAst; tail: string } | null = null;
+  let selectFields: string;
   let topLimit: number | undefined;
+
+  if (!hasFrom) {
+    // SELECT <expr> without FROM — treat as SELECT <expr> FROM (SELECT NULL)
+    // Extract select list: everything between SELECT and end (or first clause keyword)
+    const scalarMatch = base.match(/^SELECT\s+(.+)$/i);
+    if (!scalarMatch) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "SELECT list is missing or malformed",
+        token: "SELECT",
+      });
+    }
+    selectFields = scalarMatch[1]!.trim();
+    // Use a special subquery table ref for scalar select without FROM
+    // subquerySql is "SELECT __scalar__ FROM __scalar__" which parses as from.kind='table',
+    // NOT from.kind='subquery', avoiding infinite recursion in query() materialization.
+    // The scalar expression is stored in scalarExpr for direct evaluation by query().
+    fromParsed = {
+      from: {
+        kind: "subquery",
+        subquerySql: "SELECT __scalar__ FROM __scalar__",
+        alias: "__scalar__",
+        rewrittenSql: "SELECT __scalar__ FROM __scalar__",
+        outerSelectItems: parseSelectItems(selectFields),
+      },
+      tail: "",
+    };
+  } else {
+    fromParsed = parseFromRef(base);
+    if (!fromParsed) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "SELECT statement is missing or has invalid FROM clause",
+        token: "FROM",
+      });
+    }
+
+    const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+/i);
+    if (!m) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "SELECT list is missing or malformed before FROM",
+        token: "SELECT",
+      });
+    }
+    selectFields = m[1]!.trim();
+  }
 
   const topMatch = selectFields.match(/^TOP\s+(\d+)\s+(.+)$/i);
   if (/^TOP\b/i.test(selectFields)) {

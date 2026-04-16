@@ -11,6 +11,7 @@ import {
   type SqlThreeValuedLogic,
   type SqlTypedValue,
 } from "./types.js";
+import { evaluateScalarFunction } from "./functions/mod.js";
 
 function maybeWrap(child?: ExprAst): string {
   const rendered = exprAstToSql(child) ?? "";
@@ -37,6 +38,19 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       }
       if (expr.name === "RANGE" && expr.args.length >= 2) {
         return `${exprAstToSql(expr.args[0])} AND ${exprAstToSql(expr.args[1])}`;
+      }
+      if (expr.name === "CAST" && expr.args.length >= 2) {
+        // Render CAST using AS syntax: CAST(expr AS type)
+        const inner = exprAstToSql(expr.args[0]) ?? "";
+        const typeArg = expr.args[1];
+        let typeSql: string;
+        if (typeArg.kind === "literal" && typeof typeArg.typedValue.value === "string") {
+          // SQL type names in CAST are stored as string literals — render without quotes
+          typeSql = String(typeArg.typedValue.value);
+        } else {
+          typeSql = exprAstToSql(typeArg) ?? "";
+        }
+        return `CAST(${inner} AS ${typeSql})`;
       }
       const filterPart = expr.filter ? ` FILTER (WHERE ${exprAstToSql(expr.filter) ?? ""})` : "";
       return `${expr.name}(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})${filterPart}`;
@@ -224,51 +238,7 @@ export function evalExprAstTyped(
     case "function": {
       const fn = expr.name.toUpperCase();
       const args = expr.args.map((a) => evalExprAstTyped(a, resolve));
-
-      if (fn === "COALESCE") {
-        for (const value of args) {
-          if (value.value !== null && value.value !== undefined) return value;
-        }
-        return typedNull("expr.function.coalesce");
-      }
-
-      if (fn === "NULLIF") {
-        const a = args[0];
-        const b = args[1];
-        if (!a || !b) return typedNull("expr.function.nullif");
-        if (a.value == null || b.value == null) return a.value == null ? typedNull("expr.function.nullif") : a;
-        const eq = typedValueComparator.eq(a, b);
-        return eq === true ? typedNull("expr.function.nullif") : a;
-      }
-
-      if (fn === "CAST") {
-        const value = args[0];
-        const targetRaw = args[1]?.value;
-        if (!value || value.value == null) return typedNull("expr.function.cast");
-        const normalizedTarget = normalizeRuntimeTypeName(String(targetRaw ?? ""));
-        if (!normalizedTarget || normalizedTarget === "NULL") return typedNull("expr.function.cast");
-        try {
-          let castInput = value;
-          if (
-            typeof castInput.value === "number"
-            && Number.isFinite(castInput.value)
-            && (normalizedTarget === "SMALLINT"
-              || normalizedTarget === "INT"
-              || normalizedTarget === "BIGINT"
-              || normalizedTarget === "U64")
-          ) {
-            castInput = fromJs(Math.trunc(castInput.value), undefined, {}, "expr.function.cast.truncate");
-          }
-          return convertTypedValue(castInput, normalizedTarget, {
-            mode: "explicit",
-            sourceContext: "expr.function.cast",
-          });
-        } catch {
-          return typedNull("expr.function.cast");
-        }
-      }
-
-      return typedNull(`expr.function.${fn}`);
+      return evaluateScalarFunction(fn, args, { row: {}, resolve });
     }
     case "case": {
       for (const wc of expr.whenClauses) {

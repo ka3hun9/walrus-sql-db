@@ -1370,7 +1370,7 @@ export interface OnchainQueryRequest {
   orderBy?: string;
   orderDirection?: "ASC" | "DESC";
   orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
-  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
+  aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT";
   aggregateField?: string;
   groupBy?: string[];
   having?: string;

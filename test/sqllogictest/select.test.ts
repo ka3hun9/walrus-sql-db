@@ -25,6 +25,7 @@ function makeClient(): SqlClient {
     packageId: "0x0000000000000000000000000000000000000000000000000000000000000000",
     network: "sui-devnet",
     mode: "simulator",
+    dialect: "sqlite",
     logging: { level: "error" },
   }) as unknown as SqlClient;
 }

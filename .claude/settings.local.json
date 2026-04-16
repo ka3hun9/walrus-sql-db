@@ -19,7 +19,22 @@
       "Bash(grep -l \"test/\\\\|examples/\\\\|scripts/\\\\|reports/\" .github/workflows/*.yml)",
       "Bash(grep:*)",
       "Bash(git status:*)",
-      "Bash(git ls-tree:*)"
+      "Bash(git ls-tree:*)",
+      "Bash(npm install:*)",
+      "Bash(awk '/private async executeSimulator\\\\\\(sql: string\\\\\\)/{depth=1; next} /private async [a-zA-Z]+/{if\\(depth>0\\) depth--} /async [a-zA-Z]+.*\\\\\\(.*\\\\\\): Promise<ExecuteResult>/{if\\(depth>0\\){print NR; exit}}' src/client.ts)",
+      "Bash(npx vitest:*)",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/sqlite/sqlite/3450100/test/select1.test\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/sqlite/sqlite/version-3450100/test/select1.test\")",
+      "Bash(curl -s \"https://api.github.com/repos/sqlite/sqlite/gitrefs/tags\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/sqlite/sqlite/refs/tags/version-3.45.0/test/select1.test\")",
+      "Bash(curl -sI https://raw.githubusercontent.com/sqlite/sqlite/version-3.45.0/test/__TRACKED_VAR__)",
+      "Bash(curl -sI -L \"https://raw.githubusercontent.com/sqlite/sqlite/version-3.45.0/test/orderby.test\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/sqlite/sqlite/version-3.45.0/test/orderby.test\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/sqlite/sqlite/version-3.45.0/test/agg.test\")",
+      "Bash(xargs -I{} head -30 {})",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(rm -rf dist)",
+      "Bash(echo \"Exit: $?\")"
     ]
   }
 }

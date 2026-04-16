@@ -1,8 +1,8 @@
 /**
  * SQLite test file acquisition utility
  *
- * Downloads and caches SQLite .test files from the SQLite source tree.
- * Uses a known-good tag for reproducibility.
+ * Downloads and caches sqllogictest format .test files from the dolthub/sqllogictest
+ * mirror of the official SQLite SQL Logic Test suite.
  */
 
 import { createHash } from "node:crypto";
@@ -10,11 +10,11 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** SQLite source tree tag (version-3.45.0 — a stable recent release) */
-export const SQLITE_COMMIT = "version-3.45.0";
+/** dolthub/sqllogictest branch */
+export const SQLITE_COMMIT = "master";
 
-/** Base URL for SQLite test files in the source tree */
-export const SQLITE_TEST_BASE = `https://raw.githubusercontent.com/sqlite/sqlite/${SQLITE_COMMIT}/test`;
+/** Base URL for sqllogictest files in the dolthub mirror */
+export const SQLITE_TEST_BASE = `https://raw.githubusercontent.com/dolthub/sqllogictest/${SQLITE_COMMIT}/test`;
 
 /** Local cache directory */
 export const CACHE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
