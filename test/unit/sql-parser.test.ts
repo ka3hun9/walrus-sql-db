@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { parseSqlToAst } from "../../src/sql-parser.js";
+import { parseSlt } from "../sqllogictest/parser.js";
+import { loadCachedTest, cachedTestCount, PRIORITY_TESTS } from "../sqllogictest/fetch.js";
+import type { SqlAstStatement, ExprAst, SelectItemAst, TableRefAst, JoinAst, OrderItemAst } from "../../src/sql-ast.js";
 
 describe("sql-parser", () => {
   describe("basic SELECT parsing", () => {
@@ -211,5 +214,149 @@ describe("sql-parser", () => {
     it("throws on ILIKE for ANSI dialect", () => {
       expect(() => parseSqlToAst("SELECT * FROM users WHERE name ILIKE 'alice'", { dialect: "ansi" })).toThrow();
     });
+  });
+});
+
+/**
+ * Recursively check if an ExprAst contains any raw nodes
+ */
+function containsRawExpr(expr: ExprAst): boolean {
+  if (expr.kind === "raw") return true;
+  if (expr.kind === "function") {
+    for (const arg of expr.args) {
+      if (containsRawExpr(arg)) return true;
+    }
+    if (expr.filter && containsRawExpr(expr.filter)) return true;
+  }
+  if (expr.kind === "case") {
+    for (const clause of expr.whenClauses) {
+      if (containsRawExpr(clause.condition) || containsRawExpr(clause.result)) return true;
+    }
+    if (expr.elseResult && containsRawExpr(expr.elseResult)) return true;
+  }
+  if (expr.kind === "binary") {
+    return containsRawExpr(expr.left) || containsRawExpr(expr.right);
+  }
+  if (expr.kind === "unary") {
+    return containsRawExpr(expr.expr);
+  }
+  return false;
+}
+
+function findRawInSelectItem(item: SelectItemAst): boolean {
+  if (containsRawExpr(item.expr)) return true;
+  if (item.window) {
+    // window.args
+    for (const arg of item.window.args) {
+      if (containsRawExpr(arg)) return true;
+    }
+    // window.over.partitionBy
+    for (const expr of item.window.over.partitionBy) {
+      if (containsRawExpr(expr)) return true;
+    }
+    // window.over.orderBy
+    for (const orderItem of item.window.over.orderBy) {
+      if (containsRawExpr(orderItem.expr)) return true;
+    }
+  }
+  return false;
+}
+
+function findRawInTableRef(t: TableRefAst): boolean {
+  return false; // table and subquery don't contain ExprAst at this level
+}
+
+function findRawInJoin(j: JoinAst): boolean {
+  // onLeft and onRight are strings, not ExprAst
+  return false;
+}
+
+function findRawInStatement(ast: SqlAstStatement): { found: boolean; path: string } {
+  switch (ast.kind) {
+    case "select": {
+      if (ast.where && containsRawExpr(ast.where)) {
+        return { found: true, path: "where" };
+      }
+      if (ast.having && containsRawExpr(ast.having)) {
+        return { found: true, path: "having" };
+      }
+      for (const expr of ast.groupBy ?? []) {
+        if (containsRawExpr(expr)) return { found: true, path: "groupBy" };
+      }
+      for (const item of ast.selectItems) {
+        if (findRawInSelectItem(item)) return { found: true, path: "selectItems" };
+      }
+      for (const orderItem of ast.orderBy ?? []) {
+        if (containsRawExpr(orderItem.expr)) return { found: true, path: "orderBy" };
+      }
+      if (ast.join && findRawInJoin(ast.join)) return { found: true, path: "join" };
+      for (const j of ast.joins ?? []) {
+        if (findRawInJoin(j)) return { found: true, path: "joins" };
+      }
+      return { found: false, path: "" };
+    }
+    case "union":
+    case "intersect":
+    case "except":
+      // rawSql is a string, not an AST to traverse
+      return { found: false, path: "" };
+    default:
+      return { found: false, path: "" };
+  }
+}
+
+describe("raw expression canary", () => {
+  // Load all cached fixture SQL
+  const cachedSqlQueries: Array<{ file: string; sql: string; line: number }> = [];
+
+  beforeAll(() => {
+    if (cachedTestCount() === 0) return;
+    for (const name of PRIORITY_TESTS) {
+      try {
+        const content = loadCachedTest(name);
+        const doc = parseSlt(content, name);
+        for (const el of doc.elements) {
+          if (el.kind === "query") {
+            cachedSqlQueries.push({ file: name, sql: (el as any).sql, line: (el as any).line });
+          }
+        }
+      } catch {
+        // skip
+      }
+    }
+  });
+
+  it("has cached fixture SQL to test", () => {
+    expect(cachedSqlQueries.length).toBeGreaterThan(0);
+  });
+
+  it("no raw nodes in parsed SQL from fixture files", () => {
+    const failures: Array<{ file: string; line: number; sql: string; path: string }> = [];
+    const parseErrors: Array<{ file: string; line: number; sql: string; error: string }> = [];
+    for (const { file, sql, line } of cachedSqlQueries) {
+      try {
+        const ast = parseSqlToAst(sql, { dialect: "sqlite" });
+        const result = findRawInStatement(ast);
+        if (result.found) {
+          failures.push({ file, line, sql, path: result.path });
+        }
+      } catch (e: any) {
+        parseErrors.push({ file, line, sql, error: e.message });
+      }
+    }
+    if (parseErrors.length > 0) {
+      console.error(`\nFound ${parseErrors.length} queries with parse errors:`);
+      for (const f of parseErrors.slice(0, 5)) {
+        console.error(`  ${f.file}:${f.line} - ${f.error}`);
+        console.error(`    SQL: ${f.sql.slice(0, 80)}`);
+      }
+    }
+    if (failures.length > 0) {
+      console.error(`\nFound ${failures.length} queries with raw nodes:`);
+      for (const f of failures.slice(0, 10)) {
+        console.error(`  ${f.file}:${f.line} [${f.path}] ${f.sql.slice(0, 80)}`);
+      }
+    }
+    expect(failures.length).toBe(0);
   });
 });

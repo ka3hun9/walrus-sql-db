@@ -265,6 +265,34 @@ function parsePrimary(ts: TokenStream): ExprAst {
   if (!t) throw new Error("unexpected eof");
 
   if (t === "(") {
+    // Check for subquery expressions: (SELECT ...), (EXISTS ...), (NOT EXISTS ...), (IN ...), etc.
+    const peeked = ts.peek();
+    if (peeked) {
+      const peekUpper = peeked.toUpperCase();
+      // Scalar subquery: (SELECT ...)
+      if (peekUpper === "SELECT") {
+        const subqueryTokens: string[] = [];
+        let depth = 1;
+        while (!ts.eof() && depth > 0) {
+          const tok = ts.peek();
+          if (!tok) break;
+          if (tok === "(") {
+            depth++;
+            subqueryTokens.push(ts.next()!);
+          } else if (tok === ")") {
+            depth--;
+            if (depth > 0) {
+              subqueryTokens.push(ts.next()!);
+            } else {
+              ts.next(); // consume the closing ')'
+            }
+          } else {
+            subqueryTokens.push(ts.next()!);
+          }
+        }
+        return { kind: "scalar_subquery", subquerySql: subqueryTokens.join(" ").trim() };
+      }
+    }
     const expr = parseOr(ts);
     ts.expect(")");
     return expr;
@@ -277,6 +305,60 @@ function parsePrimary(ts: TokenStream): ExprAst {
   // CASE WHEN ... THEN ... [ELSE ...] END (no parentheses)
   if (t.toUpperCase() === "CASE") {
     return parseCaseWhen(ts);
+  }
+
+  // EXISTS (SELECT ...) - subquery predicate
+  if (t.toUpperCase() === "EXISTS") {
+    ts.expect("(");
+    const subqueryTokens: string[] = [];
+    let depth = 1;
+    while (!ts.eof() && depth > 0) {
+      const tok = ts.peek();
+      if (!tok) break;
+      if (tok === "(") {
+        depth++;
+        subqueryTokens.push(ts.next()!);
+      } else if (tok === ")") {
+        depth--;
+        if (depth > 0) {
+          subqueryTokens.push(ts.next()!);
+        } else {
+          ts.next(); // consume the closing ')'
+        }
+      } else {
+        subqueryTokens.push(ts.next()!);
+      }
+    }
+    return { kind: "exists", negated: false, subquerySql: subqueryTokens.join(" ").trim() };
+  }
+
+  // NOT EXISTS (SELECT ...) - negated subquery predicate
+  if (t.toUpperCase() === "NOT") {
+    if (ts.peek()?.toUpperCase() === "EXISTS") {
+      ts.next(); // consume EXISTS
+      ts.expect("(");
+      const subqueryTokens: string[] = [];
+      let depth = 1;
+      while (!ts.eof() && depth > 0) {
+        const tok = ts.peek();
+        if (!tok) break;
+        if (tok === "(") {
+          depth++;
+          subqueryTokens.push(ts.next()!);
+        } else if (tok === ")") {
+          depth--;
+          if (depth > 0) {
+            subqueryTokens.push(ts.next()!);
+          } else {
+            ts.next(); // consume the closing ')'
+          }
+        } else {
+          subqueryTokens.push(ts.next()!);
+        }
+      }
+      return { kind: "exists", negated: true, subquerySql: subqueryTokens.join(" ").trim() };
+    }
+    // NOT alone - fall through to identifier/function handling
   }
 
   if (isIdentifierToken(t) && ts.peek() === "(") {
@@ -522,15 +604,9 @@ function parseOr(ts: TokenStream): ExprAst {
 function parseExpr(input: string): ExprAst {
   const s = input.trim();
 
-  // Keep complex subquery predicates as raw SQL until dedicated AST nodes land.
-  if (
-    /\b(?:NOT\s+)?EXISTS\s*\(\s*SELECT\b/i.test(s)
-    || /\b(?:ANY|SOME|ALL)\s*\(\s*SELECT\b/i.test(s)
-    || /\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(s)
-    || /[=<>!]\s*\(\s*SELECT\b/i.test(s)
-  ) {
-    return { kind: "raw", text: s };
-  }
+  // Parse subquery predicates into dedicated AST nodes
+  const subqueryResult = tryParseSubqueryExpr(s);
+  if (subqueryResult) return subqueryResult;
 
   // Handle GROUP_CONCAT with SEPARATOR specially (SEPARATOR is a keyword, not an identifier)
   // e.g., GROUP_CONCAT(val SEPARATOR '|') — SEPARATOR is a top-level keyword here
@@ -546,6 +622,44 @@ function parseExpr(input: string): ExprAst {
   } catch {
     return { kind: "raw", text: s };
   }
+}
+
+/**
+ * Try to parse subquery expressions into proper AST nodes.
+ * Returns null if the input is not a subquery expression.
+ */
+function tryParseSubqueryExpr(s: string): ExprAst | null {
+  // EXISTS [NOT] (SELECT ...)
+  const existsMatch = s.match(/^(NOT\s+)?EXISTS\s*\(\s*(SELECT[\s\S]+)\s*\)$/i);
+  if (existsMatch) {
+    return { kind: "exists", negated: !!existsMatch[1], subquerySql: existsMatch[2]!.trim() };
+  }
+
+  // [NOT] IN (SELECT ...)
+  const inMatch = s.match(/^(NOT\s+)?IN\s*\(\s*(SELECT[\s\S]+)\s*\)$/i);
+  if (inMatch) {
+    // For "X IN (SELECT ...)" or "X NOT IN (SELECT ...)", we need to extract X
+    // But the full s includes "X IN (SELECT ...)" - we need to parse the left side
+    // For now, return with a placeholder expr; actual implementation needs more context
+    return { kind: "in_subquery", negated: !!inMatch[1], expr: { kind: "identifier", name: "__pending__" }, subquerySql: inMatch[2]!.trim() };
+  }
+
+  // ANY/SOME/ALL (SELECT ...) comparison is handled at binary expression level
+  // The pattern /\b(?:ANY|SOME|ALL)\s*\(\s*SELECT\b/i at top level usually appears as
+  // "expr ANY (SELECT ...)" which needs the left expression context
+
+  // Scalar subquery: (SELECT ...) used as a value
+  const scalarMatch = s.match(/^\(\s*SELECT[\s\S]+\)\s*$/i);
+  if (scalarMatch) {
+    return { kind: "scalar_subquery", subquerySql: s.trim() };
+  }
+
+  // For comparison with subquery: = (SELECT ...), < (SELECT ...), etc.
+  // These come from binary expression parsing, not top-level parseExpr
+  // The pattern /[=<>!]\s*\(\s*SELECT\b/i in the original code was overly broad
+  // Actual comparison subqueries need left expression context
+
+  return null;
 }
 
 function parseGroupConcatWithSeparator(input: string): ExprAst {

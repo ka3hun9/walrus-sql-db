@@ -257,6 +257,9 @@ export type ExprAst =
   | { kind: "case"; whenClauses: { condition: ExprAst; result: ExprAst }[]; elseResult?: ExprAst }
   | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
   | { kind: "unary"; op: string; expr: ExprAst }
+  | { kind: "exists"; negated: boolean; subquerySql: string }
+  | { kind: "in_subquery"; negated: boolean; expr: ExprAst; subquerySql: string }
+  | { kind: "scalar_subquery"; subquerySql: string }
   | { kind: "raw"; text: string };
 
 export type WindowFunctionAst = {
