@@ -260,6 +260,7 @@ export type ExprAst =
   | { kind: "exists"; negated: boolean; subquerySql: string }
   | { kind: "in_subquery"; negated: boolean; expr: ExprAst; subquerySql: string }
   | { kind: "scalar_subquery"; subquerySql: string }
+  | { kind: "any_subquery"; op: string; left: ExprAst; quantifier: "ANY" | "SOME" | "ALL"; subquerySql: string }
   | { kind: "raw"; text: string };
 
 export type WindowFunctionAst = {
