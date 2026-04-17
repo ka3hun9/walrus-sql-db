@@ -55,11 +55,12 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       const filterPart = expr.filter ? ` FILTER (WHERE ${exprAstToSql(expr.filter) ?? ""})` : "";
       return `${expr.name}(${expr.args.map((a) => exprAstToSql(a) ?? "").join(", ")})${filterPart}`;
     case "case": {
+      const base = expr.baseExpr ? `${exprAstToSql(expr.baseExpr) ?? ""} ` : "";
       const clauses = expr.whenClauses
         .map((wc) => `WHEN ${exprAstToSql(wc.condition) ?? ""} THEN ${exprAstToSql(wc.result) ?? ""}`)
         .join(" ");
       const elsePart = expr.elseResult ? ` ELSE ${exprAstToSql(expr.elseResult) ?? ""}` : "";
-      return `CASE ${clauses}${elsePart} END`;
+      return `CASE ${base}${clauses}${elsePart} END`;
     }
     case "binary":
       return `${maybeWrap(expr.left)} ${expr.op} ${maybeWrap(expr.right)}`;
@@ -249,6 +250,22 @@ export function evalExprAstTyped(
       return evaluateScalarFunction(fn, args, { row: {}, resolve });
     }
     case "case": {
+      if (expr.baseExpr) {
+        // CASE expression WHEN format: compare baseExpr to each WHEN value
+        const baseVal = evalExprAstTyped(expr.baseExpr, resolve);
+        for (const wc of expr.whenClauses) {
+          const whenVal = evalExprAstTyped(wc.condition, resolve);
+          const eq = typedValueComparator.eq(baseVal, whenVal);
+          if (eq === true) {
+            return evalExprAstTyped(wc.result, resolve);
+          }
+        }
+        if (expr.elseResult) {
+          return evalExprAstTyped(expr.elseResult, resolve);
+        }
+        return typedNull("expr.case");
+      }
+      // CASE WHEN format: evaluate conditions as boolean
       for (const wc of expr.whenClauses) {
         const condVal = evalExprAstTyped(wc.condition, resolve);
         if (condVal.value === true) {

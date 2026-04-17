@@ -912,7 +912,13 @@ function parseWindowFrameBound(text: string): WindowFrameBound | undefined {
 }
 
 function parseCaseWhen(ts: TokenStream): ExprAst {
-  // Parse: CASE WHEN condition THEN result [WHEN ...] [ELSE result] END
+  // Parse: CASE [expression] WHEN condition THEN result [WHEN ...] [ELSE result] END
+  // If the next token after CASE is not WHEN, parse it as baseExpr
+  let baseExpr: ExprAst | undefined;
+  if (!ts.peek()?.toUpperCase().startsWith("WHEN")) {
+    baseExpr = parseOr(ts);
+  }
+
   const whenClauses: { condition: ExprAst; result: ExprAst }[] = [];
   let elseResult: ExprAst | undefined;
 
@@ -933,7 +939,7 @@ function parseCaseWhen(ts: TokenStream): ExprAst {
       throw new Error(`expected WHEN, ELSE, or END in CASE expression, got: ${next}`);
     }
   }
-  return { kind: "case", whenClauses, elseResult };
+  return { kind: "case", baseExpr, whenClauses, elseResult };
 }
 
 function parseWindowFunction(exprText: string): WindowFunctionAst | undefined {
@@ -942,10 +948,8 @@ function parseWindowFunction(exprText: string): WindowFunctionAst | undefined {
 
   const m = trimmed.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([\s\S]*)\)\s+OVER\s*\(([\s\S]*)\)$/i);
   if (!m) {
-    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-      message: "Window function requires syntax: <function>(...) OVER (...)",
-      token: "OVER",
-    });
+    // OVER detected but not perfectly matched - return undefined, caller will use parseExpr
+    return undefined;
   }
 
   const fnName = m[1]!.toUpperCase();
@@ -968,12 +972,16 @@ function parseSelectItems(raw: string): SelectItemAst[] {
     if (m) {
       const exprText = m[1]!.trim();
       const window = parseWindowFunction(exprText);
-      const expr = window ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+      const expr = window
+        ? ({ kind: "function", name: window.name, args: window.args } as ExprAst)
+        : parseExpr(exprText);
       return { kind: "select_item", expr, alias: m[2]!, window };
     }
     const exprText = item.trim();
     const window = parseWindowFunction(exprText);
-    const expr = window ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+    const expr = window
+      ? ({ kind: "function", name: window.name, args: window.args } as ExprAst)
+      : parseExpr(exprText);
     return { kind: "select_item", expr, window };
   });
 }
@@ -983,7 +991,8 @@ function parseOrderItems(raw?: string): OrderItemAst[] | undefined {
   return splitCommaAware(raw).map((part) => {
     const m = part.match(/^(.+?)(?:\s+(ASC|DESC))?$/i);
     const exprText = m?.[1] ?? part;
-    const expr = /\bOVER\s*\(/i.test(exprText) ? ({ kind: "raw", text: exprText } as ExprAst) : parseExpr(exprText);
+    // ORDER BY expressions cannot contain window functions - parse normally
+    const expr = parseExpr(exprText);
     const direction = ((m?.[2] ?? "ASC").toUpperCase() as "ASC" | "DESC");
     return { kind: "order_item", expr, direction };
   });

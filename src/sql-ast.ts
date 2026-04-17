@@ -254,7 +254,7 @@ export type ExprAst =
   | { kind: "identifier"; name: string }
   | { kind: "literal"; typedValue: SqlTypedValue }
   | { kind: "function"; name: string; args: ExprAst[]; filter?: ExprAst }
-  | { kind: "case"; whenClauses: { condition: ExprAst; result: ExprAst }[]; elseResult?: ExprAst }
+  | { kind: "case"; baseExpr?: ExprAst; whenClauses: { condition: ExprAst; result: ExprAst }[]; elseResult?: ExprAst }
   | { kind: "binary"; op: string; left: ExprAst; right: ExprAst }
   | { kind: "unary"; op: string; expr: ExprAst }
   | { kind: "exists"; negated: boolean; subquerySql: string }

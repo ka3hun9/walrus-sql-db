@@ -10062,6 +10062,7 @@ export class WalrusSqlClient {
         if (expr.filter) this.validateExprAst(expr.filter);
         return;
       case "case":
+        if (expr.baseExpr) this.validateExprAst(expr.baseExpr);
         for (const wc of expr.whenClauses) {
           this.validateExprAst(wc.condition);
           this.validateExprAst(wc.result);
