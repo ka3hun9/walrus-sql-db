@@ -10046,35 +10046,10 @@ export class WalrusSqlClient {
     return exprAstToSql(expr);
   }
 
-  private isAllowedRawExpr(sql: string): boolean {
-    const s = sql.trim();
-    if (!s) return false;
-    if (s === "*") return true;
-
-    // currently supported raw expression buckets in evaluator path
-    if (/\bOVER\s*\(/i.test(s)) return true; // window expressions in select list
-    if (/\bIS\s+NOT\s+DISTINCT\s+FROM\b/i.test(s) || /\bIS\s+DISTINCT\s+FROM\b/i.test(s)) return true;
-    if (/\bLIKE\b[\s\S]*\bESCAPE\b/i.test(s)) return true;
-    if (/\bCASE\b/i.test(s)) return true; // CASE WHEN may appear anywhere (e.g. SUM(CASE WHEN ...))
-    if (/\bCAST\s*\(/i.test(s)) return true;
-    if (/\b(?:NOT\s+)?EXISTS\s*\(\s*SELECT\b/i.test(s)) return true;
-    if (/\b(?:ANY|SOME|ALL)\s*\(\s*SELECT\b/i.test(s)) return true;
-    if (/\b(?:NOT\s+)?IN\s*\(\s*SELECT\b/i.test(s)) return true;
-    if (/[=<>!]\s*\(\s*SELECT\b/i.test(s)) return true;
-
-    return false;
-  }
-
   private validateExprAst(expr?: ExprAst): void {
     if (!expr) return;
 
     switch (expr.kind) {
-      case "raw": {
-        if (!this.isAllowedRawExpr(expr.text)) {
-          throw sqlError("ERR_UNSUPPORTED_RAW_EXPR", expr.text);
-        }
-        return;
-      }
       case "binary":
         this.validateExprAst(expr.left);
         this.validateExprAst(expr.right);
