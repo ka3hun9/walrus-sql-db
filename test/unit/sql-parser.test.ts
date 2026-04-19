@@ -321,6 +321,78 @@ describe("raw expression canary", () => {
     }
   });
 
+  describe("GRANT/REVOKE statement parsing (SQL:2016)", () => {
+    it("parses GRANT SELECT ON table TO user", () => {
+      const ast = parseSqlToAst("GRANT SELECT ON users TO alice");
+      expect(ast.kind).toBe("grant");
+      if (ast.kind === "grant") {
+        expect(ast.privileges).toEqual(["SELECT"]);
+        expect(ast.onObject).toEqual({ type: "table", name: "users" });
+        expect(ast.grantee).toEqual({ kind: "user", name: "alice" });
+        expect(ast.withGrantOption).toBe(false);
+      }
+    });
+
+    it("parses GRANT ALL ON table TO PUBLIC", () => {
+      const ast = parseSqlToAst("GRANT ALL ON products TO PUBLIC");
+      expect(ast.kind).toBe("grant");
+      if (ast.kind === "grant") {
+        expect(ast.privileges).toEqual(["ALL"]);
+        expect(ast.grantee.kind).toBe("public");
+      }
+    });
+
+    it("parses GRANT SELECT ON table TO user WITH GRANT OPTION", () => {
+      const ast = parseSqlToAst("GRANT SELECT ON users TO admin WITH GRANT OPTION");
+      expect(ast.kind).toBe("grant");
+      if (ast.kind === "grant") {
+        expect(ast.withGrantOption).toBe(true);
+      }
+    });
+
+    it("parses GRANT EXECUTE ON FUNCTION", () => {
+      const ast = parseSqlToAst("GRANT EXECUTE ON FUNCTION my_func TO alice");
+      expect(ast.kind).toBe("grant");
+      if (ast.kind === "grant") {
+        expect(ast.privileges).toEqual(["EXECUTE"]);
+        expect(ast.onObject).toEqual({ type: "function", name: "my_func" });
+      }
+    });
+
+    it("parses REVOKE SELECT ON table FROM user", () => {
+      const ast = parseSqlToAst("REVOKE SELECT ON users FROM alice");
+      expect(ast.kind).toBe("revoke");
+      if (ast.kind === "revoke") {
+        expect(ast.privileges).toEqual(["SELECT"]);
+        expect(ast.grantee).toEqual({ kind: "user", name: "alice" });
+      }
+    });
+
+    it("parses REVOKE GRANT OPTION FOR", () => {
+      const ast = parseSqlToAst("REVOKE GRANT OPTION FOR SELECT ON users FROM admin");
+      expect(ast.kind).toBe("revoke");
+      if (ast.kind === "revoke") {
+        expect(ast.grantOptionFor).toBe(true);
+      }
+    });
+
+    it("parses REVOKE WITH CASCADE", () => {
+      const ast = parseSqlToAst("REVOKE SELECT ON users FROM alice CASCADE");
+      expect(ast.kind).toBe("revoke");
+      if (ast.kind === "revoke") {
+        expect(ast.cascade).toBe(true);
+      }
+    });
+
+    it("parses REVOKE EXECUTE ON FUNCTION", () => {
+      const ast = parseSqlToAst("REVOKE EXECUTE ON FUNCTION my_func FROM alice");
+      expect(ast.kind).toBe("revoke");
+      if (ast.kind === "revoke") {
+        expect(ast.onObject).toEqual({ type: "function", name: "my_func" });
+      }
+    });
+  });
+
   it("has cached fixture SQL to test", () => {
     console.log(`cachedSqlQueries.length = ${cachedSqlQueries.length}`);
     expect(cachedSqlQueries.length).toBeGreaterThan(0);

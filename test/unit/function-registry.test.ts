@@ -234,3 +234,139 @@ describe("function registry: window functions (FIRST_VALUE, LAST_VALUE, NTILE)",
     expect(result.rows[2]!.bucket).toBe(2);
   });
 });
+
+describe("function registry: JSON functions (SQL:2016)", () => {
+  it("JSON_VALID returns 1 for valid JSON", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_VALID('{\"a\":1}') AS result");
+    expect(result.rows[0]!.result).toBe(1);
+  });
+
+  it("JSON_VALID returns 0 for invalid JSON", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_VALID('invalid') AS result");
+    expect(result.rows[0]!.result).toBe(0);
+  });
+
+  it("JSON_EXTRACT extracts JSON value", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_EXTRACT('{\"a\":1}', '$.a') AS result");
+    // JSON_EXTRACT returns JSON scalar values as strings in the primitive path
+    expect(result.rows[0]!.result).toBe("1");
+  });
+
+  it("JSON_EXISTS returns 1 when path exists", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_EXISTS('{\"a\":1}', '$.a') AS result");
+    expect(result.rows[0]!.result).toBe(1);
+  });
+
+  it("JSON_EXISTS returns 0 when path does not exist", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_EXISTS('{\"a\":1}', '$.b') AS result");
+    expect(result.rows[0]!.result).toBe(0);
+  });
+
+  it("JSON_VALUE extracts scalar value", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_VALUE('{\"a\":\"hello\"}', '$.a') AS result");
+    expect(result.rows[0]!.result).toBe("hello");
+  });
+
+  it("JSON_KEYS returns array of keys", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_KEYS('{\"a\":1,\"b\":2}') AS result");
+    expect(result.rows[0]!.result).toBe("[\"a\",\"b\"]");
+  });
+
+  it("JSON_CONTAINS returns 1 when contains", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_CONTAINS('{\"a\":1}', '{\"a\":1}') AS result");
+    expect(result.rows[0]!.result).toBe(1);
+  });
+
+  it("JSON_CONTAINS returns 0 when does not contain", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_CONTAINS('{\"a\":1}', '{\"a\":2}') AS result");
+    expect(result.rows[0]!.result).toBe(0);
+  });
+
+  it("JSON_QUERY extracts nested object", async () => {
+    const client = makeClient();
+    const result = await client.query("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a') AS result");
+    expect(result.rows[0]!.result).toBe("{\"b\":1}");
+  });
+});
+
+describe("function registry: aggregate window functions (SUM/AVG/COUNT/MIN/MAX OVER)", () => {
+  let client: InstanceType<typeof WalrusSqlClient>;
+  beforeEach(async () => {
+    client = makeClient();
+    await client.execute("CREATE TABLE test_agg_window (id INTEGER, category TEXT, val INTEGER)");
+    await client.execute("INSERT INTO test_agg_window VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 40)");
+  });
+
+  it("SUM OVER calculates cumulative sum", async () => {
+    const result = await client.query(
+      "SELECT id, val, SUM(val) OVER (ORDER BY id) AS cum_sum FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.cum_sum).toBe(10);
+    expect(result.rows[1]!.cum_sum).toBe(30);
+    expect(result.rows[2]!.cum_sum).toBe(60);
+    expect(result.rows[3]!.cum_sum).toBe(100);
+  });
+
+  it("AVG OVER calculates cumulative average", async () => {
+    const result = await client.query(
+      "SELECT id, val, AVG(val) OVER (ORDER BY id) AS cum_avg FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.cum_avg).toBe(10);
+    expect(result.rows[1]!.cum_avg).toBe(15);
+    expect(result.rows[2]!.cum_avg).toBe(20);
+    expect(result.rows[3]!.cum_avg).toBe(25);
+  });
+
+  it("COUNT(*) OVER counts all rows in frame", async () => {
+    const result = await client.query(
+      "SELECT id, COUNT(*) OVER (ORDER BY id) AS cnt FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.cnt).toBe(1);
+    expect(result.rows[1]!.cnt).toBe(2);
+    expect(result.rows[2]!.cnt).toBe(3);
+    expect(result.rows[3]!.cnt).toBe(4);
+  });
+
+  it("COUNT(col) OVER counts non-null values", async () => {
+    await client.execute("INSERT INTO test_agg_window VALUES (5, 'A', NULL)");
+    const result = await client.query(
+      "SELECT id, COUNT(val) OVER (ORDER BY id) AS cnt FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[4]!.cnt).toBe(4);
+  });
+
+  it("MIN OVER finds minimum in frame", async () => {
+    const result = await client.query(
+      "SELECT id, val, MIN(val) OVER (ORDER BY id) AS min_val FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.min_val).toBe(10);
+    expect(result.rows[3]!.min_val).toBe(10);
+  });
+
+  it("MAX OVER finds maximum in frame", async () => {
+    const result = await client.query(
+      "SELECT id, val, MAX(val) OVER (ORDER BY id) AS max_val FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.max_val).toBe(10);
+    expect(result.rows[3]!.max_val).toBe(40);
+  });
+
+  it("SUM OVER with PARTITION BY calculates per partition", async () => {
+    const result = await client.query(
+      "SELECT id, category, val, SUM(val) OVER (PARTITION BY category ORDER BY id) AS part_sum FROM test_agg_window ORDER BY id"
+    );
+    expect(result.rows[0]!.part_sum).toBe(10);
+    expect(result.rows[1]!.part_sum).toBe(30);
+    expect(result.rows[2]!.part_sum).toBe(30);
+    expect(result.rows[3]!.part_sum).toBe(70);
+  });
+});
