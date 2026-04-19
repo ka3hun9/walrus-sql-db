@@ -322,6 +322,7 @@ describe("raw expression canary", () => {
   });
 
   it("has cached fixture SQL to test", () => {
+    console.log(`cachedSqlQueries.length = ${cachedSqlQueries.length}`);
     expect(cachedSqlQueries.length).toBeGreaterThan(0);
   });
 
@@ -344,6 +345,7 @@ describe("raw expression canary", () => {
     const parseErrors: Array<{ file: string; line: number; sql: string; error: string }> = [];
     const pathBreakdown: Record<string, number> = {};
     let queriesWithRaw = 0;
+    const firstFewRaw: Array<{ file: string; sql: string; rawKinds: string[] }> = [];
     for (const { file, sql, line } of cachedSqlQueries) {
       try {
         const ast = parseSqlToAst(sql, { dialect: "sqlite" });
@@ -351,10 +353,31 @@ describe("raw expression canary", () => {
         if (rawPaths.length > 0) {
           queriesWithRaw++;
           for (const p of rawPaths) pathBreakdown[p] = (pathBreakdown[p] ?? 0) + 1;
+          if (firstFewRaw.length < 3) {
+            // Collect info about first few raw queries
+            const rawKinds: string[] = [];
+            if (ast.kind === "select") {
+              if (ast.where) {
+                rawKinds.push(`where:${ast.where.kind}`);
+                if (ast.where.kind === "raw") {
+                  rawKinds.push(`whereText:${ast.where.text?.substring(0, 80)}`);
+                }
+              }
+              if (ast.selectItems) rawKinds.push(`select:${ast.selectItems.map(si => si.expr.kind).join(",")}`);
+            }
+            firstFewRaw.push({ file, sql: sql.substring(0, 80), rawKinds });
+          }
         }
       } catch (e: any) {
         parseErrors.push({ file, line, sql, error: e.message });
       }
+    }
+
+    // Debug output
+    console.error(`First few raw queries:`);
+    for (const r of firstFewRaw) {
+      console.error(`  [${r.file}] ${r.sql}`);
+      console.error(`    raw kinds: ${r.rawKinds.join(", ")}`);
     }
     // Report summary
     const totalQueries = cachedSqlQueries.length;

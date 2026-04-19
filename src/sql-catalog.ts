@@ -7,6 +7,8 @@ export type ColumnTypeSpec = {
   length?: number;
   precision?: number;
   scale?: number;
+  /** If set, this column was defined using a domain (for DROP DOMAIN CASCADE) */
+  domainName?: string;
 };
 
 export type ColumnSchema = {
@@ -61,11 +63,30 @@ export type ViewCatalogEntry = {
   dependencies: ViewDependencyEntry[];
   invalidReason?: string;
   invalidatedAt?: number;
+  withCheckOption?: boolean;
+  // Cached mapping from canonical aggregate key to alias (e.g., "sum" -> "total")
+  aggregateAliasMapping?: Map<string, string>;
 };
 
 export type ViewDependencyEntry = {
   source: string;
   columns: string[];
+};
+
+export type DomainCatalogEntry = {
+  name: string;
+  baseType: string;
+  length?: number;
+  precision?: number;
+  scale?: number;
+  defaultValue?: SqlPrimitive;
+  constraints: Array<{ type: "NOT NULL" | "UNIQUE" | "CHECK"; expression?: string }>;
+};
+
+export type AssertionCatalogEntry = {
+  name: string;
+  predicate: string;
+  initiallyDeferred: boolean;
 };
 
 export type ConstraintIndexCostStats = {

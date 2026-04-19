@@ -42,6 +42,7 @@ import { buildMoveCall, buildPagedMoveCall, getTableVersionHistory, PagedMoveCal
 import { parseSqlToAst } from "./sql-parser.js";
 import { exprAstToSql } from "./sql-ast-eval.js";
 import { SCALAR_FUNCTIONS_PRIMITIVE, evaluateScalarFunctionPrimitive, WINDOW_FUNCTIONS } from "./functions/mod.js";
+import type { WindowContext } from "./functions/types.js";
 import { SqlEngineError, createSqlError } from "./sql-errors.js";
 import { WalrusBatchCommitter, buildBatchMoveCallPayload, type BatchableDmlOp } from "./walrus-batch.js";
 import { OptimisticLockManager, type OptimisticLockOptions, OptimisticConflictError, threeWayMerge, buildRowVersionHash } from "./walrus-optimistic-lock.js";
@@ -52,6 +53,10 @@ import type {
   CreateFunctionStatementAst,
   CreateTriggerStatementAst,
   CreateViewStatementAst,
+  CreateDomainStatementAst,
+  DropDomainStatementAst,
+  CreateAssertionStatementAst,
+  DropAssertionStatementAst,
   DropIndexStatementAst,
   DropViewStatementAst,
   ExprAst,
@@ -84,6 +89,8 @@ import {
   type TableSchema,
   type ViewDependencyEntry,
   type ViewCatalogEntry,
+  type DomainCatalogEntry,
+  type AssertionCatalogEntry,
 } from "./sql-catalog.js";
 
 type CompareOp =
@@ -201,7 +208,8 @@ type WhereExprNode =
 
 type RankingWindowFunctionName = "ROW_NUMBER" | "RANK" | "DENSE_RANK";
 type OffsetWindowFunctionName = "LAG" | "LEAD";
-type SupportedWindowFunctionName = RankingWindowFunctionName | OffsetWindowFunctionName;
+type AggregateWindowFunctionName = "SUM" | "AVG" | "COUNT" | "MIN" | "MAX";
+type SupportedWindowFunctionName = RankingWindowFunctionName | OffsetWindowFunctionName | AggregateWindowFunctionName;
 
 type WindowFrameBoundSpec =
   | { kind: "unbounded_preceding" }
@@ -260,11 +268,22 @@ type DistributionWindowFunctionSpec = {
   frame?: WindowFrameSpec;
 };
 
+type AggregateWindowFunctionSpec = {
+  kind: "aggregate";
+  name: AggregateWindowFunctionName;
+  alias: string;
+  partitionBy: string[];
+  orderBy: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  expr: string;
+  frame?: WindowFrameSpec;
+};
+
 type ParsedWindowFunctionSpec =
   | RankingWindowFunctionSpec
   | OffsetWindowFunctionSpec
   | ValueWindowFunctionSpec
-  | DistributionWindowFunctionSpec;
+  | DistributionWindowFunctionSpec
+  | AggregateWindowFunctionSpec;
 
 type ParsedSelect = {
   explain: boolean;
@@ -279,7 +298,7 @@ type ParsedSelect = {
   offset?: number;
   orderBy?: string;
   orderDirection?: "ASC" | "DESC";
-  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC"; nullsPosition?: "FIRST" | "LAST" }>;
   aggregate?: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL" | "GROUP_CONCAT";
   aggregateField?: string;
   aggregateFilter?: ExprAst;
@@ -287,16 +306,20 @@ type ParsedSelect = {
   groupBy?: string[];
   having?: string;
   join?: {
-    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS";
     table: string;
     leftField: string;
     rightField: string;
+    natural?: boolean;
+    usingColumns?: string[];
   };
   joins?: Array<{
-    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS";
     table: string;
     leftField: string;
     rightField: string;
+    natural?: boolean;
+    usingColumns?: string[];
   }>;
   windowFunctions?: ParsedWindowFunctionSpec[];
 };
@@ -333,7 +356,7 @@ type LogicalSelectPlan = {
   aggregateField?: string;
   aggregateFilter?: ExprAst;
   aggregateSeparator?: string;
-  orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+  orderByList?: Array<{ field: string; direction: "ASC" | "DESC"; nullsPosition?: "FIRST" | "LAST" }>;
   limit?: number;
   offset?: number;
   windowFunctions?: ParsedWindowFunctionSpec[];
@@ -762,17 +785,24 @@ const SHARED_CTE_TABLES = new Set<string>();
 
 export class WalrusSqlClient {
   private readonly opts: WalrusSqlClientOptions;
-  private isolationLevel: "read_committed" | "serializable" | "repeatable_read";
+  private isolationLevel: "read_uncommitted" | "read_committed" | "serializable" | "repeatable_read";
+  private transactionMode: "read_write" | "read_only" = "read_write";
   private readonly tables = new Map<string, SqlRow[]>();
   private readonly schemas = new Map<string, TableSchema>();
   private readonly indexCatalog = new Map<string, IndexCatalogEntry>();
   private readonly viewCatalog = new Map<string, ViewCatalogEntry>();
+  /** Domain catalog: domainName -> DomainCatalogEntry */
+  private readonly domainCatalog = new Map<string, DomainCatalogEntry>();
+  /** Assertion catalog: assertionName -> AssertionCatalogEntry */
+  private readonly assertionCatalog = new Map<string, AssertionCatalogEntry>();
   /** Schema namespace catalog: schemaName -> { owner, createdAt } */
   private readonly schemaCatalog = new Map<string, { owner: string; createdAt: number }>();
   /** Scalar function catalog: functionName -> { params, returnType, body } */
   private readonly functionCatalog = new Map<string, { params: Array<{ name: string; typeName: string }>; returnType: string; body: string }>();
   /** Trigger catalog: triggerName -> { name, tableName, timing, event, body } */
   private readonly triggerCatalog = new Map<string, { name: string; tableName: string; timing: "BEFORE" | "AFTER"; event: "INSERT" | "UPDATE" | "DELETE"; body: string }>();
+  /** Disabled constraints: tableName -> set of disabled constraint names */
+  private readonly disabledConstraints = new Map<string, Set<string>>();
   private readonly cursorCatalog = new Map<string, {
     name: string;
     querySql: string;
@@ -831,14 +861,14 @@ export class WalrusSqlClient {
   constructor(opts: WalrusSqlClientOptions) {
     this.opts = opts;
     const isolation = String(opts.isolationLevel ?? "read_committed").toLowerCase();
-    if (isolation !== "read_committed" && isolation !== "serializable" && isolation !== "repeatable_read") {
+    if (isolation !== "read_uncommitted" && isolation !== "read_committed" && isolation !== "serializable" && isolation !== "repeatable_read") {
       throw sqlError(
         ClientErrorCodeEnum.TransactionState,
         `unsupported isolation level: ${String(opts.isolationLevel)}`,
         { clause: "TRANSACTION", token: String(opts.isolationLevel) },
       );
     }
-    this.isolationLevel = isolation as "read_committed" | "serializable" | "repeatable_read";
+    this.isolationLevel = isolation as "read_uncommitted" | "read_committed" | "serializable" | "repeatable_read";
     this.currentUser = opts.authUsername ?? "current_user";
     this.logger = createLogger({
       level: opts.logging?.level ?? "error",
@@ -904,7 +934,7 @@ export class WalrusSqlClient {
     return this.transactionState;
   }
 
-  getIsolationLevel(): "read_committed" | "serializable" | "repeatable_read" {
+  getIsolationLevel(): "read_uncommitted" | "read_committed" | "serializable" | "repeatable_read" {
     return this.isolationLevel;
   }
 
@@ -3226,10 +3256,93 @@ export class WalrusSqlClient {
     this.activeViewResolutionStack.push(viewName);
     try {
       const result = await this.query(viewEntry.querySql);
-      return this.normalizeMaterializedViewRows(result.rows);
+      const rows = this.normalizeMaterializedViewRows(result.rows);
+      // Use cached alias mapping if available, otherwise compute and cache it
+      if (!viewEntry.aggregateAliasMapping) {
+        viewEntry.aggregateAliasMapping = this.computeAggregateAliasMapping(viewEntry.querySql);
+      }
+      return this.mapAggregateRowAliases(rows, viewEntry.aggregateAliasMapping);
     } finally {
       this.activeViewResolutionStack.pop();
     }
+  }
+
+  // Compute mapping from canonical aggregate keys to aliases for a SELECT query
+  private computeAggregateAliasMapping(querySql: string): Map<string, string> {
+    const canonicalToAlias = new Map<string, string>();
+    const ast = parseSqlToAst(querySql, { dialect: this.opts.dialect ?? "ansi" });
+    if (ast.kind !== "select") return canonicalToAlias;
+    for (const item of ast.selectItems) {
+      if (item.kind === "select_item" && item.alias) {
+        if (item.expr.kind === "function") {
+          const fnName = item.expr.name.toUpperCase();
+          if (["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(fnName)) {
+            canonicalToAlias.set(fnName.toLowerCase(), item.alias);
+          }
+        }
+      }
+    }
+    return canonicalToAlias;
+  }
+
+  // Map aggregate canonical keys (sum/count/avg/min/max/total/group_concat) to their aliases
+  // This is needed because computeAggregateRow returns canonical keys, but the view/CTE
+  // may use aliases like "SELECT SUM(x) AS total FROM t"
+  private mapAggregateRowAliases(rows: SqlRow[], canonicalToAlias: Map<string, string>): SqlRow[] {
+    if (rows.length === 0 || canonicalToAlias.size === 0) return rows;
+
+    // Apply mapping to each row
+    return rows.map((row) => {
+      const out: SqlRow = { ...row };
+      for (const [canonical, alias] of canonicalToAlias) {
+        if (Object.prototype.hasOwnProperty.call(out, canonical)) {
+          out[alias] = out[canonical];
+          delete out[canonical];
+        }
+      }
+      return out;
+    });
+  }
+
+  private validateWithCheckOption(viewEntry: ViewCatalogEntry, row: SqlRow): void {
+    if (!viewEntry.withCheckOption) return;
+
+    // Parse the view's SELECT query to extract the WHERE clause
+    const viewAst = parseSqlToAst(viewEntry.querySql, { dialect: this.opts.dialect ?? "ansi" });
+    if (viewAst.kind !== "select") return; // UNION/INTERSECT/EXCEPT - skip for now
+
+    const whereTree = viewAst.where ? this.parseWhereTree(exprAstToSql(viewAst.where) ?? "1=1") : null;
+
+    // If no WHERE clause, all rows are visible
+    if (!whereTree) return;
+
+    // Evaluate the WHERE clause against the new row
+    const result = this.evaluateWhereTree(row, whereTree);
+    if (result !== "TRUE") {
+      throw sqlError(
+        "ERR_CHECK_OPTION_VIOLATION",
+        `WITH CHECK OPTION violated: row does not satisfy the view's WHERE condition`,
+      );
+    }
+  }
+
+  private resolveViewToBaseTable(viewEntry: ViewCatalogEntry): string {
+    // For simple views with a single base table, return that table
+    // For complex views (joins, etc.), this would need more sophisticated handling
+    if (viewEntry.dependencies.length === 0) {
+      throw sqlError("ERR_UNSUPPORTED_INSERT", `cannot INSERT/UPDATE on view with no base table: ${viewEntry.name}`);
+    }
+    if (viewEntry.dependencies.length > 1) {
+      throw sqlError("ERR_UNSUPPORTED_INSERT", `cannot INSERT/UPDATE on view with multiple base tables: ${viewEntry.name}`);
+    }
+    const normalizedSource = viewEntry.dependencies[0]!.source;
+    // Find the actual table name (case-insensitive match but case-sensitive lookup)
+    for (const tableName of this.tables.keys()) {
+      if (tableName.toUpperCase() === normalizedSource) {
+        return tableName;
+      }
+    }
+    throw sqlError("ERR_TABLE_NOT_FOUND", `base table for view not found: ${normalizedSource}`);
   }
 
   private normalizeMaterializedViewRows(rows: SqlRow[]): SqlRow[] {
@@ -3833,16 +3946,36 @@ export class WalrusSqlClient {
       }
     }
 
-    // SET TRANSACTION ISOLATION LEVEL
-    const setTxnMatch = upper.match(/^SET\s+TRANSACTION\s+ISOLATION\s+LEVEL\s+(SERIALIZABLE|REPEATABLE\s+READ|READ\s+COMMITTED)$/i);
-    if (setTxnMatch) {
-      const level = setTxnMatch[1]!.toUpperCase().replace(/\s+/g, "_") as "SERIALIZABLE" | "REPEATABLE_READ" | "READ_COMMITTED";
-      const levelMap: Record<string, "serializable" | "repeatable_read" | "read_committed"> = {
+    // SET TRANSACTION [ISOLATION LEVEL <level>] [READ ONLY | READ WRITE]
+    const setTxnFullMatch = upper.match(/^SET\s+TRANSACTION\s+(?:ISOLATION\s+LEVEL\s+(SERIALIZABLE|REPEATABLE\s+READ|READ\s+COMMITTED|READ\s+UNCOMMITTED))?(?:,\s*(READ\s+ONLY|READ\s+WRITE))?$/i);
+    if (setTxnFullMatch) {
+      const levelMap: Record<string, "serializable" | "repeatable_read" | "read_committed" | "read_uncommitted"> = {
         SERIALIZABLE: "serializable",
-        REPEATABLE_READ: "repeatable_read",
-        READ_COMMITTED: "read_committed",
+        "REPEATABLE READ": "repeatable_read",
+        "READ COMMITTED": "read_committed",
+        "READ UNCOMMITTED": "read_uncommitted",
       };
-      this.isolationLevel = levelMap[level];
+      const modeMap: Record<string, "read_only" | "read_write"> = {
+        "READ ONLY": "read_only",
+        "READ WRITE": "read_write",
+      };
+      if (setTxnFullMatch[1]) {
+        this.isolationLevel = levelMap[setTxnFullMatch[1]!];
+      }
+      if (setTxnFullMatch[2]) {
+        this.transactionMode = modeMap[setTxnFullMatch[2]!];
+      }
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "SET",
+        affectedRows: 0,
+      };
+    }
+
+    // Also support just SET TRANSACTION READ ONLY / READ WRITE (without ISOLATION LEVEL)
+    const setTxnModeMatch = upper.match(/^SET\s+TRANSACTION\s+(READ\s+ONLY|READ\s+WRITE)$/i);
+    if (setTxnModeMatch) {
+      this.transactionMode = setTxnModeMatch[1]!.toUpperCase() === "READ ONLY" ? "read_only" : "read_write";
       return {
         txDigest: this.fakeDigest(normalized),
         statementType: "SET",
@@ -4013,6 +4146,54 @@ export class WalrusSqlClient {
         txDigest: this.fakeDigest(normalized),
         statementType: "DELETE",
         affectedRows: viewName ? 1 : 0,
+      };
+    }
+
+    if (upper.startsWith("CREATE DOMAIN")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_domain") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      this.executeCreateDomainStatement(ast);
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("DROP DOMAIN")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_domain") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const domainName = this.executeDropDomainStatement(ast);
+      if (domainName) this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: domainName ? 1 : 0,
+      };
+    }
+
+    if (upper.startsWith("CREATE ASSERTION")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "create_assertion") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      this.executeCreateAssertionStatement(ast);
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "CREATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (upper.startsWith("DROP ASSERTION")) {
+      const ast = parseSqlToAst(normalized, { dialect: this.opts.dialect ?? "ansi" });
+      if (ast.kind !== "drop_assertion") throw sqlError("ERR_UNSUPPORTED_DDL", normalized);
+      const assertionName = this.executeDropAssertionStatement(ast);
+      if (assertionName) this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(normalized),
+        statementType: "DELETE",
+        affectedRows: assertionName ? 1 : 0,
       };
     }
 
@@ -4339,6 +4520,11 @@ export class WalrusSqlClient {
           updateCounts.set(table, (updateCounts.get(table) ?? 0) + count);
         }
 
+        const setNullCounts = this.applyOnUpdateSetNullOrDefault(plan.table, beforeImage, row);
+        for (const [table, count] of setNullCounts.entries()) {
+          updateCounts.set(table, (updateCounts.get(table) ?? 0) + count);
+        }
+
         // Collect returning rows
         if (returningCols) {
           const schema = this.schemas.get(plan.table);
@@ -4456,9 +4642,14 @@ export class WalrusSqlClient {
         }
       }
 
+      // Handle ON DELETE SET NULL/SET DEFAULT before collecting delete targets
+      const setNullCounts = this.applyOnDeleteSetNullOrDefault(plan.table, matchedRows);
+
       const deleteTargets = this.collectDeleteTargetsWithCascade(plan.table, matchedRows);
       const deleteCounts = this.applyDeleteTargets(deleteTargets);
-      const touched = [...deleteCounts.values()].reduce((sum, count) => sum + count, 0);
+      const deleteTouched = [...deleteCounts.values()].reduce((sum, count) => sum + count, 0);
+      const setNullTouched = [...setNullCounts.values()].reduce((sum, count) => sum + count, 0);
+      const touched = deleteTouched + setNullTouched;
 
       // Fire AFTER DELETE triggers
       for (const row of matchedRows) {
@@ -4469,11 +4660,19 @@ export class WalrusSqlClient {
         for (const [table, count] of deleteCounts.entries()) {
           if (count > 0) this.bumpTableWriteStats(table, { deleteRows: count });
         }
+        for (const [table, count] of setNullCounts.entries()) {
+          if (count > 0) this.bumpTableWriteStats(table, { updateRows: count });
+        }
       } else {
         for (const [table, count] of deleteCounts.entries()) {
           if (count > 0) this.dirtyTables.add(table);
           if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
           if (count > 0) this.recordStorageWrite(table, "DELETE_ROW", count, "simulator");
+        }
+        for (const [table, count] of setNullCounts.entries()) {
+          if (count > 0) this.dirtyTables.add(table);
+          if (count > 0) this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
+          if (count > 0) this.recordStorageWrite(table, "UPDATE_ROW", count, "simulator");
         }
         if (touched > 0) this.invalidateReadCacheOnWrite();
       }
@@ -4891,6 +5090,8 @@ export class WalrusSqlClient {
           table: j.table,
           leftField: j.leftField,
           rightField: j.rightField,
+          ...(j.natural ? { natural: true } : {}),
+          ...(j.usingColumns ? { usingColumns: j.usingColumns } : {}),
         }))
       : parsed.join
       ? [{
@@ -4898,6 +5099,8 @@ export class WalrusSqlClient {
           table: parsed.join.table,
           leftField: parsed.join.leftField,
           rightField: parsed.join.rightField,
+          ...(parsed.join.natural ? { natural: true } : {}),
+          ...(parsed.join.usingColumns ? { usingColumns: parsed.join.usingColumns } : {}),
         }]
       : [];
     if (rawJoins.length > 0) rewriteRules.push("RULE_CANONICALIZE_JOIN_CHAIN");
@@ -4913,6 +5116,7 @@ export class WalrusSqlClient {
     const orderByList = parsed.orderByList?.map((order) => ({
       field: order.field.trim(),
       direction: (order.direction === "DESC" ? "DESC" : "ASC") as "ASC" | "DESC",
+      ...(order.nullsPosition ? { nullsPosition: order.nullsPosition } : {}),
     }));
     const orderChanged = Boolean(
       orderByList?.some((order, idx) => {
@@ -7086,8 +7290,32 @@ export class WalrusSqlClient {
 
     const normalizedName = normalizeRuntimeTypeName(m[1]!);
     if (!normalizedName || normalizedName === "NULL") throw sqlError("ERR_UNSUPPORTED_TYPE", rawType);
-    const name = normalizedName as SqlTypeName;
 
+    // Check if the type name is actually a domain
+    const domainEntry = this.domainCatalog.get(normalizedName);
+    if (domainEntry) {
+      // Resolve domain to its base type, but track the domain name for CASCADE
+      const domainBaseName = domainEntry.baseType as SqlTypeName;
+      const params = m[2]?.split(",").map((x) => Number(x.trim()));
+      if (domainBaseName === "DECIMAL") {
+        if (!params || params.length !== 2 || !Number.isInteger(params[0]) || !Number.isInteger(params[1])) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", `DECIMAL requires (precision,scale): ${rawType}`);
+        }
+        return { name: domainBaseName, precision: params[0], scale: params[1], domainName: normalizedName };
+      }
+      if (domainBaseName === "CHAR" || domainBaseName === "VARCHAR") {
+        if (!params || params.length !== 1 || !Number.isInteger(params[0]) || params[0]! <= 0) {
+          throw sqlError("ERR_TYPE_CONSTRAINT", `${domainBaseName} requires positive length: ${rawType}`);
+        }
+        return { name: domainBaseName, length: params[0]!, domainName: normalizedName };
+      }
+      if (params && params.length > 0) {
+        throw sqlError("ERR_TYPE_CONSTRAINT", `${domainBaseName} does not accept parameters: ${rawType}`);
+      }
+      return { name: domainBaseName, domainName: normalizedName };
+    }
+
+    const name = normalizedName as SqlTypeName;
     const params = m[2]?.split(",").map((x) => Number(x.trim()));
 
     if (name === "DECIMAL") {
@@ -7279,7 +7507,7 @@ export class WalrusSqlClient {
         continue;
       }
 
-      const dm = d.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i);
+      const dm = d.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+((?:TIME|TIMESTAMP)\s+WITH\s+TIME\s+ZONE|[a-zA-Z]+(?:\s*\([^\)]*\))?)\s*(.*)$/i);
       if (!dm) throw sqlError("ERR_UNSUPPORTED_DDL", `invalid column definition: ${d}`);
       const colName = dm[1]!.trim();
       const type = this.parseSqlTypeSpec(dm[2]!);
@@ -7296,6 +7524,15 @@ export class WalrusSqlClient {
         throw sqlError("ERR_UNSUPPORTED_DDL", `DEFAULT NULL conflicts with NOT NULL: ${colName}`);
       }
       columns.push({ name: colName, type, notNull, primaryKey, unique, defaultValue });
+
+      // Column-level CHECK constraint
+      const colCheckMatch = consRaw.match(/^CHECK\s*\((.+)\)$/i);
+      if (colCheckMatch) {
+        checkConstraints.push({
+          name: undefined,
+          predicate: colCheckMatch[1]!.trim(),
+        });
+      }
 
       const colRefMatch = consRaw.match(/\bREFERENCES\s+(.+)$/i);
       if (colRefMatch) {
@@ -7802,6 +8039,20 @@ export class WalrusSqlClient {
       if (hh > 23 || mm > 59 || ss > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME: ${s}`);
       return s;
     }
+    if (type.name === "TIME_TZ") {
+      const s = String(value).trim();
+      const m = s.match(/^(\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
+      if (!m) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME_TZ: ${s}`);
+      const timePart = m[1]!;
+      const zonePart = (m[2]?.trim() ?? "Z").toUpperCase();
+      const [hh, mm, ss] = timePart.split(":").map((x) => Number(x));
+      if (hh > 23 || mm > 59 || ss > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME_TZ: ${s}`);
+      if (zonePart !== "Z") {
+        const [zh, zm] = zonePart.slice(1).split(":").map((x) => Number(x));
+        if (zh > 23 || zm > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIME_TZ: ${s}`);
+      }
+      return `${timePart}${zonePart !== "Z" ? zonePart : "Z"}`;
+    }
     if (type.name === "TIMESTAMP") {
       const s = String(value).trim();
       const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
@@ -7832,6 +8083,21 @@ export class WalrusSqlClient {
       if (Number.isNaN(dt.getTime())) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP: ${s}`);
       return `${dt.toISOString().slice(0, 19)}Z`;
     }
+    if (type.name === "TIMESTAMP_TZ") {
+      const s = String(value).trim();
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
+      if (!m) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP_TZ: ${s}`);
+      const datePart = m[1]!;
+      const timePart = m[2]!;
+      const zonePart = (m[3]?.trim() ?? "Z").toUpperCase();
+      const [hh, mm, ss] = timePart.split(":").map((x) => Number(x));
+      if (hh > 23 || mm > 59 || ss > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP_TZ: ${s}`);
+      if (zonePart !== "Z") {
+        const [zh, zm] = zonePart.slice(1).split(":").map((x) => Number(x));
+        if (zh > 23 || zm > 59) throw sqlError("ERR_TYPE_CONSTRAINT", `invalid TIMESTAMP_TZ: ${s}`);
+      }
+      return `${datePart}T${timePart}${zonePart}`;
+    }
     if (type.name === "BLOB") {
       try {
         if (typeof value === "string") return encodeBlob(value);
@@ -7839,6 +8105,14 @@ export class WalrusSqlClient {
       } catch {
         throw sqlError("ERR_TYPE_CONSTRAINT", `invalid BLOB: ${String(value)}`);
       }
+    }
+    // INTERVAL values are stored as interval objects with __interval__ marker
+    if (type.name === "INTERVAL") {
+      return value; // Value should already be an interval object from bindTypedValue
+    }
+    // XML values are stored as strings
+    if (type.name === "XML") {
+      return String(value);
     }
 
     throw sqlError("ERR_UNSUPPORTED_TYPE", type.name);
@@ -7873,17 +8147,21 @@ export class WalrusSqlClient {
 
     const out: SqlRow = {};
     for (const c of schema.columns) {
-      const hasCandidate = Object.prototype.hasOwnProperty.call(candidate, c.name);
-      const raw = hasCandidate ? candidate[c.name] : (c.defaultValue ?? null);
+      // Find the actual key in candidate that matches column name (case-insensitive)
+      const actualKey = Object.keys(candidate).find((k) => k.toUpperCase() === c.name.toUpperCase());
+      const hasCandidate = actualKey !== undefined;
+      const raw = hasCandidate && actualKey !== undefined ? candidate[actualKey] : (c.defaultValue ?? null);
 
       let bound: SqlTypedValue;
       try {
+        // Check if previous row has this column (case-insensitive) for binding mode determination
+        const prevKey = previous ? Object.keys(previous).find((k) => k.toUpperCase() === c.name.toUpperCase()) : undefined;
         bound =
           boundInputs[c.name]
           ?? (hasCandidate
             ? this.bindTypedValue(
                 (raw ?? null) as SqlPrimitive,
-                previous && Object.prototype.hasOwnProperty.call(previous, c.name) ? "storage" : "js",
+                previous && prevKey ? "storage" : "js",
                 `dml.bind:${table}.${c.name}`,
               )
             : this.bindTypedValue((raw ?? null) as SqlPrimitive, "literal", `dml.default:${table}.${c.name}`));
@@ -8404,17 +8682,6 @@ export class WalrusSqlClient {
           },
         );
       }
-
-      if (ref.fk.onUpdate !== "CASCADE") {
-        throw constraintError(
-          "FOREIGN_KEY",
-          `ON UPDATE ${ref.fk.onUpdate} is not supported in update path yet`,
-          {
-            clause: `ON UPDATE ${ref.fk.onUpdate}`,
-            field: `${parentTable} -> ${ref.table}`,
-          },
-        );
-      }
     }
   }
 
@@ -8433,6 +8700,127 @@ export class WalrusSqlClient {
           const childColumn = ref.fk.columns[i]!;
           const parentColumn = ref.fk.refColumns[i]!;
           candidate[childColumn] = (after[parentColumn] ?? null) as SqlPrimitive;
+        }
+        const next = this.applySchemaOnWrite(ref.table, candidate, childRow);
+        this.commitRowUpdate(ref.table, childRow, next);
+        counts.set(ref.table, (counts.get(ref.table) ?? 0) + 1);
+      }
+    }
+
+    return counts;
+  }
+
+  private applyOnDeleteSetNullOrDefault(parentTable: string, parentRows: SqlRow[]): Map<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const ref of this.getReferencingForeignKeys(parentTable)) {
+      if (ref.fk.onDelete !== "SET NULL" && ref.fk.onDelete !== "SET DEFAULT") continue;
+
+      const childSchema = this.schemas.get(ref.table);
+      if (!childSchema) continue;
+
+      // Validate SET NULL/SET DEFAULT is feasible before processing rows
+      for (let i = 0; i < ref.fk.columns.length; i++) {
+        const childColumn = ref.fk.columns[i]!;
+        const colSchema = childSchema.columns.find((c) => c.name.toUpperCase() === childColumn.toUpperCase());
+        if (!colSchema) continue;
+
+        if (ref.fk.onDelete === "SET NULL") {
+          // SET NULL requires the column to allow NULL values
+          if (colSchema.notNull || colSchema.primaryKey) {
+            throw constraintError(
+              "FOREIGN_KEY",
+              `cannot SET NULL on ${ref.table}.${childColumn}: column is NOT NULL`,
+              { clause: "ON DELETE SET NULL", field: `${ref.table}.${childColumn}` },
+            );
+          }
+        } else {
+          // SET DEFAULT requires the column to have a default value
+          if (colSchema.defaultValue === undefined || colSchema.defaultValue === null) {
+            throw constraintError(
+              "FOREIGN_KEY",
+              `cannot SET DEFAULT on ${ref.table}.${childColumn}: column has no default value`,
+              { clause: "ON DELETE SET DEFAULT", field: `${ref.table}.${childColumn}` },
+            );
+          }
+        }
+      }
+
+      const childRows = this.requireWritableTableForDml(ref.table);
+      for (const parentRow of parentRows) {
+        for (const childRow of childRows) {
+          if (!this.doesChildRowReferenceParent(parentRow, childRow, ref.fk)) continue;
+          const candidate = { ...childRow };
+          for (let i = 0; i < ref.fk.columns.length; i++) {
+            const childColumn = ref.fk.columns[i]!;
+            if (ref.fk.onDelete === "SET NULL") {
+              candidate[childColumn] = null as unknown as SqlPrimitive;
+            } else {
+              // SET DEFAULT: get the default value for the column
+              const colSchema = childSchema.columns.find((c) => c.name.toUpperCase() === childColumn.toUpperCase());
+              candidate[childColumn] = (colSchema?.defaultValue ?? null) as SqlPrimitive;
+            }
+          }
+          const next = this.applySchemaOnWrite(ref.table, candidate, childRow);
+          this.commitRowUpdate(ref.table, childRow, next);
+          counts.set(ref.table, (counts.get(ref.table) ?? 0) + 1);
+        }
+      }
+    }
+
+    return counts;
+  }
+
+  private applyOnUpdateSetNullOrDefault(parentTable: string, before: SqlRow, after: SqlRow): Map<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const ref of this.getReferencingForeignKeys(parentTable)) {
+      if (ref.fk.onUpdate !== "SET NULL" && ref.fk.onUpdate !== "SET DEFAULT") continue;
+      if (!this.didForeignKeyReferenceChange(ref.fk, before, after)) continue;
+
+      const childSchema = this.schemas.get(ref.table);
+      if (!childSchema) continue;
+
+      // Validate SET NULL/SET DEFAULT is feasible before processing rows
+      for (let i = 0; i < ref.fk.columns.length; i++) {
+        const childColumn = ref.fk.columns[i]!;
+        const colSchema = childSchema.columns.find((c) => c.name.toUpperCase() === childColumn.toUpperCase());
+        if (!colSchema) continue;
+
+        if (ref.fk.onUpdate === "SET NULL") {
+          // SET NULL requires the column to allow NULL values
+          if (colSchema.notNull || colSchema.primaryKey) {
+            throw constraintError(
+              "FOREIGN_KEY",
+              `cannot SET NULL on ${ref.table}.${childColumn}: column is NOT NULL`,
+              { clause: "ON UPDATE SET NULL", field: `${ref.table}.${childColumn}` },
+            );
+          }
+        } else {
+          // SET DEFAULT requires the column to have a default value
+          if (colSchema.defaultValue === undefined || colSchema.defaultValue === null) {
+            throw constraintError(
+              "FOREIGN_KEY",
+              `cannot SET DEFAULT on ${ref.table}.${childColumn}: column has no default value`,
+              { clause: "ON UPDATE SET DEFAULT", field: `${ref.table}.${childColumn}` },
+            );
+          }
+        }
+      }
+
+      const childRows = this.requireWritableTableForDml(ref.table);
+      for (const childRow of childRows) {
+        if (!this.doesChildRowReferenceParent(before, childRow, ref.fk)) continue;
+        const candidate = { ...childRow };
+        for (let i = 0; i < ref.fk.columns.length; i++) {
+          const childColumn = ref.fk.columns[i]!;
+          if (ref.fk.onUpdate === "SET NULL") {
+            candidate[childColumn] = null as unknown as SqlPrimitive;
+          } else {
+            // SET DEFAULT: get the default value for the column
+            const colSchema = childSchema.columns.find((c) => c.name.toUpperCase() === childColumn.toUpperCase());
+            candidate[childColumn] = (colSchema?.defaultValue ?? null) as SqlPrimitive;
+          }
         }
         const next = this.applySchemaOnWrite(ref.table, candidate, childRow);
         this.commitRowUpdate(ref.table, childRow, next);
@@ -8476,17 +8864,18 @@ export class WalrusSqlClient {
     operation: "INSERT" | "UPDATE" | "DELETE",
     tableName: string,
     role: "target" | "source" = "target",
-  ): void {
+  ): ViewCatalogEntry | undefined {
     const viewEntry = this.getViewCatalogEntry(tableName);
-    if (!viewEntry) return;
+    if (!viewEntry) return undefined;
 
-    const code = operation === "INSERT"
-      ? ClientErrorCodeEnum.UnsupportedInsert
-      : operation === "UPDATE"
-        ? ClientErrorCodeEnum.UnsupportedUpdate
-        : ClientErrorCodeEnum.UnsupportedDelete;
+    // INSERT and UPDATE on views are supported (WITH CHECK OPTION adds validation)
+    if (operation === "INSERT" || operation === "UPDATE") {
+      return viewEntry;
+    }
+
+    // DELETE on views is not yet supported
     throw sqlError(
-      code,
+      ClientErrorCodeEnum.UnsupportedDelete,
       `updatable view is deferred in Phase 3: ${operation} ${role} cannot reference view ${viewEntry.name}`,
     );
   }
@@ -8918,6 +9307,7 @@ export class WalrusSqlClient {
       querySql: ast.querySql,
       status: "ACTIVE",
       dependencies,
+      withCheckOption: ast.withCheckOption,
     });
     return viewName;
   }
@@ -8949,8 +9339,186 @@ export class WalrusSqlClient {
     }
 
     this.assertViewPermission("DROP", viewName);
+
+    // RESTRICT: error if there are dependent views
+    if (!ast.cascade) {
+      const dependentViews = this.collectTransitiveDependentViews(new Set([viewName]));
+      // Exclude the view itself
+      dependentViews.delete(viewName);
+      if (dependentViews.size > 0) {
+        throw constraintError(
+          "FOREIGN_KEY",
+          `cannot drop view ${ast.viewName}: referenced by ${[...dependentViews].join(", ")}`,
+          {
+            clause: "RESTRICT",
+            field: ast.viewName,
+          },
+        );
+      }
+    }
+
+    // CASCADE: delete all dependent views
+    if (ast.cascade) {
+      const viewsToDelete = this.collectTransitiveDependentViews(new Set([viewName]));
+      for (const v of viewsToDelete) {
+        const viewEntry = this.viewCatalog.get(v);
+        if (viewEntry) {
+          this.viewCatalog.delete(v);
+        }
+      }
+      return entry.name;
+    }
+
     this.viewCatalog.delete(viewName);
     return entry.name;
+  }
+
+  private executeCreateDomainStatement(ast: CreateDomainStatementAst): string {
+    const domainName = this.normalizeDomainName(ast.domainName);
+    if (this.domainCatalog.has(domainName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `domain already exists: ${ast.domainName}`);
+    }
+    // Check that base type is valid
+    const normalizedBaseType = ast.baseType.toUpperCase();
+    const domainEntry: DomainCatalogEntry = {
+      name: domainName,
+      baseType: normalizedBaseType,
+      length: ast.length,
+      precision: ast.precision,
+      scale: ast.scale,
+      defaultValue: ast.defaultValue,
+      constraints: ast.constraints ?? [],
+    };
+    this.domainCatalog.set(domainName, domainEntry);
+    return domainName;
+  }
+
+  private executeDropDomainStatement(ast: DropDomainStatementAst): string | null {
+    const domainName = this.normalizeDomainName(ast.domainName);
+    const entry = this.domainCatalog.get(domainName);
+    if (!entry) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `domain not found: ${ast.domainName}`);
+    }
+
+    // Collect columns that use this domain
+    const dependentColumns: Array<{ table: string; column: string; columnSchema: ColumnSchema }> = [];
+    for (const [tableName, schema] of this.schemas) {
+      for (const col of schema.columns) {
+        if (col.type.domainName?.toUpperCase() === domainName) {
+          dependentColumns.push({ table: tableName, column: col.name, columnSchema: col });
+        }
+      }
+    }
+
+    if (dependentColumns.length > 0) {
+      if (ast.cascade) {
+        // CASCADE: convert columns to use the domain's base type
+        for (const { table, column, columnSchema } of dependentColumns) {
+          const schema = this.schemas.get(table)!;
+          const colIndex = schema.columns.findIndex((c) => c.name.toUpperCase() === column.toUpperCase());
+          if (colIndex >= 0) {
+            // Replace domain type with base type, preserving NOT NULL and other properties
+            schema.columns[colIndex] = {
+              ...schema.columns[colIndex]!,
+              type: {
+                name: entry.baseType as SqlTypeName,
+                length: entry.length,
+                precision: entry.precision,
+                scale: entry.scale,
+                domainName: undefined, // No longer a domain-based column
+              },
+            };
+          }
+        }
+      } else {
+        // RESTRICT: fail if any columns depend on this domain
+        const depList = dependentColumns.map((d) => `${d.table}.${d.column}`).join(", ");
+        throw constraintError(
+          "DDL_DEPENDENCY",
+          `cannot drop domain ${ast.domainName}: referenced by ${depList}`,
+          { token: ast.domainName, clause: "DROP DOMAIN" },
+        );
+      }
+    }
+
+    this.domainCatalog.delete(domainName);
+    return entry.name;
+  }
+
+  private normalizeDomainName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
+  private getDomainCatalogEntry(name: string): DomainCatalogEntry | undefined {
+    return this.domainCatalog.get(this.normalizeDomainName(name));
+  }
+
+  private executeCreateAssertionStatement(ast: CreateAssertionStatementAst): string {
+    const assertionName = this.normalizeAssertionName(ast.assertionName);
+    if (this.assertionCatalog.has(assertionName)) {
+      throw sqlError("ERR_UNSUPPORTED_DDL", `assertion already exists: ${ast.assertionName}`);
+    }
+    const entry: AssertionCatalogEntry = {
+      name: assertionName,
+      predicate: ast.predicate,
+      initiallyDeferred: ast.initiallyDeferred,
+    };
+    this.assertionCatalog.set(assertionName, entry);
+    // Validate immediately if not initially deferred
+    if (!ast.initiallyDeferred) {
+      this.evaluateAssertion(entry);
+    }
+    return assertionName;
+  }
+
+  private executeDropAssertionStatement(ast: DropAssertionStatementAst): string | null {
+    const assertionName = this.normalizeAssertionName(ast.assertionName);
+    const entry = this.assertionCatalog.get(assertionName);
+    if (!entry) {
+      if (ast.ifExists) return null;
+      throw sqlError("ERR_UNSUPPORTED_DDL", `assertion not found: ${ast.assertionName}`);
+    }
+    this.assertionCatalog.delete(assertionName);
+    return entry.name;
+  }
+
+  private normalizeAssertionName(name: string): string {
+    return name.trim().toUpperCase();
+  }
+
+  private evaluateAssertion(entry: AssertionCatalogEntry): void {
+    // Assertions are evaluated as a boolean condition across the entire database
+    // For simplicity, we evaluate as a WHERE predicate against an empty row
+    // since assertions in SQL92 typically check database-level constraints
+    // like "SELECT SUM(...) > 0" or similar.
+    // This is a simplified implementation - full SQL92 assertion evaluation
+    // would require running the predicate as a query and checking if any row satisfies it.
+    try {
+      const result = this.evaluateRawExpression(entry.predicate, {});
+      if (result !== true) {
+        throw constraintError(
+          "CHECK",
+          `assertion "${entry.name}" violated`,
+          { token: entry.name, clause: "ASSERTION" },
+        );
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("assertion")) throw e;
+      // If the assertion predicate can't be evaluated as a simple expression,
+      // it likely contains a subquery which needs special handling
+      // For now, re-throw as assertion violation
+      throw constraintError(
+        "CHECK",
+        `assertion "${entry.name}" could not be evaluated`,
+        { token: entry.name, clause: "ASSERTION" },
+      );
+    }
+  }
+
+  private evaluateRawExpression(expr: string, row: SqlRow): unknown {
+    // Helper to evaluate a raw expression as a boolean
+    return this.evaluateCheckPredicate(row, expr);
   }
 
   // ---------------------------------------------------------------------------
@@ -8959,41 +9527,49 @@ export class WalrusSqlClient {
 
   private executeInsertStatement(ast: InsertStatementAst): ExecuteResult {
     const table = ast.tableName;
-    this.assertUpdatableViewDeferred("INSERT", table, "target");
+    const viewEntry = this.assertUpdatableViewDeferred("INSERT", table, "target");
+    // If target is a view with WITH CHECK OPTION, resolve to base table for INSERT
+    const baseTable = viewEntry ? this.resolveViewToBaseTable(viewEntry) : table;
     this.assertTablePrivilege(table, "INSERT");
-    const bucket = this.requireWritableTableForDml(table);
+    const bucket = this.requireWritableTableForDml(baseTable);
 
     // When INSERT has no column list, use actual table column names in order
-    const tableSchema = this.schemas.get(table);
+    const tableSchema = this.schemas.get(baseTable);
     const tableColumns = tableSchema?.columns.map((c) => c.name) ?? [];
 
     for (const rowExprs of ast.values) {
       const row: SqlRow = {};
       for (let i = 0; i < rowExprs.length; i++) {
-        const colName = ast.columns?.[i] ?? tableColumns[i];
+        // When INSERT has explicit column list, use as-is; otherwise use schema column names
+        const schemaColName = tableColumns[i];
+        const colName = ast.columns?.[i] ?? schemaColName;
         if (!colName) continue; // Skip extra values beyond column count
         const valSql = exprAstToSql(rowExprs[i]) ?? "NULL";
         const evaluated = this.evalExpr({}, valSql);
         row[colName] = evaluated ?? null;
       }
-      let coerced = this.applySchemaOnWrite(table, row, undefined, {});
-      coerced = this.fireBeforeTriggers(table, "INSERT", coerced);
-      this.evaluateCheckConstraints(table, coerced);
+      let coerced = this.applySchemaOnWrite(baseTable, row, undefined, {});
+      coerced = this.fireBeforeTriggers(baseTable, "INSERT", coerced);
+      this.evaluateCheckConstraints(baseTable, coerced);
+      // Validate WITH CHECK OPTION if this is a view
+      if (viewEntry) {
+        this.validateWithCheckOption(viewEntry, coerced);
+      }
       bucket.push(coerced);
-      this.addRowToUniqueIndexes(table, coerced);
+      this.addRowToUniqueIndexes(baseTable, coerced);
       if (this.isDmlWriteStagingActive()) {
-        this.recordTransactionLogWrite(table, "INSERT", coerced, null, coerced);
-        this.bumpTableWriteStats(table, { insertRows: 1 });
+        this.recordTransactionLogWrite(baseTable, "INSERT", coerced, null, coerced);
+        this.bumpTableWriteStats(baseTable, { insertRows: 1 });
       } else {
-        this.addRowToSecondaryIndexes(table, coerced);
-        this.bumpIndexMaintenanceStats(table, "INSERT", 1);
-        this.dirtyTables.add(table);
-        this.applyImmediateRowVersion(table, "INSERT", coerced);
-        this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
-        this.recordStorageWrite(table, "INSERT_ROW", 1, "simulator");
+        this.addRowToSecondaryIndexes(baseTable, coerced);
+        this.bumpIndexMaintenanceStats(baseTable, "INSERT", 1);
+        this.dirtyTables.add(baseTable);
+        this.applyImmediateRowVersion(baseTable, "INSERT", coerced);
+        this.recordImmutableOptimizerStatsVersionObject(baseTable, { confirmationStatus: "confirmed" });
+        this.recordStorageWrite(baseTable, "INSERT_ROW", 1, "simulator");
         this.invalidateReadCacheOnWrite();
       }
-      this.fireAfterTriggers(table, "INSERT", coerced);
+      this.fireAfterTriggers(baseTable, "INSERT", coerced);
     }
 
     return {
@@ -9005,9 +9581,11 @@ export class WalrusSqlClient {
 
   private executeUpdateStatement(ast: UpdateStatementAst): ExecuteResult {
     const table = ast.tableName;
-    this.assertUpdatableViewDeferred("UPDATE", table, "target");
+    const viewEntry = this.assertUpdatableViewDeferred("UPDATE", table, "target");
+    // If target is a view with WITH CHECK OPTION, resolve to base table for UPDATE
+    const baseTable = viewEntry ? this.resolveViewToBaseTable(viewEntry) : table;
     this.assertTablePrivilege(table, "UPDATE");
-    const bucket = this.requireWritableTableForDml(table);
+    const bucket = this.requireWritableTableForDml(baseTable);
 
     // Evaluate WHERE expression against each row
     const whereSql = ast.where ? exprAstToSql(ast.where) : "1 = 1";
@@ -9019,17 +9597,22 @@ export class WalrusSqlClient {
       const setRow = { ...row };
       for (const { column, value } of ast.setClause) {
         const valSql = exprAstToSql(value) ?? "NULL";
-        setRow[column.toUpperCase()] = this.evalExpr(setRow, valSql) ?? null;
+        setRow[column] = this.evalExpr(setRow, valSql) ?? null;
       }
-      const coerced = this.applySchemaOnWrite(table, setRow, undefined, {});
-      this.fireBeforeTriggers(table, "UPDATE", coerced);
+      const coerced = this.applySchemaOnWrite(baseTable, setRow, row, {});
+      this.fireBeforeTriggers(baseTable, "UPDATE", coerced);
+      this.evaluateCheckConstraints(baseTable, coerced); // validate CHECK constraints before committing
+      // Validate WITH CHECK OPTION if this is a view
+      if (viewEntry) {
+        this.validateWithCheckOption(viewEntry, coerced);
+      }
       Object.assign(row, coerced);
-      this.addRowToUniqueIndexes(table, coerced);
+      this.addRowToUniqueIndexes(baseTable, coerced, row); // pass previous row for key change detection
       if (!this.isDmlWriteStagingActive()) {
-        this.addRowToSecondaryIndexes(table, coerced);
-        this.dirtyTables.add(table);
+        this.addRowToSecondaryIndexes(baseTable, coerced);
+        this.dirtyTables.add(baseTable);
       }
-      this.fireAfterTriggers(table, "UPDATE", coerced);
+      this.fireAfterTriggers(baseTable, "UPDATE", coerced);
       touched++;
     }
 
@@ -9113,6 +9696,242 @@ export class WalrusSqlClient {
 
   private executeAlterTable(ast: AlterTableStatementAst): ExecuteResult {
     const table = ast.tableName;
+
+    // Dispatch based on AST action - ast.action is an object with action property
+    const actionType = ast.action.action;
+
+    // ADD CONSTRAINT
+    if (actionType === "add_constraint") {
+      const addConstraintAction = ast.action as { action: "add_constraint"; constraintName?: string; constraintDefinition: string };
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+      const constraintDef = addConstraintAction.constraintDefinition.toUpperCase();
+
+      // Handle CHECK constraint
+      if (constraintDef.startsWith("CHECK")) {
+        const checkMatch = addConstraintAction.constraintDefinition.match(/^CHECK\s*\((.+)\)$/i);
+        if (!checkMatch) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `invalid CHECK constraint definition: ${addConstraintAction.constraintDefinition}`);
+        }
+        const predicate = checkMatch[1]!;
+        const checkConstraint = {
+          name: addConstraintAction.constraintName,
+          predicate,
+        };
+
+        // Validate check constraint against existing rows
+        if (!schema.checkConstraints) schema.checkConstraints = [];
+        const rows = this.tables.get(table);
+        if (rows) {
+          for (const row of rows) {
+            const result = this.evaluateCheckPredicate(row, predicate);
+            if (result !== true) {
+              throw constraintError(
+                "CHECK",
+                `check constraint ${addConstraintAction.constraintName ? `"${addConstraintAction.constraintName}"` : ""} violated in ${table}`,
+                {
+                  clause: "ADD CONSTRAINT",
+                  field: table,
+                },
+              );
+            }
+          }
+        }
+
+        schema.checkConstraints.push(checkConstraint);
+        this.invalidateReadCacheOnWrite();
+        return {
+          txDigest: this.fakeDigest(ast.rawSql),
+          statementType: "ALTER",
+          affectedRows: 0,
+        };
+      }
+
+      // Handle UNIQUE constraint
+      if (constraintDef.startsWith("UNIQUE")) {
+        const uniqueMatch = addConstraintAction.constraintDefinition.match(/^UNIQUE\s*\(([^)]+)\)$/i);
+        if (!uniqueMatch) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `invalid UNIQUE constraint definition: ${addConstraintAction.constraintDefinition}`);
+        }
+        const columns = uniqueMatch[1]!.split(",").map((c) => c.trim());
+        const uniqueGroup = columns.map((c) => c.replace(/^["']|["']$/g, ""));
+
+        // Validate unique constraint against existing rows
+        const rows = this.tables.get(table);
+        if (rows) {
+          const seen = new Map<string, number>();
+          for (const row of rows) {
+            const keyVal = uniqueGroup.map((col) => String(row[col] ?? null)).join("||");
+            if (seen.has(keyVal)) {
+              throw constraintError(
+                "DUPLICATE_KEY",
+                `unique constraint ${addConstraintAction.constraintName ? `"${addConstraintAction.constraintName}"` : ""} violated in ${table}(${uniqueGroup.join(",")})`,
+                {
+                  clause: "ADD CONSTRAINT",
+                  field: table,
+                },
+              );
+            }
+            seen.set(keyVal, 1);
+          }
+        }
+
+        if (!schema.uniqueGroups) schema.uniqueGroups = [];
+        schema.uniqueGroups.push(uniqueGroup);
+        this.invalidateReadCacheOnWrite();
+        return {
+          txDigest: this.fakeDigest(ast.rawSql),
+          statementType: "ALTER",
+          affectedRows: 0,
+        };
+      }
+
+      // Handle PRIMARY KEY constraint
+      if (constraintDef.startsWith("PRIMARY KEY")) {
+        const pkMatch = addConstraintAction.constraintDefinition.match(/^PRIMARY\s+KEY\s*\(([^)]+)\)$/i);
+        if (!pkMatch) {
+          throw sqlError("ERR_UNSUPPORTED_DDL", `invalid PRIMARY KEY constraint definition: ${addConstraintAction.constraintDefinition}`);
+        }
+        const columns = pkMatch[1]!.split(",").map((c) => c.trim().replace(/^["']|["']$/g, ""));
+
+        // Validate PRIMARY KEY against existing rows (no nulls, no duplicates)
+        const rows = this.tables.get(table);
+        if (rows) {
+          for (const row of rows) {
+            for (const col of columns) {
+              if (row[col] === null || row[col] === undefined) {
+                throw constraintError(
+                  "NOT_NULL",
+                  `primary key column ${col} has null value in ${table}`,
+                  {
+                    clause: "ADD CONSTRAINT",
+                    field: `${table}.${col}`,
+                  },
+                );
+              }
+            }
+            const keyVal = columns.map((col) => String(row[col] ?? null)).join("||");
+            const seen = new Map<string, number>();
+            if (seen.has(keyVal)) {
+              throw constraintError(
+                "DUPLICATE_KEY",
+                `primary key duplicate value in ${table}(${columns.join(",")})`,
+                {
+                  clause: "ADD CONSTRAINT",
+                  field: table,
+                },
+              );
+            }
+            seen.set(keyVal, 1);
+          }
+        }
+
+        schema.primaryKeyGroup = columns;
+        // Add NOT NULL to each primary key column
+        for (const col of columns) {
+          const colSchema = schema.columns.find((c) => c.name.toUpperCase() === col.toUpperCase());
+          if (colSchema) colSchema.notNull = true;
+        }
+        this.invalidateReadCacheOnWrite();
+        return {
+          txDigest: this.fakeDigest(ast.rawSql),
+          statementType: "ALTER",
+          affectedRows: 0,
+        };
+      }
+
+      throw sqlError("ERR_UNSUPPORTED_DDL", `unsupported constraint type: ${addConstraintAction.constraintDefinition}`);
+    }
+
+    // DROP CONSTRAINT
+    if (actionType === "drop_constraint") {
+      const dropConstraintAction = ast.action as { action: "drop_constraint"; constraintName: string; cascade?: boolean };
+      const schema = this.schemas.get(table);
+      if (!schema) throw sqlError("ERR_TABLE_NOT_FOUND", table);
+
+      const constraintName = dropConstraintAction.constraintName.toUpperCase();
+
+      // Check if constraint exists - search in checkConstraints, uniqueGroups, primaryKeyGroup
+      let found = false;
+      let constraintType = "";
+
+      // Check checkConstraints
+      if (schema.checkConstraints) {
+        const idx = schema.checkConstraints.findIndex((c) => c.name?.toUpperCase() === constraintName);
+        if (idx >= 0) {
+          schema.checkConstraints.splice(idx, 1);
+          found = true;
+          constraintType = "CHECK";
+        }
+      }
+
+      // Check primaryKeyGroup
+      if (!found && schema.primaryKeyGroup && schema.primaryKeyGroup.map((c) => c.toUpperCase()).join(",") === constraintName) {
+        schema.primaryKeyGroup = undefined;
+        found = true;
+        constraintType = "PRIMARY KEY";
+      }
+
+      // Check uniqueGroups
+      if (!found && schema.uniqueGroups) {
+        const idx = schema.uniqueGroups.findIndex((g) => g.map((c) => c.toUpperCase()).join(",") === constraintName);
+        if (idx >= 0) {
+          schema.uniqueGroups.splice(idx, 1);
+          found = true;
+          constraintType = "UNIQUE";
+        }
+      }
+
+      if (!found) {
+        throw sqlError("ERR_UNSUPPORTED_DDL", `constraint not found: ${dropConstraintAction.constraintName}`);
+      }
+
+      // If CASCADE is specified with RESTRICT-only constraints, we silently ignore (SQL standard says RESTRICT is default)
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(ast.rawSql),
+        statementType: "ALTER",
+        affectedRows: 0,
+      };
+    }
+
+    if (actionType === "disable_constraint") {
+      const constraintName = (ast.action as { action: "disable_constraint"; constraintName: string }).constraintName;
+      if (!constraintName) throw sqlError("ERR_UNSUPPORTED_DDL", "DISABLE CONSTRAINT requires a constraint name");
+      let disabled = this.disabledConstraints.get(table.toUpperCase());
+      if (!disabled) {
+        disabled = new Set<string>();
+        this.disabledConstraints.set(table.toUpperCase(), disabled);
+      }
+      disabled.add(constraintName.toUpperCase());
+      this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
+      this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(ast.rawSql),
+        statementType: "UPDATE",
+        affectedRows: 0,
+      };
+    }
+
+    if (actionType === "validate_constraint") {
+      const constraintName = (ast.action as { action: "validate_constraint"; constraintName: string }).constraintName;
+      const disabled = this.disabledConstraints.get(table.toUpperCase());
+      if (disabled) {
+        disabled.delete(constraintName.toUpperCase());
+        if (disabled.size === 0) this.disabledConstraints.delete(table.toUpperCase());
+      }
+      this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
+      this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
+      this.invalidateReadCacheOnWrite();
+      return {
+        txDigest: this.fakeDigest(ast.rawSql),
+        statementType: "UPDATE",
+        affectedRows: 0,
+      };
+    }
+
     this.applyAlterTable(ast.rawSql);
     this.recordImmutableOptimizerStatsVersionObject(table, { confirmationStatus: "confirmed" });
     this.recordStorageWrite(table, "ALTER_TABLE", 0, "simulator");
@@ -9745,7 +10564,7 @@ export class WalrusSqlClient {
     this.bumpConstraintCost(table, { rebuildOps: 1 });
   }
 
-  private addRowToUniqueIndexes(table: string, row: SqlRow): void {
+  private addRowToUniqueIndexes(table: string, row: SqlRow, previousRow?: SqlRow): void {
     const schema = this.schemas.get(table);
     if (!schema) return;
     this.ensureUniqueIndexMaps(table);
@@ -9756,6 +10575,27 @@ export class WalrusSqlClient {
       const keyName = this.uniqueGroupName(g);
       const keyVal = this.uniqueGroupValue(row, g);
       if (keyVal === null) continue;
+
+      // For UPDATE with previousRow: remove old key if it differs from new key
+      if (previousRow !== undefined) {
+        const oldKeyVal = this.uniqueGroupValue(previousRow, g);
+        if (oldKeyVal !== null && oldKeyVal !== keyVal) {
+          idxMap.get(keyName)?.delete(oldKeyVal);
+        }
+      }
+
+      // Check for duplicate key (skip for UPDATE when key unchanged)
+      if (previousRow === undefined || this.uniqueGroupValue(previousRow, g) !== keyVal) {
+        const existing = idxMap.get(keyName)?.get(keyVal);
+        if (existing !== undefined) {
+          throw constraintError(
+            "DUPLICATE_KEY",
+            `Duplicate key value ${keyVal} for ${table}(${g.join(",")})`,
+            { clause: previousRow !== undefined ? "UPDATE" : "INSERT", field: g.join(",") },
+          );
+        }
+      }
+
       idxMap.get(keyName)?.set(keyVal, row);
       this.bumpConstraintCost(table, { insertOps: 1, rowsIndexed: 1 });
     }
@@ -10098,6 +10938,11 @@ export class WalrusSqlClient {
     return upper === "NTILE" || upper === "PERCENT_RANK" || upper === "CUME_DIST";
   }
 
+  private isAggregateWindowFunction(name: string): name is AggregateWindowFunctionName {
+    const upper = name.toUpperCase();
+    return upper === "SUM" || upper === "AVG" || upper === "COUNT" || upper === "MIN" || upper === "MAX";
+  }
+
   private defaultWindowAlias(name: SupportedWindowFunctionName): string {
     return name.toLowerCase();
   }
@@ -10185,6 +11030,28 @@ export class WalrusSqlClient {
       } as DistributionWindowFunctionSpec;
     }
 
+    if (this.isAggregateWindowFunction(name)) {
+      // SUM, AVG, COUNT, MIN, MAX: args are (expr)
+      // For COUNT(*), the wildcard is detected and treated as no expression
+      let expr = "";
+      if (window.args[0]) {
+        const argSql = this.exprAstToSql(window.args[0]) ?? "";
+        // COUNT(*) has wildcard arg - treat as no expression (COUNT(*))
+        if (argSql !== "*") {
+          expr = argSql;
+        }
+      }
+      return {
+        kind: "aggregate",
+        name,
+        alias: explicitAlias?.trim() || this.defaultWindowAlias(name),
+        partitionBy,
+        orderBy,
+        expr,
+        frame,
+      } as AggregateWindowFunctionSpec;
+    }
+
     // ROW_NUMBER, RANK, DENSE_RANK take no args
     if (window.args.length > 0) {
       throw sqlError("ERR_UNSUPPORTED_SELECT", `${name}() does not accept arguments`);
@@ -10219,6 +11086,7 @@ export class WalrusSqlClient {
       ?.map((o) => ({
         field: this.exprAstToSql(o.expr) ?? "",
         direction: o.direction,
+        ...(o.nullsPosition ? { nullsPosition: o.nullsPosition } : {}),
       }))
       .filter((x) => x.field);
 
@@ -10239,7 +11107,8 @@ export class WalrusSqlClient {
     });
 
     const normalizedFieldTexts = ast.selectItems.map((it, idx) => {
-      if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name)) {
+      // Skip aggregate check if it's a window function (has window property)
+      if (it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name) && !it.window) {
         // Always use canonical aggregate name, even when aliased
         // The aggregate computation returns canonical keys (count/sum/avg/etc.)
         return it.expr.name.toLowerCase();
@@ -10251,7 +11120,7 @@ export class WalrusSqlClient {
     });
 
     const aggregateItem = ast.selectItems.find(
-      (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name),
+      (it) => it.expr.kind === "function" && ["COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT"].includes(it.expr.name) && !it.window,
     );
 
     // Fallback: also detect aggregate functions with CASE WHEN or complex args that are parsed as raw
@@ -10310,6 +11179,17 @@ export class WalrusSqlClient {
     const whereClauses = where ? this.tryParseWhere(where) : [];
     const whereTree = where ? this.parseWhereTree(where) : undefined;
 
+    const joinResult = ast.join
+      ? {
+          type: ast.join.joinType,
+          table: ast.join.table,
+          leftField: ast.join.onLeft,
+          rightField: ast.join.onRight,
+          ...(ast.join.natural ? { natural: true } : {}),
+          ...(ast.join.usingColumns ? { usingColumns: ast.join.usingColumns } : {}),
+        }
+      : undefined;
+
     return {
       explain: ast.explain,
       table,
@@ -10330,19 +11210,14 @@ export class WalrusSqlClient {
       aggregateSeparator,
       groupBy,
       having,
-      join: ast.join
-        ? {
-            type: ast.join.joinType,
-            table: ast.join.table,
-            leftField: ast.join.onLeft,
-            rightField: ast.join.onRight,
-          }
-        : undefined,
+      join: joinResult,
       joins: ast.joins?.map((j) => ({
         type: j.joinType,
         table: j.table,
         leftField: j.onLeft,
         rightField: j.onRight,
+        ...(j.natural ? { natural: true } : {}),
+        ...(j.usingColumns ? { usingColumns: j.usingColumns } : {}),
       })),
       windowFunctions: windowFunctions.length ? windowFunctions : undefined,
     };
@@ -10491,7 +11366,7 @@ export class WalrusSqlClient {
 
   private splitSelectTail(sql: string, setOpToken: "UNION" | "INTERSECT" | "EXCEPT" = "UNION"): {
     baseSql: string;
-    orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>;
+    orderByList?: Array<{ field: string; direction: "ASC" | "DESC"; nullsPosition?: "FIRST" | "LAST" }>;
     limit?: number;
     offset?: number;
   } {
@@ -10519,7 +11394,7 @@ export class WalrusSqlClient {
             }
             field = rendered;
           }
-          return { field, direction: o.direction };
+          return { field, direction: o.direction, ...(o.nullsPosition ? { nullsPosition: o.nullsPosition } : {}) };
         })
       : undefined;
 
@@ -10774,14 +11649,30 @@ export class WalrusSqlClient {
   ): SqlRow[] {
     const out: SqlRow[] = [];
     const matchedRightIndexes = new Set<number>();
+    const usingColumns = join.usingColumns;
 
     for (const leftRow of leftRows) {
       let matched = false;
       for (let ri = 0; ri < rightRows.length; ri++) {
         const rightRow = rightRows[ri]!;
-        const leftVal = this.resolveJoinFieldValue(leftRow, join.leftField);
-        const rightVal = this.resolveJoinFieldValue(rightRow, join.rightField);
-        if (!this.joinKeyEqual(leftVal, rightVal)) continue;
+        let allMatch = true;
+        if (usingColumns) {
+          // USING JOIN: check all columns
+          for (const col of usingColumns) {
+            const leftVal = this.resolveJoinFieldValue(leftRow, col);
+            const rightVal = this.resolveJoinFieldValue(rightRow, col);
+            if (!this.joinKeyEqual(leftVal, rightVal)) {
+              allMatch = false;
+              break;
+            }
+          }
+        } else {
+          // Regular join: check single column pair
+          const leftVal = this.resolveJoinFieldValue(leftRow, join.leftField);
+          const rightVal = this.resolveJoinFieldValue(rightRow, join.rightField);
+          allMatch = this.joinKeyEqual(leftVal, rightVal);
+        }
+        if (!allMatch) continue;
         matched = true;
         matchedRightIndexes.add(ri);
         out.push(this.mergeJoinedRows(leftTable, leftRow, join.table, rightRow));
@@ -10809,12 +11700,31 @@ export class WalrusSqlClient {
     rightRows: SqlRow[] = this.requireTable(join.table),
   ): SqlRow[] {
     const rightIndex = new Map<string, number[]>();
+    const usingColumns = join.usingColumns;
 
     for (let ri = 0; ri < rightRows.length; ri++) {
-      const key = this.toJoinComparableKey(
-        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
-        "join.hash.right",
-      );
+      const rightRow = rightRows[ri]!;
+      let key: string | null;
+      if (usingColumns) {
+        // Composite key for USING JOIN
+        const parts: string[] = [];
+        let valid = true;
+        for (const col of usingColumns) {
+          const val = this.resolveJoinFieldValue(rightRow, col);
+          const encoded = this.toJoinComparableKey(val, "join.hash.right");
+          if (encoded === null) {
+            valid = false;
+            break;
+          }
+          parts.push(encoded);
+        }
+        key = valid ? parts.join("|") : null;
+      } else {
+        key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+          "join.hash.right",
+        );
+      }
       if (key === null) continue;
       const bucket = rightIndex.get(key);
       if (bucket) bucket.push(ri);
@@ -10826,10 +11736,27 @@ export class WalrusSqlClient {
 
     for (const leftRow of leftRows) {
       let matched = false;
-      const key = this.toJoinComparableKey(
-        this.resolveJoinFieldValue(leftRow, join.leftField),
-        "join.hash.left",
-      );
+      let key: string | null;
+      if (usingColumns) {
+        // Composite key for USING JOIN
+        const parts: string[] = [];
+        let valid = true;
+        for (const col of usingColumns) {
+          const val = this.resolveJoinFieldValue(leftRow, col);
+          const encoded = this.toJoinComparableKey(val, "join.hash.left");
+          if (encoded === null) {
+            valid = false;
+            break;
+          }
+          parts.push(encoded);
+        }
+        key = valid ? parts.join("|") : null;
+      } else {
+        key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(leftRow, join.leftField),
+          "join.hash.left",
+        );
+      }
       const rightHits = key === null ? undefined : rightIndex.get(key);
       if (rightHits?.length) {
         for (const ri of rightHits) {
@@ -10861,22 +11788,51 @@ export class WalrusSqlClient {
     rightRows: SqlRow[] = this.requireTable(join.table),
   ): SqlRow[] {
     type JoinEntry = { key: string; rowIndex: number };
+    const usingColumns = join.usingColumns;
 
     const leftEntries: JoinEntry[] = [];
     for (let li = 0; li < leftRows.length; li++) {
-      const key = this.toJoinComparableKey(
-        this.resolveJoinFieldValue(leftRows[li]!, join.leftField),
-        "join.merge.left",
-      );
+      const leftRow = leftRows[li]!;
+      let key: string | null;
+      if (usingColumns) {
+        const parts: string[] = [];
+        let valid = true;
+        for (const col of usingColumns) {
+          const val = this.resolveJoinFieldValue(leftRow, col);
+          const encoded = this.toJoinComparableKey(val, "join.merge.left");
+          if (encoded === null) { valid = false; break; }
+          parts.push(encoded);
+        }
+        key = valid ? parts.join("|") : null;
+      } else {
+        key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(leftRows[li]!, join.leftField),
+          "join.merge.left",
+        );
+      }
       if (key !== null) leftEntries.push({ key, rowIndex: li });
     }
 
     const rightEntries: JoinEntry[] = [];
     for (let ri = 0; ri < rightRows.length; ri++) {
-      const key = this.toJoinComparableKey(
-        this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
-        "join.merge.right",
-      );
+      const rightRow = rightRows[ri]!;
+      let key: string | null;
+      if (usingColumns) {
+        const parts: string[] = [];
+        let valid = true;
+        for (const col of usingColumns) {
+          const val = this.resolveJoinFieldValue(rightRow, col);
+          const encoded = this.toJoinComparableKey(val, "join.merge.right");
+          if (encoded === null) { valid = false; break; }
+          parts.push(encoded);
+        }
+        key = valid ? parts.join("|") : null;
+      } else {
+        key = this.toJoinComparableKey(
+          this.resolveJoinFieldValue(rightRows[ri]!, join.rightField),
+          "join.merge.right",
+        );
+      }
       if (key !== null) rightEntries.push({ key, rowIndex: ri });
     }
 
@@ -11031,6 +11987,34 @@ export class WalrusSqlClient {
     algorithm: JoinExecutionAlgorithm = "NESTED_LOOP",
     spillStats?: JoinSpillRuntimeStats,
   ): SqlRow[] {
+    // Handle NATURAL JOIN - find common columns and use first one
+    if (join.natural) {
+      const leftSchema = this.schemas.get(leftTable);
+      const rightSchema = this.schemas.get(join.table);
+      if (leftSchema && rightSchema) {
+        const leftCols = new Set(leftSchema.columns.map(c => c.name));
+        const commonCols = rightSchema.columns.filter((c) => leftCols.has(c.name)).map(c => c.name);
+        if (commonCols.length > 0) {
+          // Use first common column for join
+          const naturalJoin: NonNullable<ParsedSelect["join"]> = {
+            type: join.type,
+            table: join.table,
+            leftField: commonCols[0]!,
+            rightField: commonCols[0]!,
+          };
+          return this.applyJoin(leftTable, leftRows, naturalJoin, algorithm, spillStats);
+        }
+        // No common columns - NATURAL JOIN becomes CROSS JOIN
+        const crossJoin: NonNullable<ParsedSelect["join"]> = {
+          type: "CROSS",
+          table: join.table,
+          leftField: "",
+          rightField: "",
+        };
+        return this.applyJoin(leftTable, leftRows, crossJoin, algorithm, spillStats);
+      }
+    }
+
     if (join.type === "RIGHT") {
       const syntheticLeftRows = this.requireTable(join.table);
       const syntheticJoin: NonNullable<ParsedSelect["join"]> = {
@@ -11764,10 +12748,16 @@ export class WalrusSqlClient {
     // Handle INTERVAL 'value' unit (e.g., INTERVAL '1' YEAR, INTERVAL '2' MONTH)
     const intervalMatch = expr.match(/^INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)$/i);
     if (intervalMatch) {
-      // Store as object: { value: number, unit: string }
       const value = Number(intervalMatch[1]);
       const unit = intervalMatch[2]!.toUpperCase();
-      return { __interval__: true, value, unit } as unknown as SqlPrimitive;
+      return { __interval__: true as const, value, unit } as unknown as SqlPrimitive;
+    }
+
+    // Handle XML 'value' literal (e.g., XML '<element>value</element>')
+    const xmlMatch = expr.match(/^XML\s+'([^']*)'$/i);
+    if (xmlMatch) {
+      const value = xmlMatch[1]!;
+      return { __xml__: true, value } as unknown as SqlPrimitive;
     }
 
     // Handle expression COLLATE collation_name (e.g., name COLLATE NOCASE)
@@ -11952,7 +12942,7 @@ export class WalrusSqlClient {
   private toRpn(tokens: string[]): string[] {
     const out: string[] = [];
     const ops: string[] = [];
-    const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "u-": 3 };
+    const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "||": 0, "&": 0, "|": 0, "^": 0, "u-": 3 };
 
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i]!;
@@ -11965,9 +12955,9 @@ export class WalrusSqlClient {
         ops.pop();
         continue;
       }
-      if (["+", "-", "*", "/", "%"].includes(t)) {
+      if (["+", "-", "*", "/", "%", "||"].includes(t)) {
         const prev = tokens[i - 1];
-        const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%"].includes(prev!));
+        const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%", "||"].includes(prev!));
         const op = unary ? "u-" : t;
         while (ops.length && pri[ops[ops.length - 1]!] >= pri[op]) out.push(ops.pop()!);
         ops.push(op);
@@ -12010,7 +13000,14 @@ export class WalrusSqlClient {
         else if (t === "-") st.push(an - bn);
         else if (t === "*") st.push(an * bn);
         else if (t === "/") st.push(bn === 0 ? null : an / bn);
-        else st.push(bn === 0 ? null : an % bn);
+        else if (t === "%") st.push(bn === 0 ? null : an % bn);
+        else if (t === "||") {
+          // String concatenation
+          st.push(String(a ?? "") + String(b ?? ""));
+        }
+        else if (t === "&") st.push((an & bn) | 0);
+        else if (t === "|") st.push((an | bn) | 0);
+        else if (t === "^") st.push((an ^ bn) | 0);
         continue;
       }
 
@@ -12053,10 +13050,9 @@ export class WalrusSqlClient {
 
   private joinKeyEqual(left: SqlPrimitive | undefined, right: SqlPrimitive | undefined): boolean {
     if (left === null || left === undefined || right === null || right === undefined) return false;
-    return (
-      this.encodeTypedKey(left, "join.key.left")
-      === this.encodeTypedKey(right, "join.key.right")
-    );
+    const leftEncoded = this.encodeTypedKey(left, "join.key.left");
+    const rightEncoded = this.encodeTypedKey(right, "join.key.right");
+    return leftEncoded === rightEncoded;
   }
 
   private textOrder(a: string, b: string): number {
@@ -12193,7 +13189,9 @@ export class WalrusSqlClient {
   private evaluateCheckConstraints(table: string, row: SqlRow): void {
     const schema = this.schemas.get(table);
     if (!schema?.checkConstraints?.length) return;
+    const disabled = this.disabledConstraints.get(table.toUpperCase());
     for (const cc of schema.checkConstraints) {
+      if (disabled?.has(cc.name?.toUpperCase() ?? "")) continue;
       if (!this.evaluateCheckPredicate(row, cc.predicate)) {
         throw constraintError("CHECK", cc.name ? `CHECK constraint "${cc.name}" violated` : `CHECK constraint violated on ${table}`);
       }
@@ -12272,13 +13270,15 @@ export class WalrusSqlClient {
 
     for (const row of rows) {
       rowsVisited += 1;
-      if (!this.evaluateSelectPredicateRow(row, logicalPlan, parsed)) continue;
+      const predicateResult = this.evaluateSelectPredicateRow(row, logicalPlan, parsed);
+      if (!predicateResult) continue;
       if (matchedRows < offset) {
         matchedRows += 1;
         continue;
       }
 
-      out.push(this.pickFields(row, logicalPlan.fields));
+      const picked = this.pickFields(row, logicalPlan.fields);
+      out.push(picked);
       emittedRows += 1;
       if (limit !== undefined && emittedRows >= limit) {
         return { rows: out, rowsVisited, earlyStop: true };
@@ -12596,6 +13596,20 @@ export class WalrusSqlClient {
       } as DistributionWindowFunctionSpec;
     }
 
+    if (this.isAggregateWindowFunction(name)) {
+      // SUM, AVG, COUNT, MIN, MAX: (expr)
+      const expr = m[2]!.trim();
+      return {
+        kind: "aggregate",
+        name,
+        alias,
+        partitionBy: over.partitionBy,
+        orderBy: over.orderBy,
+        expr,
+        frame: over.frame,
+      } as AggregateWindowFunctionSpec;
+    }
+
     // ROW_NUMBER, RANK, DENSE_RANK take no args
     const argsStr = m[2]!.trim();
     if (argsStr) {
@@ -12656,7 +13670,7 @@ export class WalrusSqlClient {
       sorted.forEach((entry, pos) => {
         // For ROW_NUMBER with a frame, compute position within frame
         if (spec.name === "ROW_NUMBER" && spec.frame) {
-          const { start: s, end: e } = this.getFrameBounds(sorted.length, pos, spec.frame);
+          const { start: s, end: e } = this.getFrameBounds(sorted.length, pos, spec.frame, sorted, spec.orderBy);
           if (s > e) {
             values[entry.idx] = 1;
           } else {
@@ -12690,13 +13704,100 @@ export class WalrusSqlClient {
     sortedLength: number,
     pos: number,
     frame: WindowFrameSpec,
+    sortedRows?: Array<{ row: SqlRow; idx: number }>,
+    orderBy?: Array<{ field: string; direction: "ASC" | "DESC" }>,
   ): { start: number; end: number } {
     let start = 0;
     let end = sortedLength - 1;
 
-    const { start: startBound, end: endBound } = frame;
+    const { start: startBound, end: endBound, unit } = frame;
 
-    // Compute start index
+    // For RANGE mode with interval bounds, use value-based comparison
+    if (unit === "RANGE" && sortedRows && orderBy && orderBy.length > 0) {
+      const currentRow = sortedRows[pos];
+      if (currentRow) {
+        const currentOrderValue = this.resolveRowValue(currentRow.row, orderBy[0]!.field);
+        const direction = orderBy[0]!.direction;
+
+        // Compute value-based start bound
+        if (startBound.kind === "offset_preceding_interval") {
+          const intervalObj = { __interval__: true as const, value: startBound.value, unit: startBound.unit };
+          const lowerBound = this.subtractInterval(currentOrderValue, intervalObj);
+          // Find first row where order value >= lowerBound
+          let s = pos;
+          while (s > 0) {
+            const rowValue = this.resolveRowValue(sortedRows[s - 1]!.row, orderBy[0]!.field);
+            if (this.compareForOrder(rowValue, lowerBound, direction) >= 0) {
+              s--;
+            } else {
+              break;
+            }
+          }
+          start = s;
+        } else if (startBound.kind === "offset_following_interval") {
+          const intervalObj = { __interval__: true as const, value: startBound.value, unit: startBound.unit };
+          const upperBound = this.addInterval(currentOrderValue, intervalObj);
+          // Find first row where order value > upperBound, then start is after that
+          let s = pos;
+          while (s < sortedLength - 1) {
+            const rowValue = this.resolveRowValue(sortedRows[s + 1]!.row, orderBy[0]!.field);
+            if (this.compareForOrder(rowValue, upperBound, direction) <= 0) {
+              s++;
+            } else {
+              break;
+            }
+          }
+          start = Math.min(s + 1, sortedLength - 1);
+        } else if (startBound.kind === "unbounded_preceding") {
+          start = 0;
+        } else if (startBound.kind === "current_row") {
+          start = pos;
+        } else if (startBound.kind === "unbounded_following") {
+          start = sortedLength - 1;
+        }
+
+        // Compute value-based end bound
+        if (endBound.kind === "offset_preceding_interval") {
+          const intervalObj = { __interval__: true as const, value: endBound.value, unit: endBound.unit };
+          const lowerBound = this.subtractInterval(currentOrderValue, intervalObj);
+          // Find last row where order value >= lowerBound
+          let e = pos;
+          while (e > 0) {
+            const rowValue = this.resolveRowValue(sortedRows[e - 1]!.row, orderBy[0]!.field);
+            if (this.compareForOrder(rowValue, lowerBound, direction) >= 0) {
+              e--;
+            } else {
+              break;
+            }
+          }
+          end = e;
+        } else if (endBound.kind === "offset_following_interval") {
+          const intervalObj = { __interval__: true as const, value: endBound.value, unit: endBound.unit };
+          const upperBound = this.addInterval(currentOrderValue, intervalObj);
+          // Find last row where order value <= upperBound
+          let e = pos;
+          while (e < sortedLength - 1) {
+            const rowValue = this.resolveRowValue(sortedRows[e + 1]!.row, orderBy[0]!.field);
+            if (this.compareForOrder(rowValue, upperBound, direction) <= 0) {
+              e++;
+            } else {
+              break;
+            }
+          }
+          end = e;
+        } else if (endBound.kind === "unbounded_preceding") {
+          end = 0;
+        } else if (endBound.kind === "current_row") {
+          end = pos;
+        } else if (endBound.kind === "unbounded_following") {
+          end = sortedLength - 1;
+        }
+
+        return { start, end };
+      }
+    }
+
+    // Compute start index (ROWS/GROUPS mode or non-interval RANGE)
     if (startBound.kind === "unbounded_preceding") {
       start = 0;
     } else if (startBound.kind === "offset_preceding") {
@@ -12757,32 +13858,107 @@ export class WalrusSqlClient {
 
         if (spec.frame) {
           // With frame: compute frame bounds relative to partition position
-          const { start: startBound, end: endBound } = spec.frame;
+          const { start: startBound, end: endBound, unit } = spec.frame;
           let frameStart = 0;
           let frameEnd = sorted.length - 1;
 
-          if (startBound.kind === "unbounded_preceding") {
-            frameStart = 0;
-          } else if (startBound.kind === "offset_preceding") {
-            frameStart = Math.max(0, pos - startBound.offset);
-          } else if (startBound.kind === "offset_following") {
-            frameStart = Math.min(sorted.length - 1, pos + startBound.offset);
-          } else if (startBound.kind === "current_row") {
-            frameStart = pos;
-          } else if (startBound.kind === "unbounded_following") {
-            frameStart = sorted.length - 1;
-          }
+          // For RANGE mode with interval bounds, use value-based comparison
+          if (unit === "RANGE" && spec.orderBy.length > 0) {
+            const currentOrderValue = this.resolveRowValue(entry.row, spec.orderBy[0]!.field);
+            const direction = spec.orderBy[0]!.direction;
 
-          if (endBound.kind === "unbounded_preceding") {
-            frameEnd = 0;
-          } else if (endBound.kind === "offset_preceding") {
-            frameEnd = Math.max(0, pos - endBound.offset);
-          } else if (endBound.kind === "offset_following") {
-            frameEnd = Math.min(sorted.length - 1, pos + endBound.offset);
-          } else if (endBound.kind === "current_row") {
-            frameEnd = pos;
-          } else if (endBound.kind === "unbounded_following") {
-            frameEnd = sorted.length - 1;
+            if (startBound.kind === "offset_preceding_interval") {
+              const intervalObj = { __interval__: true as const, value: startBound.value, unit: startBound.unit };
+              const lowerBound = this.subtractInterval(currentOrderValue, intervalObj);
+              let s = pos;
+              while (s > 0) {
+                const rowValue = this.resolveRowValue(sorted[s - 1]!.row, spec.orderBy[0]!.field);
+                if (this.compareForOrder(rowValue, lowerBound, direction) >= 0) {
+                  s--;
+                } else {
+                  break;
+                }
+              }
+              frameStart = s;
+            } else if (startBound.kind === "offset_following_interval") {
+              const intervalObj = { __interval__: true as const, value: startBound.value, unit: startBound.unit };
+              const upperBound = this.addInterval(currentOrderValue, intervalObj);
+              let s = pos;
+              while (s < sorted.length - 1) {
+                const rowValue = this.resolveRowValue(sorted[s + 1]!.row, spec.orderBy[0]!.field);
+                if (this.compareForOrder(rowValue, upperBound, direction) <= 0) {
+                  s++;
+                } else {
+                  break;
+                }
+              }
+              frameStart = Math.min(s + 1, sorted.length - 1);
+            } else if (startBound.kind === "unbounded_preceding") {
+              frameStart = 0;
+            } else if (startBound.kind === "current_row") {
+              frameStart = pos;
+            } else if (startBound.kind === "unbounded_following") {
+              frameStart = sorted.length - 1;
+            }
+
+            if (endBound.kind === "offset_preceding_interval") {
+              const intervalObj = { __interval__: true as const, value: endBound.value, unit: endBound.unit };
+              const lowerBound = this.subtractInterval(currentOrderValue, intervalObj);
+              let e = pos;
+              while (e > 0) {
+                const rowValue = this.resolveRowValue(sorted[e - 1]!.row, spec.orderBy[0]!.field);
+                if (this.compareForOrder(rowValue, lowerBound, direction) >= 0) {
+                  e--;
+                } else {
+                  break;
+                }
+              }
+              frameEnd = e;
+            } else if (endBound.kind === "offset_following_interval") {
+              const intervalObj = { __interval__: true as const, value: endBound.value, unit: endBound.unit };
+              const upperBound = this.addInterval(currentOrderValue, intervalObj);
+              let e = pos;
+              while (e < sorted.length - 1) {
+                const rowValue = this.resolveRowValue(sorted[e + 1]!.row, spec.orderBy[0]!.field);
+                if (this.compareForOrder(rowValue, upperBound, direction) <= 0) {
+                  e++;
+                } else {
+                  break;
+                }
+              }
+              frameEnd = e;
+            } else if (endBound.kind === "unbounded_preceding") {
+              frameEnd = 0;
+            } else if (endBound.kind === "current_row") {
+              frameEnd = pos;
+            } else if (endBound.kind === "unbounded_following") {
+              frameEnd = sorted.length - 1;
+            }
+          } else {
+            // ROWS/GROUPS mode or non-interval RANGE
+            if (startBound.kind === "unbounded_preceding") {
+              frameStart = 0;
+            } else if (startBound.kind === "offset_preceding") {
+              frameStart = Math.max(0, pos - startBound.offset);
+            } else if (startBound.kind === "offset_following") {
+              frameStart = Math.min(sorted.length - 1, pos + startBound.offset);
+            } else if (startBound.kind === "current_row") {
+              frameStart = pos;
+            } else if (startBound.kind === "unbounded_following") {
+              frameStart = sorted.length - 1;
+            }
+
+            if (endBound.kind === "unbounded_preceding") {
+              frameEnd = 0;
+            } else if (endBound.kind === "offset_preceding") {
+              frameEnd = Math.max(0, pos - endBound.offset);
+            } else if (endBound.kind === "offset_following") {
+              frameEnd = Math.min(sorted.length - 1, pos + endBound.offset);
+            } else if (endBound.kind === "current_row") {
+              frameEnd = pos;
+            } else if (endBound.kind === "unbounded_following") {
+              frameEnd = sorted.length - 1;
+            }
           }
 
           if (frameStart > frameEnd) {
@@ -12845,7 +14021,7 @@ export class WalrusSqlClient {
         let frameStart = 0;
         let frameEnd = pos; // default: CURRENT ROW
         if (spec.frame) {
-          const bounds = this.getFrameBounds(sorted.length, pos, spec.frame);
+          const bounds = this.getFrameBounds(sorted.length, pos, spec.frame, sorted, spec.orderBy);
           frameStart = bounds.start;
           frameEnd = bounds.end;
         }
@@ -12933,6 +14109,89 @@ export class WalrusSqlClient {
     return values;
   }
 
+  private computeAggregateWindowFunctionValues(rows: SqlRow[], spec: AggregateWindowFunctionSpec): SqlPrimitive[] {
+    const values = new Array<SqlPrimitive>(rows.length);
+    const groups = new Map<string, Array<{ row: SqlRow; idx: number }>>();
+
+    rows.forEach((row, idx) => {
+      const key = spec.partitionBy.length
+        ? spec.partitionBy
+            .map((field) => this.encodeTypedKey(this.resolveRowValue(row, field), `window.partition:${spec.name}:${field}`))
+            .join("||")
+        : "__all__";
+      const arr = groups.get(key) ?? [];
+      arr.push({ row, idx });
+      groups.set(key, arr);
+    });
+
+    const windowFn = WINDOW_FUNCTIONS[spec.name];
+    if (!windowFn) {
+      throw sqlError("ERR_UNSUPPORTED_SELECT", `window function not supported: ${spec.name}`);
+    }
+
+    for (const groupRows of groups.values()) {
+      const sorted = [...groupRows].sort((a, b) => {
+        for (const ord of spec.orderBy) {
+          const av = this.resolveRowValue(a.row, ord.field);
+          const bv = this.resolveRowValue(b.row, ord.field);
+          const c = this.compareForOrder(av, bv, ord.direction);
+          if (c !== 0) return c;
+        }
+        return a.idx - b.idx;
+      });
+
+      const partitionStart = sorted[0]!.idx;
+      const partitionEnd = sorted[sorted.length - 1]!.idx;
+
+      sorted.forEach((entry, pos) => {
+        // Compute frame bounds — SQL standard default is:
+        // RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // (unless overridden by an explicit frame clause)
+        let frameStart = 0;
+        let frameEnd = pos; // default: CURRENT ROW
+        if (spec.frame) {
+          const bounds = this.getFrameBounds(sorted.length, pos, spec.frame, sorted, spec.orderBy);
+          frameStart = bounds.start;
+          frameEnd = bounds.end;
+        }
+
+        if (frameStart > frameEnd || frameStart < 0 || frameEnd >= sorted.length) {
+          values[entry.idx] = null;
+          return;
+        }
+
+        // Build orderByValues Map for context
+        const orderByValues = new Map<string, SqlPrimitive>();
+        for (const ord of spec.orderBy) {
+          orderByValues.set(ord.field, this.resolveRowValue(entry.row, ord.field) ?? null as SqlPrimitive);
+        }
+
+        // Build the args - the expression is passed as a string for the window function to evaluate
+        // The window function will look up this expression as a field name in each row
+        // For COUNT(*), spec.expr is empty and we pass no args
+        const args: SqlTypedValue[] = spec.expr
+          ? [fromJs(spec.expr as SqlPrimitive, undefined, {}, `window.${spec.name.toLowerCase()}.arg`)]
+          : [];
+
+        // Build WindowContext
+        const context: WindowContext = {
+          rows: sorted.map((s) => s.row),
+          rowIndex: pos,
+          partitionStart: 0,
+          partitionEnd: sorted.length - 1,
+          orderByValues,
+          frameStart,
+          frameEnd,
+        };
+
+        const result = windowFn.evaluate(args, context);
+        values[entry.idx] = result.value;
+      });
+    }
+
+    return values;
+  }
+
   private parseLiteralValue(literal: string): SqlPrimitive {
     const trimmed = literal.trim();
     if (trimmed.toUpperCase() === "NULL") return null;
@@ -12990,6 +14249,12 @@ export class WalrusSqlClient {
           values: this.computeDistributionWindowFunctionValues(rows, windowFn),
         };
       }
+      if (windowFn.kind === "aggregate") {
+        return {
+          alias: windowFn.alias,
+          values: this.computeAggregateWindowFunctionValues(rows, windowFn),
+        };
+      }
       return {
         alias: windowFn.alias,
         values: this.computeRankingWindowFunctionValues(rows, windowFn),
@@ -13005,11 +14270,66 @@ export class WalrusSqlClient {
     });
   }
 
-  private applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC" }>): SqlRow[] {
+  private addInterval(value: SqlPrimitive | undefined, intervalObj: { __interval__: true; value: number; unit: string }): SqlPrimitive | undefined {
+    if (value === null || value === undefined) return value;
+    const { value: intervalValue, unit } = intervalObj;
+
+    if (typeof value === "string") {
+      const date = new Date(value);
+      if (!isNaN(date.getTime())) {
+        const ms = this.intervalToMilliseconds(intervalValue, unit);
+        return new Date(date.getTime() + ms).toISOString().slice(0, 19).replace("T", " ");
+      }
+    }
+    if (typeof value === "number") {
+      const ms = this.intervalToMilliseconds(intervalValue, unit);
+      return value + ms / 1000; // Return as seconds for numeric Unix timestamp
+    }
+    return value;
+  }
+
+  private subtractInterval(value: SqlPrimitive | undefined, intervalObj: { __interval__: true; value: number; unit: string }): SqlPrimitive | undefined {
+    if (value === null || value === undefined) return value;
+    const { value: intervalValue, unit } = intervalObj;
+
+    if (typeof value === "string") {
+      const date = new Date(value);
+      if (!isNaN(date.getTime())) {
+        const ms = this.intervalToMilliseconds(intervalValue, unit);
+        return new Date(date.getTime() - ms).toISOString().slice(0, 19).replace("T", " ");
+      }
+    }
+    if (typeof value === "number") {
+      const ms = this.intervalToMilliseconds(intervalValue, unit);
+      return value - ms / 1000;
+    }
+    return value;
+  }
+
+  private intervalToMilliseconds(value: number, unit: string): number {
+    switch (unit.toUpperCase()) {
+      case "YEAR":
+        return value * 365.25 * 24 * 60 * 60 * 1000;
+      case "MONTH":
+        return value * 30.44 * 24 * 60 * 60 * 1000;
+      case "DAY":
+        return value * 24 * 60 * 60 * 1000;
+      case "HOUR":
+        return value * 60 * 60 * 1000;
+      case "MINUTE":
+        return value * 60 * 1000;
+      case "SECOND":
+        return value * 1000;
+      default:
+        return 0;
+    }
+  }
+
+  private applyOrder(rows: SqlRow[], orderByList?: Array<{ field: string; direction: "ASC" | "DESC"; nullsPosition?: "FIRST" | "LAST" }>): SqlRow[] {
     if (!orderByList?.length) return rows;
     return [...rows].sort((a, b) => {
-      for (const { field, direction } of orderByList) {
-        const cmp = this.compareForOrder(a[field], b[field], direction);
+      for (const { field, direction, nullsPosition } of orderByList) {
+        const cmp = this.compareForOrder(a[field], b[field], direction, nullsPosition);
         if (cmp !== 0) return cmp;
       }
       return 0;
@@ -13020,12 +14340,24 @@ export class WalrusSqlClient {
     a: SqlPrimitive | undefined,
     b: SqlPrimitive | undefined,
     direction: "ASC" | "DESC",
+    nullsPosition?: "FIRST" | "LAST",
   ): number {
     const aNull = a === null || a === undefined;
     const bNull = b === null || b === undefined;
     if (aNull && bNull) return 0;
-    if (aNull) return 1;
-    if (bNull) return -1;
+
+    // Handle NULLS FIRST/LAST
+    if (nullsPosition === "FIRST") {
+      if (aNull && !bNull) return -1;
+      if (!aNull && bNull) return 1;
+    } else if (nullsPosition === "LAST") {
+      if (aNull && !bNull) return 1;
+      if (!aNull && bNull) return -1;
+    } else {
+      // Default: NULLS LAST for both ASC and DESC (SQLite-compatible default)
+      if (aNull && !bNull) return 1;
+      if (!aNull && bNull) return -1;
+    }
 
     const [leftTyped, rightTyped] = this.normalizeComparableTypedPair(a, b, "order.key");
     const lt = typedValueComparator.lt(leftTyped, rightTyped);
@@ -13191,9 +14523,16 @@ export class WalrusSqlClient {
         continue;
       }
       const parsed = this.parseFieldExpr(f);
-      const key = parsed.field;
-      const val = parsed.valueExpr ? this.evalExpr(row, parsed.valueExpr) : this.resolveProjectionFieldValue(row, key);
-      out[key] = val ?? null;
+      // If no AS clause and field is qualified (e.g., "a.ID"), strip qualifier for output key
+      // but still use full qualified name to look up the value
+      const isQualifiedRef = !parsed.valueExpr && parsed.field.includes('.');
+      const lookupKey = parsed.field;
+      const val = parsed.valueExpr
+        ? this.evalExpr(row, parsed.valueExpr)
+        : this.resolveProjectionFieldValue(row, lookupKey);
+      // Strip qualifier from key for output (e.g., "a.ID" -> "ID") unless there's an AS clause
+      const outputKey = isQualifiedRef ? parsed.field.split('.').pop()! : parsed.field;
+      out[outputKey] = val ?? null;
     }
     return out;
   }
