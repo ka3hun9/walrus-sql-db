@@ -6,6 +6,10 @@ import type {
   CreateFunctionStatementAst,
   CreateTriggerStatementAst,
   CreateViewStatementAst,
+  CreateDomainStatementAst,
+  DropDomainStatementAst,
+  CreateAssertionStatementAst,
+  DropAssertionStatementAst,
   DropIndexStatementAst,
   DropViewStatementAst,
   ExprAst,
@@ -14,7 +18,11 @@ import type {
   DeleteStatementAst,
   TruncateTableStatementAst,
   AlterTableStatementAst,
+  AlterTableAction,
   CreateTableStatementAst,
+  GrantStatementAst,
+  PrivilegeKind,
+  RevokeStatementAst,
   JoinAst,
   OrderItemAst,
   SelectItemAst,
@@ -468,9 +476,46 @@ function parsePrimary(ts: TokenStream): ExprAst {
     return funcExpr;
   }
 
-  if (isIdentifierToken(t)) return { kind: "identifier", name: t };
+  if (isIdentifierToken(t)) {
+    // Check for qualified identifier: table.column or table.*
+    if (ts.peek() === ".") {
+      ts.next(); // consume '.'
+      const afterDot = ts.peek();
+      if (afterDot === "*") {
+        ts.next(); // consume '*'
+        return { kind: "qualified_wildcard", table: t };
+      }
+      if (afterDot && isIdentifierToken(afterDot)) {
+        ts.next(); // consume column identifier
+        return { kind: "qualified_identifier", table: t, column: afterDot };
+      }
+      // '.' followed by non-identifier, treat '.' as raw
+      return { kind: "raw", text: `${t}.${afterDot ?? ""}` };
+    }
+    return { kind: "identifier", name: t };
+  }
+
+  // Handle wildcard: *
+  if (t === "*") {
+    return { kind: "wildcard" };
+  }
 
   return { kind: "raw", text: t };
+}
+
+function parsePostfix(ts: TokenStream): ExprAst {
+  let expr = parsePrimary(ts);
+  while (true) {
+    if (ts.match("COLLATE")) {
+      const collationTok = ts.next();
+      if (collationTok) {
+        expr = { kind: "collate", expr, collation: collationTok };
+      }
+    } else {
+      break;
+    }
+  }
+  return expr;
 }
 
 function parseUnary(ts: TokenStream): ExprAst {
@@ -483,7 +528,7 @@ function parseUnary(ts: TokenStream): ExprAst {
   if (ts.match("~")) {
     return { kind: "unary", op: "~", expr: parseUnary(ts) };
   }
-  return parsePrimary(ts);
+  return parsePostfix(ts);
 }
 
 function parseMul(ts: TokenStream): ExprAst {
@@ -534,17 +579,55 @@ function collectUntilClosingParen(ts: TokenStream): string {
   return tokens.join(" ").trim();
 }
 
-function parseCompare(ts: TokenStream): ExprAst {
+function parseBitwiseOr(ts: TokenStream): ExprAst {
+  let left = parseBitwiseAnd(ts);
+  while (true) {
+    const op = ts.peek();
+    if (!op || !["|", "^"].includes(op)) break;
+    ts.next();
+    const right = parseBitwiseAnd(ts);
+    left = { kind: "binary", op, left, right };
+  }
+  return left;
+}
+
+function parseBitwiseAnd(ts: TokenStream): ExprAst {
   let left = parseAdd(ts);
+  while (true) {
+    if (ts.match("&")) {
+      const right = parseAdd(ts);
+      left = { kind: "binary", op: "&", left, right };
+    } else {
+      break;
+    }
+  }
+  return left;
+}
+
+function parseConcat(ts: TokenStream): ExprAst {
+  let left = parseBitwiseOr(ts);
+  while (true) {
+    if (ts.match("||")) {
+      const right = parseBitwiseOr(ts);
+      left = { kind: "binary", op: "||", left, right };
+    } else {
+      break;
+    }
+  }
+  return left;
+}
+
+function parseCompare(ts: TokenStream): ExprAst {
+  let left = parseConcat(ts);
 
   if (ts.match("IS")) {
     if (ts.match("NOT")) {
       if (ts.match("NULL")) return { kind: "binary", op: "IS NOT", left, right: literalExpr(null) };
-      const right = parseAdd(ts);
+      const right = parseConcat(ts);
       return { kind: "binary", op: "IS NOT", left, right };
     }
     if (ts.match("NULL")) return { kind: "binary", op: "IS", left, right: literalExpr(null) };
-    const right = parseAdd(ts);
+    const right = parseConcat(ts);
     return { kind: "binary", op: "IS", left, right };
   }
 
@@ -565,13 +648,13 @@ function parseCompare(ts: TokenStream): ExprAst {
       return { kind: "binary", op: "NOT IN", left, right: { kind: "function", name: "LIST", args: vals } };
     }
     if (ts.match("BETWEEN")) {
-      const a = parseAdd(ts);
+      const a = parseConcat(ts);
       ts.expect("AND");
-      const b = parseAdd(ts);
+      const b = parseConcat(ts);
       return { kind: "binary", op: "NOT BETWEEN", left, right: { kind: "function", name: "RANGE", args: [a, b] } };
     }
     if (ts.match("LIKE")) {
-      const pat = parseAdd(ts);
+      const pat = parseConcat(ts);
       return { kind: "binary", op: "NOT LIKE", left, right: pat };
     }
   }
@@ -593,15 +676,21 @@ function parseCompare(ts: TokenStream): ExprAst {
   }
 
   if (ts.match("BETWEEN")) {
-    const a = parseAdd(ts);
+    const a = parseConcat(ts);
     ts.expect("AND");
-    const b = parseAdd(ts);
+    const b = parseConcat(ts);
     return { kind: "binary", op: "BETWEEN", left, right: { kind: "function", name: "RANGE", args: [a, b] } };
   }
 
   if (ts.match("LIKE")) {
-    const pat = parseAdd(ts);
-    return { kind: "binary", op: "LIKE", left, right: pat };
+    const pat = parseConcat(ts);
+    let escape: ExprAst | undefined;
+    if (ts.match("ESCAPE")) {
+      escape = parseConcat(ts);
+    }
+    const binary: ExprAst = { kind: "binary", op: "LIKE", left, right: pat };
+    if (escape) binary.escape = escape;
+    return binary;
   }
 
   const op = ts.peek();
@@ -623,10 +712,10 @@ function parseCompare(ts: TokenStream): ExprAst {
         return { kind: "any_subquery", op, left, quantifier: quantifier.toUpperCase() as "ANY" | "SOME" | "ALL", subquerySql };
       }
       // ANY/SOME/ALL not followed by SELECT - fall back to identifier
-      const right = parseAdd(ts);
+      const right = parseConcat(ts);
       return { kind: "binary", op, left, right };
     }
-    const right = parseAdd(ts);
+    const right = parseConcat(ts);
     return { kind: "binary", op, left, right };
   }
 
@@ -989,20 +1078,103 @@ function parseSelectItems(raw: string): SelectItemAst[] {
 function parseOrderItems(raw?: string): OrderItemAst[] | undefined {
   if (!raw) return undefined;
   return splitCommaAware(raw).map((part) => {
-    const m = part.match(/^(.+?)(?:\s+(ASC|DESC))?$/i);
+    // Extended regex to capture NULLS FIRST/LAST
+    const m = part.match(/^(.+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/i);
     const exprText = m?.[1] ?? part;
     // ORDER BY expressions cannot contain window functions - parse normally
     const expr = parseExpr(exprText);
     const direction = ((m?.[2] ?? "ASC").toUpperCase() as "ASC" | "DESC");
-    return { kind: "order_item", expr, direction };
+    const nullsPosition = m?.[3]?.toUpperCase() as "FIRST" | "LAST" | undefined;
+    return { kind: "order_item", expr, direction, ...(nullsPosition ? { nullsPosition } : {}) };
   });
+}
+
+/**
+ * Find the position of the FROM keyword at depth 0 (not inside parentheses).
+ * This is needed to correctly parse SELECT statements with scalar subqueries
+ * that contain their own FROM clause.
+ */
+function findFromAtDepthZero(sql: string): number | null {
+  // Skip leading "SELECT " to get to the select list
+  const selectMatch = sql.match(/^SELECT\s+/i);
+  if (!selectMatch) return null;
+  let pos = selectMatch[0]!.length;
+  let depth = 0;
+  while (pos < sql.length) {
+    const ch = sql[pos]!;
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+    } else if (depth === 0 && sql.substring(pos).toUpperCase().startsWith("FROM ") &&
+               /[\s]/.test(sql[pos - 1]!)) {
+      // Found FROM at depth 0, preceded by whitespace
+      return pos;
+    }
+    pos++;
+  }
+  return null;
 }
 
 function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
   const joins: JoinAst[] = [];
   let rest = tail;
 
+  // SQL clause keywords that cannot be table aliases
+  const clauseKeywords = new Set([
+    "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
+    "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN", "UNION",
+    "INTERSECT", "EXCEPT", "ON", "USING", "NATURAL",
+  ]);
+
   while (true) {
+    // Try comma-separated tables (implicit CROSS JOIN): , t2, t3
+    // First match just comma and table name
+    const commaTableMatch = rest.match(/^\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)/i);
+    if (commaTableMatch) {
+      joins.push({
+        kind: "join",
+        joinType: "CROSS",
+        table: commaTableMatch[1]!,
+        onLeft: "",
+        onRight: "",
+      });
+      // Get remaining after table name - may include alias, comma, or clause keywords
+      rest = rest.slice(commaTableMatch[0].length).trim();
+
+      // Check if next token is an alias (not a clause keyword)
+      const aliasMatch = rest.match(/^(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      if (aliasMatch) {
+        const word = aliasMatch[1].toUpperCase();
+        if (!clauseKeywords.has(word)) {
+          // Valid alias - consume it and continue
+          rest = rest.slice(aliasMatch[0].length).trim();
+        }
+      }
+      continue;
+    }
+
+    // Try NATURAL JOIN: NATURAL [LEFT|RIGHT|FULL|[OUTER]] JOIN table [AS alias]
+    // Note: alias requires AS keyword to avoid misinterpreting keywords like ORDER as aliases
+    const naturalRegex = /^\s*NATURAL\s+(LEFT|RIGHT|FULL|INNER)?\s*(?:OUTER\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*))?(.*)$/i;
+    const naturalMatch = rest.match(naturalRegex);
+    if (naturalMatch) {
+      console.error("DEBUG NATURAL match found:", { input: rest.substring(0, 60), joinType: naturalMatch[1], table: naturalMatch[2], remainder: JSON.stringify(naturalMatch[4]) });
+      rest = naturalMatch[4] ?? "";
+      console.error("DEBUG NATURAL rest after:", JSON.stringify(rest));
+      const joinType = ((naturalMatch[1] ?? "INNER").toUpperCase()) as "INNER" | "LEFT" | "RIGHT" | "FULL";
+      joins.push({
+        kind: "join",
+        joinType,
+        table: naturalMatch[2]!,
+        onLeft: "",
+        onRight: "",
+        natural: true,
+      });
+      rest = naturalMatch[4] ?? "";
+      continue;
+    }
+
     // Try ON clause first: JOIN ... ON t1.col = t2.col
     const jm = rest.match(
       /^\s*(?:(INNER|LEFT|RIGHT|FULL)(?:\s+OUTER)?\s+)?JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?\s+ON\s+([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([a-zA-Z_][a-zA-Z0-9_\.]*)\s*(.*)$/i,
@@ -1027,8 +1199,8 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
     if (usingMatch) {
       const joinType = (usingMatch[1]?.toUpperCase() ?? "INNER") as "INNER" | "LEFT" | "RIGHT" | "FULL";
       const columns = usingMatch[4]!.split(",").map((c) => c.trim());
-      // For USING with multiple columns, create a separate join AST for each column
-      // For simplicity, use the first column; multi-column USING requires schema resolution
+      // For USING with multiple columns, use the first column as onLeft/onRight
+      // and store all columns in usingColumns for multi-column matching during execution
       const firstCol = columns[0]!;
       joins.push({
         kind: "join",
@@ -1036,6 +1208,7 @@ function parseJoinChain(tail: string): { joins: JoinAst[]; rest: string } {
         table: usingMatch[2]!,
         onLeft: firstCol,
         onRight: firstCol,
+        usingColumns: columns.length > 1 ? columns : undefined,
       });
       rest = usingMatch[5] ?? "";
       continue;
@@ -1092,11 +1265,21 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
     };
   }
 
-  const table = base.match(/^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
-  if (!table) return null;
+  // Use depth-aware FROM finder to correctly handle scalar subqueries
+  const fromPos = findFromAtDepthZero(base);
+  if (fromPos === null) return null;
+
+  // Everything between "SELECT " and FROM is the select list
+  // Everything after FROM is the table/tail part
+  const selectList = base.substring("SELECT ".length, fromPos).trim();
+  const afterFrom = base.substring(fromPos + "FROM".length).trim();
+
+  // Parse table name and alias from the afterFrom part
+  const tableMatch = afterFrom.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
+  if (!tableMatch) return null;
 
   let alias: string | undefined;
-  let tail = table[3] ?? "";
+  let tail = tableMatch[2] ?? "";
   const aliasCandidate = tail.match(/^\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b(.*)$/i);
   if (aliasCandidate) {
     const token = aliasCandidate[1]!.toUpperCase();
@@ -1112,10 +1295,12 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
       "LEFT",
       "RIGHT",
       "FULL",
+      "CROSS",
       "JOIN",
       "UNION",
       "INTERSECT",
       "EXCEPT",
+      "NATURAL",
     ]);
     if (!clauseKeywords.has(token)) {
       alias = aliasCandidate[1]!;
@@ -1124,7 +1309,7 @@ function parseFromRef(base: string): { from: TableRefAst; tail: string } | null 
   }
 
   return {
-    from: { kind: "table", name: table[2]!.trim(), alias },
+    from: { kind: "table", name: tableMatch[1]!.trim(), alias },
     tail,
   };
 }
@@ -1344,32 +1529,93 @@ function parseCreateFunctionStatement(base: string, rawSql: string): CreateFunct
   const normalized = base.replace(/;\s*$/, "").trim();
   if (!normalized) return null;
 
-  // CREATE FUNCTION func_name(params) RETURNS type AS 'body'
-  const match = normalized.match(
-    /^CREATE\s+FUNCTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)\s+RETURNS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+'([^']+)'$/i,
+  // CREATE FUNCTION func_name(params) RETURNS type [LANGUAGE lang] [AS 'body'|AS $$body$$|AS $tag$body$tag$]
+  const headerMatch = normalized.match(
+    /^CREATE\s+FUNCTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)\s+RETURNS\s+([a-zA-Z_][a-zA-Z0-9_]*)/i,
   );
-  if (match) {
-    const paramStr = match[2]!.trim();
-    const params = paramStr
-      ? paramStr.split(",").map((p) => {
-          const [name, typeName] = p.trim().split(/\s+/);
-          return { name: name!.trim(), typeName: (typeName ?? "INT").trim() };
-        })
-      : [];
+  if (!headerMatch) return null;
+
+  const functionName = headerMatch[1]!;
+  const paramStr = headerMatch[2]!.trim();
+  const returnType = headerMatch[3]!;
+
+  const params = paramStr
+    ? paramStr.split(",").map((p) => {
+        const [name, typeName] = p.trim().split(/\s+/);
+        return { name: name!.trim(), typeName: (typeName ?? "INT").trim() };
+      })
+    : [];
+
+  // After the RETURNS type, there may be LANGUAGE clause and AS clause
+  const afterHeader = normalized.slice(headerMatch[0].length).trim();
+
+  let language: string | undefined;
+  let body = "";
+  let bodyKind: "expression" | "statement" = "expression";
+
+  // Parse optional LANGUAGE clause
+  const langMatch = afterHeader.match(/^LANGUAGE\s+(\w+)\s*/i);
+  if (langMatch) {
+    language = langMatch[1]!;
+  }
+
+  // Find AS clause
+  const asIdx = afterHeader.search(/\bAS\b/i);
+  if (asIdx === -1) {
+    // No AS clause - function declaration without body (for forward declarations)
     return {
       kind: "create_function",
-      functionName: match[1]!,
+      functionName,
       spec: {
-        name: match[1]!,
+        name: functionName,
         params,
-        returnType: match[3]!,
-        body: match[4]!,
+        returnType,
+        bodyKind: "expression",
+        body: "",
       },
       rawSql,
     };
   }
 
-  return null;
+  const afterAs = afterHeader.slice(asIdx + 2).trim();
+
+  // Parse the body - could be single-quoted, dollar-quoted, or BEGIN...END
+  // Single-quoted: 'body'
+  const singleQuoteMatch = afterAs.match(/^'((?:[^'\\]|\\.)*)'$/s);
+  if (singleQuoteMatch) {
+    body = singleQuoteMatch[1]!;
+  } else if (afterAs.startsWith("$$")) {
+    // Dollar-quoted: $$body$$ or $tag$body$tag$
+    const dollarMatch = afterAs.match(/^\$([^$]*)\$([\s\S]*?)\$\1\$/);
+    if (dollarMatch) {
+      body = dollarMatch[2]!;
+    } else {
+      // Simple $$...$$ without tag
+      const simpleDollarMatch = afterAs.match(/^\$\$([\s\S]*?)\$\$$/);
+      if (simpleDollarMatch) {
+        body = simpleDollarMatch[1]!;
+      }
+    }
+  }
+
+  // Detect if body is a compound statement (BEGIN...END)
+  if (/^BEGIN\s/i.test(body.trim())) {
+    bodyKind = "statement";
+  }
+
+  return {
+    kind: "create_function",
+    functionName,
+    spec: {
+      name: functionName,
+      params,
+      returnType,
+      language,
+      bodyKind,
+      body,
+    },
+    rawSql,
+  };
 }
 
 /**
@@ -1484,7 +1730,16 @@ function parseCreateViewStatement(
     return null;
   }
 
-  const querySql = match[2]!.trim();
+  let querySql = match[2]!.trim();
+  let withCheckOption = false;
+
+  // Parse WITH CHECK OPTION
+  const withCheckMatch = querySql.match(/^(.+?)\s+WITH\s+CHECK\s+OPTION$/i);
+  if (withCheckMatch) {
+    querySql = withCheckMatch[1]!.trim();
+    withCheckOption = true;
+  }
+
   if (!/^SELECT\b/i.test(querySql)) {
     throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
       message: "CREATE VIEW currently requires a SELECT-based query after AS",
@@ -1505,6 +1760,7 @@ function parseCreateViewStatement(
     viewName: match[1]!,
     querySql,
     rawSql,
+    withCheckOption,
   };
 }
 
@@ -1512,12 +1768,12 @@ function parseDropViewStatement(base: string, rawSql: string): DropViewStatement
   const normalized = base.replace(/;\s*$/, "").trim();
   if (!/^DROP\s+/i.test(normalized)) return null;
 
-  const match = normalized.match(/^DROP\s+VIEW\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  const match = normalized.match(/^DROP\s+VIEW\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(\s+(CASCADE|RESTRICT))?$/i);
 
   if (!match) {
     if (/^DROP\s+VIEW\b/i.test(normalized)) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "DROP VIEW requires syntax: DROP VIEW [IF EXISTS] <name>",
+        message: "DROP VIEW requires syntax: DROP VIEW [IF EXISTS] <name> [CASCADE | RESTRICT]",
         token: "VIEW",
       });
     }
@@ -1528,6 +1784,130 @@ function parseDropViewStatement(base: string, rawSql: string): DropViewStatement
     kind: "drop_view",
     ifExists: !!match[1],
     viewName: match[2]!,
+    cascade: match[4]?.toUpperCase() === "CASCADE",
+    rawSql,
+  };
+}
+
+function parseCreateDomainStatement(base: string, rawSql: string): CreateDomainStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+DOMAIN\b/i.test(normalized)) return null;
+
+  // CREATE DOMAIN name AS type [(length)] [DEFAULT expr] [constraint...]
+  const match = normalized.match(
+    /^CREATE\s+DOMAIN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+([A-Z_][A-Z0-9_]*(?:\s+VARYING)?)(?:\s*\(\s*(\d+)\s*\))?/i,
+  );
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "CREATE DOMAIN requires syntax: CREATE DOMAIN <name> AS <type>[(length)]",
+      token: "DOMAIN",
+    });
+  }
+
+  const domainName = match[1]!;
+  const baseType = match[2]!.toUpperCase();
+  const length = match[3] ? parseInt(match[3], 10) : undefined;
+
+  // Extract optional DEFAULT clause
+  let defaultValue: string | undefined;
+  let remaining = normalized.slice(normalized.toUpperCase().search(/AS\s+\S+/i) + 3).trim();
+  const defaultMatch = remaining.match(/\bDEFAULT\s+(.+?)(?=\s+(?:CONSTRAINT|NOT\s+NULL|UNIQUE|CHECK)\b|$)/i);
+  if (defaultMatch) {
+    defaultValue = defaultMatch[1]!.trim();
+    remaining = remaining.slice(0, defaultMatch.index!) + remaining.slice(defaultMatch.index! + defaultMatch[0].length);
+  }
+
+  // Extract constraints
+  const constraints: Array<{ type: "NOT NULL" | "UNIQUE" | "CHECK"; expression?: string }> = [];
+  const notNullMatch = remaining.match(/\bNOT\s+NULL\b/i);
+  if (notNullMatch) {
+    constraints.push({ type: "NOT NULL" });
+  }
+  const uniqueMatch = remaining.match(/\bUNIQUE\b/i);
+  if (uniqueMatch) {
+    constraints.push({ type: "UNIQUE" });
+  }
+  const checkMatch = remaining.match(/\bCHECK\s*\((.+?)\)/i);
+  if (checkMatch) {
+    constraints.push({ type: "CHECK", expression: checkMatch[1] });
+  }
+
+  return {
+    kind: "create_domain",
+    domainName,
+    baseType,
+    length,
+    defaultValue,
+    constraints: constraints.length > 0 ? constraints : undefined,
+    rawSql,
+  };
+}
+
+function parseDropDomainStatement(base: string, rawSql: string): DropDomainStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+DOMAIN\b/i.test(normalized)) return null;
+
+  const match = normalized.match(/^DROP\s+DOMAIN\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(CASCADE|RESTRICT))?$/i);
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "DROP DOMAIN requires syntax: DROP DOMAIN [IF EXISTS] <name> [CASCADE|RESTRICT]",
+      token: "DOMAIN",
+    });
+  }
+
+  return {
+    kind: "drop_domain",
+    ifExists: !!match[1],
+    domainName: match[2]!,
+    cascade: match[3]?.toUpperCase() === "CASCADE",
+    rawSql,
+  };
+}
+
+function parseCreateAssertionStatement(base: string, rawSql: string): CreateAssertionStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^CREATE\s+ASSERTION\b/i.test(normalized)) return null;
+
+  // CREATE ASSERTION name CHECK (search_condition) [INITIALLY DEFERRED]
+  const match = normalized.match(
+    /^CREATE\s+ASSERTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+CHECK\s*\((.+)\)(?:\s+INITIALLY\s+DEFERRED)?$/i,
+  );
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "CREATE ASSERTION requires syntax: CREATE ASSERTION <name> CHECK (<condition>) [INITIALLY DEFERRED]",
+      token: "ASSERTION",
+    });
+  }
+
+  return {
+    kind: "create_assertion",
+    assertionName: match[1]!,
+    predicate: match[2]!.trim(),
+    initiallyDeferred: /\bINITIALLY\s+DEFERRED\b/i.test(normalized),
+    rawSql,
+  };
+}
+
+function parseDropAssertionStatement(base: string, rawSql: string): DropAssertionStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+ASSERTION\b/i.test(normalized)) return null;
+
+  const match = normalized.match(/^DROP\s+ASSERTION\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+
+  if (!match) {
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "DROP ASSERTION requires syntax: DROP ASSERTION [IF EXISTS] <name>",
+      token: "ASSERTION",
+    });
+  }
+
+  return {
+    kind: "drop_assertion",
+    ifExists: !!match[1],
+    assertionName: match[2]!,
     rawSql,
   };
 }
@@ -1696,18 +2076,288 @@ function parseAlterTableStatement(base: string, rawSql: string): AlterTableState
   const normalized = base.replace(/;\s*$/, "").trim();
   if (!/^ALTER\s+TABLE\b/i.test(normalized)) return null;
 
-  const match = normalized.match(/^ALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(.+)$/i);
-  if (!match) {
+  // ALTER TABLE table_name action
+  const tableMatch = normalized.match(/^ALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(.+)$/i);
+  if (!tableMatch) {
     throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
       message: "ALTER TABLE requires a table name and action",
       token: "ALTER",
     });
   }
 
+  const tableName = tableMatch[1]!;
+  const actionText = tableMatch[2]!.trim();
+
+  // Parse the action
+  const action = parseAlterTableAction(actionText);
+
   return {
     kind: "alter_table",
-    tableName: match[1]!,
-    action: match[2]!.trim(),
+    tableName,
+    action,
+    rawSql,
+  };
+}
+
+function parseAlterTableAction(actionText: string): AlterTableAction {
+  const upper = actionText.toUpperCase();
+
+  // ADD CONSTRAINT must be checked before ADD COLUMN since ADD matches first
+  // ADD constraint [constraint_name] constraint_definition
+  if (upper.startsWith("ADD CONSTRAINT")) {
+    const match = actionText.match(/^ADD\s+CONSTRAINT\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(.+)$/i);
+    if (match) {
+      return {
+        action: "add_constraint",
+        constraintName: match[1]!,
+        constraintDefinition: match[2]!.trim(),
+      };
+    }
+  }
+
+  // ADD [COLUMN] column_name [datatype] - check for ADD COLUMN explicitly
+  const addColMatch = actionText.match(/^ADD\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(.*)$/i);
+  if (addColMatch) {
+    return {
+      action: "add_column",
+      columnName: addColMatch[1]!,
+      dataType: addColMatch[2]?.trim() || undefined,
+    };
+  }
+
+  // ADD column_name [datatype] - bare ADD (no COLUMN keyword)
+  const addBareMatch = actionText.match(/^ADD\s+(?!CONSTRAINT)([a-zA-Z_][a-zA-Z0-9_]*)\s*(.*)$/i);
+  if (addBareMatch) {
+    return {
+      action: "add_column",
+      columnName: addBareMatch[1]!,
+      dataType: addBareMatch[2]?.trim() || undefined,
+    };
+  }
+
+  // DROP [COLUMN] column_name [RESTRICT|CASCADE]
+  const dropColMatch = actionText.match(/^DROP\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(RESTRICT|CASCADE)?$/i);
+  if (dropColMatch) {
+    return {
+      action: "drop_column",
+      columnName: dropColMatch[1]!,
+      cascade: dropColMatch[2]?.toUpperCase() === "CASCADE",
+    };
+  }
+
+  // ALTER [COLUMN] column_name SET DEFAULT literal
+  const alterSetDefaultMatch = actionText.match(/^ALTER\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+SET\s+DEFAULT\s+(.+)$/i);
+  if (alterSetDefaultMatch) {
+    return {
+      action: "alter_column_set_default",
+      columnName: alterSetDefaultMatch[1]!,
+      defaultValue: alterSetDefaultMatch[2]!.trim(),
+    };
+  }
+
+  // ALTER [COLUMN] column_name DROP DEFAULT
+  const alterDropDefaultMatch = actionText.match(/^ALTER\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+DROP\s+DEFAULT$/i);
+  if (alterDropDefaultMatch) {
+    return {
+      action: "alter_column_drop_default",
+      columnName: alterDropDefaultMatch[1]!,
+    };
+  }
+
+  // DROP CONSTRAINT constraint_name [RESTRICT|CASCADE]
+  const dropConstraintMatch = actionText.match(/^DROP\s+CONSTRAINT\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(RESTRICT|CASCADE)?$/i);
+  if (dropConstraintMatch) {
+    return {
+      action: "drop_constraint",
+      constraintName: dropConstraintMatch[1]!,
+      cascade: dropConstraintMatch[2]?.toUpperCase() === "CASCADE",
+    };
+  }
+
+  // RENAME TO new_table_name
+  const renameTableMatch = actionText.match(/^RENAME\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (renameTableMatch) {
+    return {
+      action: "rename_table",
+      newTableName: renameTableMatch[1]!,
+    };
+  }
+
+  // RENAME COLUMN old_name TO new_name
+  const renameColMatch = actionText.match(/^RENAME\s+COLUMN\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (renameColMatch) {
+    return {
+      action: "rename_column",
+      columnName: renameColMatch[1]!,
+      newColumnName: renameColMatch[2]!,
+    };
+  }
+
+  // ALTER [COLUMN] column_name TYPE new_type (PostgreSQL)
+  const alterTypeMatch = actionText.match(/^ALTER\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+TYPE\s+(.+)$/i);
+  if (alterTypeMatch) {
+    return {
+      action: "alter_column_set_type",
+      columnName: alterTypeMatch[1]!,
+      dataType: alterTypeMatch[2]!.trim(),
+    };
+  }
+
+  // ALTER [COLUMN] column_name SET NOT NULL (PostgreSQL)
+  const alterSetNotNullMatch = actionText.match(/^ALTER\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+SET\s+NOT\s+NULL$/i);
+  if (alterSetNotNullMatch) {
+    return {
+      action: "alter_column_set_not_null",
+      columnName: alterSetNotNullMatch[1]!,
+    };
+  }
+
+  // ALTER [COLUMN] column_name DROP NOT NULL (PostgreSQL)
+  const alterDropNotNullMatch = actionText.match(/^ALTER\s+(?:COLUMN\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+DROP\s+NOT\s+NULL$/i);
+  if (alterDropNotNullMatch) {
+    return {
+      action: "alter_column_drop_not_null",
+      columnName: alterDropNotNullMatch[1]!,
+    };
+  }
+
+  // DISABLE TRIGGER name|ALL (PostgreSQL)
+  const disableTriggerMatch = actionText.match(/^DISABLE\s+TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*|ALL)$/i);
+  if (disableTriggerMatch) {
+    return {
+      action: "disable_trigger",
+      triggerName: disableTriggerMatch[1]!,
+    };
+  }
+
+  // ENABLE TRIGGER name|ALL (PostgreSQL)
+  const enableTriggerMatch = actionText.match(/^ENABLE\s+TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*|ALL)$/i);
+  if (enableTriggerMatch) {
+    return {
+      action: "enable_trigger",
+      triggerName: enableTriggerMatch[1]!,
+    };
+  }
+
+  // VALIDATE CONSTRAINT constraint_name (PostgreSQL)
+  const validateConstraintMatch = actionText.match(/^VALIDATE\s+CONSTRAINT\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (validateConstraintMatch) {
+    return {
+      action: "validate_constraint",
+      constraintName: validateConstraintMatch[1]!,
+    };
+  }
+
+  // DISABLE CONSTRAINT constraint_name (PostgreSQL)
+  const disableConstraintMatch = actionText.match(/^DISABLE\s+CONSTRAINT\s+([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+  if (disableConstraintMatch) {
+    return {
+      action: "disable_constraint",
+      constraintName: disableConstraintMatch[1]!,
+    };
+  }
+
+  // If nothing matched, throw an error instead of returning raw
+  throw createSqlError("SQL_SYNTAX_UNSUPPORTED_ALTER_ACTION", {
+    message: `Unsupported ALTER TABLE action: ${actionText}`,
+    token: actionText.split(/\s+/)[0] ?? "",
+  });
+}
+
+function parseGrantStatement(base: string, rawSql: string): GrantStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^GRANT\b/i.test(normalized)) return null;
+
+  // GRANT {privilege[,privilege...]|ALL} ON [TABLE] table_name TO {grantee|PUBLIC} [WITH GRANT OPTION]
+  const match = normalized.match(
+    /^GRANT\s+((?:[A-Z_]+,?\s*)+|ALL(?:\s+PRIVILEGES)?)\s+ON\s+(?:TABLE\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*|PUBLIC)\s*(WITH\s+GRANT\s+OPTION)?$/i,
+  );
+  if (!match) {
+    // Try function-level GRANT: GRANT EXECUTE ON FUNCTION name TO {grantee|PUBLIC}
+    const funcMatch = normalized.match(
+      /^GRANT\s+(EXECUTE)\s+ON\s+FUNCTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+TO\s+([a-zA-Z_][a-zA-Z0-9_]*|PUBLIC)\s*(WITH\s+GRANT\s+OPTION)?$/i,
+    );
+    if (funcMatch) {
+      const privileges = [funcMatch[1]!.toUpperCase() as PrivilegeKind];
+      const granteeName = funcMatch[3]!.toUpperCase();
+      return {
+        kind: "grant",
+        privileges,
+        onObject: { type: "function", name: funcMatch[2]! },
+        grantee: granteeName === "PUBLIC" ? { kind: "public" } : { kind: "user", name: funcMatch[3]! },
+        withGrantOption: !!funcMatch[4],
+        rawSql,
+      };
+    }
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "GRANT requires privilege list, table name, and grantee",
+      token: "GRANT",
+    });
+  }
+
+  const privStr = match[1]!.trim().toUpperCase();
+  const privileges: PrivilegeKind[] = privStr === "ALL" || privStr === "ALL PRIVILEGES"
+    ? ["ALL"]
+    : privStr.split(",").map((p) => p.trim() as PrivilegeKind).filter((p) => p);
+
+  const granteeName = match[3]!.toUpperCase();
+
+  return {
+    kind: "grant",
+    privileges,
+    onObject: { type: "table", name: match[2]! },
+    grantee: granteeName === "PUBLIC" ? { kind: "public" } : { kind: "user", name: match[3]! },
+    withGrantOption: !!match[4],
+    rawSql,
+  };
+}
+
+function parseRevokeStatement(base: string, rawSql: string): RevokeStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^REVOKE\b/i.test(normalized)) return null;
+
+  // REVOKE [GRANT OPTION FOR] {privilege[,privilege...]|ALL} ON [TABLE] table_name FROM {grantee|PUBLIC} [CASCADE|RESTRICT]
+  const match = normalized.match(
+    /^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?((?:[A-Z_]+,?\s*)+|ALL(?:\s+PRIVILEGES)?)\s+ON\s+(?:TABLE\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*|PUBLIC)\s*(CASCADE|RESTRICT)?$/i,
+  );
+  if (!match) {
+    // Try function-level REVOKE: REVOKE EXECUTE ON FUNCTION name FROM {grantee|PUBLIC}
+    const funcMatch = normalized.match(
+      /^REVOKE\s+(GRANT\s+OPTION\s+FOR\s+)?(EXECUTE)\s+ON\s+FUNCTION\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*|PUBLIC)\s*(CASCADE|RESTRICT)?$/i,
+    );
+    if (funcMatch) {
+      const privileges = [funcMatch[2]!.toUpperCase() as PrivilegeKind];
+      const granteeName = funcMatch[4]!.toUpperCase();
+      return {
+        kind: "revoke",
+        privileges,
+        onObject: { type: "function", name: funcMatch[3]! },
+        grantee: granteeName === "PUBLIC" ? { kind: "public" } : { kind: "user", name: funcMatch[4]! },
+        grantOptionFor: !!funcMatch[1],
+        cascade: funcMatch[5]?.toUpperCase() === "CASCADE",
+        rawSql,
+      };
+    }
+    throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+      message: "REVOKE requires privilege list, table name, and grantee",
+      token: "REVOKE",
+    });
+  }
+
+  const privStr = match[2]!.trim().toUpperCase();
+  const privileges: PrivilegeKind[] = privStr === "ALL" || privStr === "ALL PRIVILEGES"
+    ? ["ALL"]
+    : privStr.split(",").map((p) => p.trim() as PrivilegeKind).filter((p) => p);
+
+  const granteeName = match[4]!.toUpperCase();
+
+  return {
+    kind: "revoke",
+    privileges,
+    onObject: { type: "table", name: match[3]! },
+    grantee: granteeName === "PUBLIC" ? { kind: "public" } : { kind: "user", name: match[4]! },
+    grantOptionFor: !!match[1],
+    cascade: match[5]?.toUpperCase() === "CASCADE",
     rawSql,
   };
 }
@@ -1852,6 +2502,18 @@ export function parseSqlToAst(
   const dropView = parseDropViewStatement(base, sql);
   if (dropView) return dropView;
 
+  const createDomain = parseCreateDomainStatement(base, sql);
+  if (createDomain) return createDomain;
+
+  const dropDomain = parseDropDomainStatement(base, sql);
+  if (dropDomain) return dropDomain;
+
+  const createAssertion = parseCreateAssertionStatement(base, sql);
+  if (createAssertion) return createAssertion;
+
+  const dropAssertion = parseDropAssertionStatement(base, sql);
+  if (dropAssertion) return dropAssertion;
+
   const insert = parseInsertStatement(base, sql);
   if (insert) return insert;
 
@@ -1870,11 +2532,17 @@ export function parseSqlToAst(
   const createTable = parseCreateTableStatement(base, sql);
   if (createTable) return createTable;
 
+  const grant = parseGrantStatement(base, sql);
+  if (grant) return grant;
+
+  const revoke = parseRevokeStatement(base, sql);
+  if (revoke) return revoke;
+
   const selectLike = /^SELECT\b/i.test(base);
   if (!selectLike) {
     throw createSqlError("SQL_DIALECT_UNSUPPORTED_SYNTAX", {
       message:
-        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/SAVEPOINT/ROLLBACK TO SAVEPOINT/RELEASE SAVEPOINT/CREATE SCHEMA/CREATE FUNCTION/CREATE TRIGGER/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW statements are currently accepted by parser baseline",
+        "Only SELECT/UNION/INTERSECT/EXCEPT/BEGIN/COMMIT/ROLLBACK/SAVEPOINT/ROLLBACK TO SAVEPOINT/RELEASE SAVEPOINT/CREATE SCHEMA/CREATE FUNCTION/CREATE TRIGGER/CREATE INDEX/DROP INDEX/CREATE VIEW/DROP VIEW/GRANT/REVOKE statements are currently accepted by parser baseline",
       token: base.split(/\s+/)[0],
     });
   }
@@ -1919,14 +2587,15 @@ export function parseSqlToAst(
       });
     }
 
-    const m = base.match(/^SELECT\s+(.+?)\s+FROM\s+/i);
-    if (!m) {
+    const fromPos = findFromAtDepthZero(base);
+    if (fromPos === null) {
       throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
-        message: "SELECT list is missing or malformed before FROM",
-        token: "SELECT",
+        message: "SELECT statement is missing or has invalid FROM clause",
+        token: "FROM",
       });
     }
-    selectFields = m[1]!.trim();
+    // Everything between "SELECT " and FROM is the select list
+    selectFields = base.substring("SELECT ".length, fromPos).trim();
   }
 
   const topMatch = selectFields.match(/^TOP\s+(\d+)\s+(.+)$/i);

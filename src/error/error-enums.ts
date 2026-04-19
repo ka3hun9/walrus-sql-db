@@ -39,6 +39,7 @@ export enum ClientErrorCodeEnum {
   ExecutionFailed = "ERR_EXECUTION_FAILED",
   QueryFailed = "ERR_QUERY_FAILED",
   VerificationFailed = "ERR_VERIFICATION_FAILED",
+  CheckOptionViolation = "ERR_CHECK_OPTION_VIOLATION",
 }
 
 export enum ConstraintViolationKindEnum {

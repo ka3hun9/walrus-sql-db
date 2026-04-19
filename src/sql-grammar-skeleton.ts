@@ -10,6 +10,9 @@ export type StatementKind =
   | "drop_index"
   | "create_view"
   | "drop_view"
+  | "alter_table"
+  | "grant"
+  | "revoke"
   | "other";
 
 export type ClauseStatus = "present" | "absent";
@@ -80,7 +83,7 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
   const up = upper(sql);
   const dialect = options?.dialect ?? "ansi";
 
-  const statement: StatementKind = startsWithWord(up, "CREATE INDEX") || startsWithWord(up, "CREATE UNIQUE INDEX")
+const statement: StatementKind = startsWithWord(up, "CREATE INDEX") || startsWithWord(up, "CREATE UNIQUE INDEX")
     ? "create_index"
     : startsWithWord(up, "DROP INDEX")
       ? "drop_index"
@@ -88,13 +91,19 @@ export function inspectSqlGrammarSkeleton(sql: string, options?: InspectOptions)
         ? "create_view"
         : startsWithWord(up, "DROP VIEW")
           ? "drop_view"
-      : hasWord(up, "UNION") || hasWord(up, "INTERSECT") || hasWord(up, "EXCEPT")
-        ? "union"
-        : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
-          ? "select"
-          : startsWithWord(up, "BEGIN") || startsWithWord(up, "COMMIT") || startsWithWord(up, "ROLLBACK")
-            ? "transaction"
-            : "other";
+          : startsWithWord(up, "ALTER TABLE")
+              ? "alter_table"
+              : startsWithWord(up, "GRANT")
+                  ? "grant"
+                  : startsWithWord(up, "REVOKE")
+                    ? "revoke"
+              : hasWord(up, "UNION") || hasWord(up, "INTERSECT") || hasWord(up, "EXCEPT")
+                ? "union"
+                : startsWithWord(up, "SELECT") || startsWithWord(up, "WITH")
+                  ? "select"
+                  : startsWithWord(up, "BEGIN") || startsWithWord(up, "COMMIT") || startsWithWord(up, "ROLLBACK")
+                    ? "transaction"
+                    : "other";
 
   const clauses = {
     cte: startsWithWord(up, "WITH") ? "present" : "absent",

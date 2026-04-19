@@ -20,6 +20,7 @@ import * as regex from "./scalar/regex.js";
 import * as json from "./scalar/json.js";
 import * as aggregate from "./aggregate/special.js";
 import * as windowFn from "./window/special.js";
+import * as windowAgg from "./window/aggregate.js";
 
 // ---------------------------------------------------------------------------
 // Build SCALAR_FUNCTIONS (typed path — SqlTypedValue throughout)
@@ -84,6 +85,7 @@ function buildScalarFunctions(): Record<string, SqlScalarFunction> {
   for (const fnName of [
     "JSON","JSON_EXTRACT","JSON_OBJECT","JSON_ARRAY","JSON_TYPE",
     "JSON_VALID","JSON_LENGTH","JSON_INSERT","JSON_SET","JSON_REMOVE",
+    "JSON_EXISTS","JSON_VALUE","JSON_KEYS","JSON_CONTAINS","JSON_QUERY",
   ] as const) {
     const fn = (json as unknown as Record<string, SqlScalarFunction>)[fnName];
     if (fn) map[fnName] = fn;
@@ -128,7 +130,7 @@ function buildScalarFunctionsPrimitive(): Record<string, SqlScalarFunctionPrimit
 export const SCALAR_FUNCTIONS = buildScalarFunctions();
 export const SCALAR_FUNCTIONS_PRIMITIVE = buildScalarFunctionsPrimitive();
 export const AGGREGATE_FUNCTIONS = aggregate.AGGREGATE_FUNCTIONS;
-export const WINDOW_FUNCTIONS = windowFn.WINDOW_FUNCTIONS;
+export const WINDOW_FUNCTIONS = { ...windowFn.WINDOW_FUNCTIONS, ...windowAgg.AGGREGATE_WINDOW_FUNCTIONS };
 
 // ---------------------------------------------------------------------------
 // Helper: check if a function name is registered (case-insensitive)

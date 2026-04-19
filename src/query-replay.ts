@@ -1143,7 +1143,7 @@ function groupRows(
 }
 
 function joinRows(
-  joinType: "INNER" | "LEFT" | "RIGHT" | "FULL",
+  joinType: "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS",
   leftTable: string,
   leftRows: SqlRow[],
   rightTable: string,
@@ -1151,6 +1151,26 @@ function joinRows(
   leftFieldExpr: string,
   rightFieldExpr: string,
 ): SqlRow[] {
+  // CROSS JOIN - simple cross product
+  if (joinType === "CROSS") {
+    const out: SqlRow[] = [];
+    for (const l of leftRows) {
+      for (const r of rightRows) {
+        const merged: SqlRow = {};
+        for (const [k, v] of Object.entries(l)) {
+          merged[k] = v;
+          merged[`${leftTable}.${k}`] = v;
+        }
+        for (const [k, v] of Object.entries(r)) {
+          merged[`${rightTable}.${k}`] = v;
+          if (!(k in merged)) merged[k] = v;
+        }
+        out.push(merged);
+      }
+    }
+    return out;
+  }
+
   if (joinType === "RIGHT") {
     return joinRows("LEFT", rightTable, rightRows, leftTable, leftRows, rightFieldExpr, leftFieldExpr);
   }

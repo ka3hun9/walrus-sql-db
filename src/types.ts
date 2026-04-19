@@ -21,10 +21,13 @@ export const SQL_RUNTIME_TYPE_CANONICAL_NAMES = [
   "STRING",
   "U64",
   "INTERVAL",
+  "BIT",
+  "BIT_VARYING",
+  "XML",
 ] as const;
 
 export type SqlRuntimeTypeName = (typeof SQL_RUNTIME_TYPE_CANONICAL_NAMES)[number];
-export type SqlRuntimeTypeFamily = "NULL" | "INTEGER" | "NUMERIC" | "CHARACTER" | "TEMPORAL" | "BOOLEAN" | "BINARY";
+export type SqlRuntimeTypeFamily = "NULL" | "INTEGER" | "NUMERIC" | "CHARACTER" | "TEMPORAL" | "BOOLEAN" | "BINARY" | "BIT";
 
 export interface SqlRuntimeTypeMetadata {
   min?: number | string;
@@ -77,12 +80,23 @@ export const SqlRuntimeType = {
   STRING: "STRING",
   U64: "U64",
   INTERVAL: "INTERVAL",
+  BIT: "BIT",
+  BIT_VARYING: "BIT_VARYING",
 } as const satisfies Record<string, SqlRuntimeTypeName>;
 
 export const SQL_RUNTIME_TYPE_ALIASES: Readonly<Record<string, SqlRuntimeTypeName>> = {
   INTEGER: "INT",
   REAL: "DOUBLE",
   NUMERIC: "DECIMAL",
+  "BIT VARYING": "BIT_VARYING",
+  // NATIONAL CHARACTER types (SQL92)
+  NCHAR: "CHAR",
+  "NATIONAL CHAR": "CHAR",
+  "NATIONAL CHARACTER": "CHAR",
+  NVARCHAR: "VARCHAR",
+  "NATIONAL CHARACTER VARYING": "VARCHAR",
+  "NATIONAL CHAR VARYING": "VARCHAR",
+  "NCHAR VARYING": "VARCHAR",
 };
 
 export function normalizeRuntimeTypeName(raw: string): SqlRuntimeTypeName | null {
@@ -209,6 +223,21 @@ const BASE_RUNTIME_TYPE_MODELS: Readonly<Record<SqlRuntimeTypeName, Omit<SqlRunt
     acceptsParameters: false,
     metadata: { min: 0, max: "18446744073709551615", unsigned: true },
   },
+  BIT: {
+    family: "BIT",
+    acceptsParameters: true,
+    metadata: { fixedLength: true },
+  },
+  BIT_VARYING: {
+    family: "BIT",
+    acceptsParameters: true,
+    metadata: { fixedLength: false },
+  },
+  XML: {
+    family: "CHARACTER",
+    acceptsParameters: false,
+    metadata: {},
+  },
 };
 
 function validateRuntimeTypeMetadata(name: SqlRuntimeTypeName, metadata: SqlRuntimeTypeMetadata): void {
@@ -229,6 +258,12 @@ function validateRuntimeTypeMetadata(name: SqlRuntimeTypeName, metadata: SqlRunt
     }
     if (precision !== undefined && scale !== undefined && scale > precision) {
       throw new TypeError("DECIMAL scale cannot exceed precision");
+    }
+  }
+
+  if ((name === "BIT" || name === "BIT_VARYING") && metadata.length !== undefined) {
+    if (!Number.isInteger(metadata.length) || metadata.length <= 0) {
+      throw new TypeError(`${name} length must be a positive integer`);
     }
   }
 }
@@ -277,7 +312,7 @@ const NUMERIC_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>([
 ]);
 
 const TEXT_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>(["TEXT", "STRING", "CHAR", "VARCHAR"]);
-const TEMPORAL_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>(["DATE", "TIME", "TIMESTAMP"]);
+const TEMPORAL_RUNTIME_TYPES = new Set<SqlRuntimeTypeName>(["DATE", "TIME", "TIME_TZ", "TIMESTAMP", "TIMESTAMP_TZ"]);
 
 export function resolveCastPolicy(
   source: SqlRuntimeTypeName,
@@ -492,16 +527,39 @@ export function validateTypedValue(value: SqlPrimitive, runtimeType: SqlRuntimeT
     case "BOOLEAN":
       if (typeof value !== "boolean") throw new TypeError("BOOLEAN value must be true/false");
       return;
+    case "INTERVAL":
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        !("__interval__" in value) ||
+        (value as { __interval__?: unknown }).__interval__ !== true
+      ) {
+        throw new TypeError("INTERVAL value must be an interval object");
+      }
+      const intervalVal = value as { __interval__: true; value: unknown; unit: unknown };
+      if (typeof intervalVal.value !== "number") throw new TypeError("INTERVAL value must be a number");
+      if (typeof intervalVal.unit !== "string") throw new TypeError("INTERVAL unit must be a string");
+      return;
     case "CHAR":
     case "VARCHAR":
     case "TEXT":
     case "STRING":
     case "DATE":
     case "TIME":
+    case "TIME_TZ":
     case "TIMESTAMP":
+    case "TIMESTAMP_TZ":
     case "BLOB":
+    case "BIT":
+    case "BIT_VARYING":
+    case "XML":
       if (typeof value !== "string") throw new TypeError(`${type} value must be a string`);
       if ((type === "CHAR" || type === "VARCHAR") && runtimeType.metadata.length !== undefined) {
+        if (value.length > runtimeType.metadata.length) {
+          throw new TypeError(`${type} value exceeds max length ${runtimeType.metadata.length}`);
+        }
+      }
+      if ((type === "BIT" || type === "BIT_VARYING") && runtimeType.metadata.length !== undefined) {
         if (value.length > runtimeType.metadata.length) {
           throw new TypeError(`${type} value exceeds max length ${runtimeType.metadata.length}`);
         }
@@ -690,6 +748,20 @@ function coercePrimitiveToType(targetType: SqlRuntimeTypeName, value: SqlPrimiti
     const [hh, mm, ss] = s.split(":").map((x) => Number(x));
     if (hh > 23 || mm > 59 || ss > 59) throw new TypeError(`invalid TIME: ${s}`);
     return s;
+  }
+  if (targetType === "TIME_TZ") {
+    const s = String(value).trim();
+    const m = s.match(/^(\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:\d{2}))?$/i);
+    if (!m) throw new TypeError(`invalid TIME_TZ: ${s}`);
+    const timePart = m[1]!;
+    const zonePart = (m[2]?.trim() ?? "Z").toUpperCase();
+    const [hh, mm, ss] = timePart.split(":").map((x) => Number(x));
+    if (hh > 23 || mm > 59 || ss > 59) throw new TypeError(`invalid TIME_TZ: ${s}`);
+    if (zonePart !== "Z") {
+      const [zh, zm] = zonePart.slice(1).split(":").map((x) => Number(x));
+      if (zh > 23 || zm > 59) throw new TypeError(`invalid TIME_TZ: ${s}`);
+    }
+    return `${timePart}${zonePart !== "Z" ? zonePart : "Z"}`;
   }
   if (targetType === "TIMESTAMP") {
     const s = String(value).trim();
@@ -1101,7 +1173,7 @@ export type SessionTransactionState = "idle" | "active" | "committing" | "aborte
 
 export interface ExecuteResult {
   txDigest: string;
-  statementType: "CREATE" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "MERGE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
+  statementType: "CREATE" | "ALTER" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "MERGE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
   affectedRows?: number;
   /** For INSERT/UPDATE/DELETE with RETURNING clause */
   returningRows?: SqlRow[];
@@ -1376,13 +1448,13 @@ export interface OnchainQueryRequest {
   having?: string;
   explain?: boolean;
   join?: {
-    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS";
     table: string;
     leftField: string;
     rightField: string;
   };
   joins?: Array<{
-    type: "INNER" | "LEFT" | "RIGHT" | "FULL";
+    type: "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS";
     table: string;
     leftField: string;
     rightField: string;

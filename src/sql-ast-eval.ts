@@ -25,6 +25,12 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
   switch (expr.kind) {
     case "identifier":
       return expr.name;
+    case "qualified_identifier":
+      return `${expr.table}.${expr.column}`;
+    case "qualified_wildcard":
+      return `${expr.table}.*`;
+    case "wildcard":
+      return "*";
     case "literal": {
       const literal = expr.typedValue.value;
       if (literal === null) return "NULL";
@@ -62,8 +68,13 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       const elsePart = expr.elseResult ? ` ELSE ${exprAstToSql(expr.elseResult) ?? ""}` : "";
       return `CASE ${base}${clauses}${elsePart} END`;
     }
-    case "binary":
-      return `${maybeWrap(expr.left)} ${expr.op} ${maybeWrap(expr.right)}`;
+    case "binary": {
+      let sql = `${maybeWrap(expr.left)} ${expr.op} ${maybeWrap(expr.right)}`;
+      if (expr.escape) {
+        sql += ` ESCAPE ${exprAstToSql(expr.escape)}`;
+      }
+      return sql;
+    }
     case "unary":
       if (expr.op.toUpperCase() === "NOT") return `NOT (${exprAstToSql(expr.expr)})`;
       return `${expr.op}${exprAstToSql(expr.expr)}`;
@@ -75,6 +86,8 @@ export function exprAstToSql(expr?: ExprAst): string | undefined {
       return `(${expr.subquerySql})`;
     case "any_subquery":
       return `${exprAstToSql(expr.left) ?? ""} ${expr.op} ${expr.quantifier} (${expr.subquerySql})`;
+    case "collate":
+      return `${exprAstToSql(expr.expr) ?? ""} COLLATE ${expr.collation}`;
     case "raw":
       return expr.text;
     default:
@@ -130,6 +143,19 @@ export function evalExprAstTyped(
   switch (expr.kind) {
     case "identifier":
       return resolve(expr.name) ?? typedNull(`expr.identifier:${expr.name}`);
+    case "qualified_identifier":
+      // For qualified identifiers, try table.column first, then fall back to just column
+      const fullName = `${expr.table}.${expr.column}`;
+      const val = resolve(fullName);
+      if (val !== undefined) return val;
+      // Fall back to column-only resolution (for queries that don't use table prefixes)
+      return resolve(expr.column) ?? typedNull(`expr.qualified_identifier:${fullName}`);
+    case "wildcard":
+      // Wildcard is handled specially in execution context, not here
+      return typedNull("expr.wildcard");
+    case "qualified_wildcard":
+      // Qualified wildcard (table.*) is handled specially in execution context
+      return typedNull("expr.qualified_wildcard");
     case "literal":
       return expr.typedValue;
     case "unary": {
@@ -211,6 +237,32 @@ export function evalExprAstTyped(
         return fromJs((l.value as number) % (r.value as number), SqlRuntimeType.DOUBLE, {}, "expr.binary.mod");
       }
 
+      if (op === "||") {
+        // String concatenation
+        try {
+          const leftText = convertTypedValue(left, SqlRuntimeType.TEXT, { mode: "explicit", sourceContext: "expr.binary.concat.left" });
+          const rightText = convertTypedValue(right, SqlRuntimeType.TEXT, { mode: "explicit", sourceContext: "expr.binary.concat.right" });
+          if (leftText.value == null || rightText.value == null) return typedNull("expr.binary.concat");
+          return fromJs(String(leftText.value) + String(rightText.value), SqlRuntimeType.TEXT, {}, "expr.binary.concat");
+        } catch {
+          return typedNull("expr.binary.concat");
+        }
+      }
+
+      // Bitwise operators
+      if (op === "&" || op === "|" || op === "^") {
+        const l = toDoubleTyped(left, `expr.binary.bitwise.${op}.left`);
+        const r = toDoubleTyped(right, `expr.binary.bitwise.${op}.right`);
+        if (!l || !r || l.value == null || r.value == null) return typedNull(`expr.binary.bitwise.${op}`);
+        const leftNum = l.value as number;
+        const rightNum = r.value as number;
+        let result: number;
+        if (op === "&") result = leftNum & rightNum;
+        else if (op === "|") result = leftNum | rightNum;
+        else result = leftNum ^ rightNum;
+        return fromJs(result, SqlRuntimeType.INT, {}, `expr.binary.bitwise.${op}`);
+      }
+
       if (op === "=") return truthToTyped(typedValueComparator.eq(left, right), "expr.binary.eq");
       if (op === "!=" || op === "<>") {
         const eq = typedValueComparator.eq(left, right);
@@ -234,7 +286,18 @@ export function evalExprAstTyped(
             sourceContext: "expr.binary.like.right",
           });
           if (leftText.value == null || rightText.value == null) return typedNull(`expr.binary.${op}`);
-          const pat = String(rightText.value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
+          let escapeChar = "\\";
+          if (expr.escape) {
+            const escapeVal = evalExprAstTyped(expr.escape, resolve);
+            const escapeText = convertTypedValue(escapeVal, SqlRuntimeType.TEXT, {
+              mode: "explicit",
+              sourceContext: "expr.binary.like.escape",
+            });
+            if (escapeText.value != null) escapeChar = String(escapeText.value);
+          }
+          const escapeRegex = new RegExp(`[${escapeChar.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}]`, "g");
+          const escapedPattern = String(rightText.value).replace(escapeRegex, "\\$&");
+          const pat = escapedPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
           const matched = new RegExp(`^${pat}$`, "i").test(String(leftText.value));
           return truthToTyped(op === "LIKE" ? matched : !matched, `expr.binary.${op}`);
         } catch {
@@ -277,6 +340,8 @@ export function evalExprAstTyped(
       }
       return typedNull("expr.case");
     }
+    case "collate":
+      return evalExprAstTyped(expr.expr, resolve);
     case "raw":
       return typedNull("expr.raw");
     default:
