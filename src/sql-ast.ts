@@ -17,6 +17,7 @@ export type SqlAstStatement =
   | CreateTriggerStatementAst
   | CreateIndexStatementAst
   | DropIndexStatementAst
+  | DropTableStatementAst
   | CreateViewStatementAst
   | DropViewStatementAst
   | CreateDomainStatementAst
@@ -163,6 +164,13 @@ export type DropIndexStatementAst = {
   kind: "drop_index";
   indexName: string;
   tableName?: string;
+  ifExists: boolean;
+  rawSql: string;
+};
+
+export type DropTableStatementAst = {
+  kind: "drop_table";
+  tableName: string;
   ifExists: boolean;
   rawSql: string;
 };

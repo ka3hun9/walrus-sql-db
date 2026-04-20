@@ -3939,6 +3939,7 @@ export class WalrusSqlClient {
         case "create_trigger":
         case "create_index":
         case "drop_index":
+        case "drop_table":
         case "create_view":
         case "drop_view":
           // Fall through to string-matching handlers below
@@ -4198,8 +4199,13 @@ export class WalrusSqlClient {
     }
 
     if (upper.startsWith("DROP TABLE")) {
-      const table = this.extractTableName(normalized, /DROP TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+      const hasIfExists = /IF\s+EXISTS/i.test(normalized);
+      const table = this.extractTableName(normalized, /DROP TABLE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)/i);
       if (!this.tables.has(table) || !this.schemas.has(table)) {
+        if (hasIfExists) {
+          // IF EXISTS: succeed silently if table doesn't exist
+          return { txDigest: this.fakeDigest(normalized), statementType: "DELETE", affectedRows: 0 };
+        }
         throw sqlError("ERR_TABLE_NOT_FOUND", table);
       }
       const dropDependents = this.collectDropDependents(table);

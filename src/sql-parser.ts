@@ -11,6 +11,7 @@ import type {
   CreateAssertionStatementAst,
   DropAssertionStatementAst,
   DropIndexStatementAst,
+  DropTableStatementAst,
   DropViewStatementAst,
   ExprAst,
   InsertStatementAst,
@@ -1720,6 +1721,31 @@ function parseDropIndexStatement(base: string, rawSql: string): DropIndexStateme
   };
 }
 
+function parseDropTableStatement(base: string, rawSql: string): DropTableStatementAst | null {
+  const normalized = base.replace(/;\s*$/, "").trim();
+  if (!/^DROP\s+/i.test(normalized)) return null;
+
+  // SQLite supports: DROP TABLE [IF EXISTS] tablename
+  const match = normalized.match(/^DROP\s+TABLE\s+(IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)$/i);
+
+  if (!match) {
+    if (/^DROP\s+TABLE\b/i.test(normalized)) {
+      throw createSqlError("SQL_SYNTAX_INCOMPLETE_STATEMENT", {
+        message: "DROP TABLE requires syntax: DROP TABLE [IF EXISTS] <name>",
+        token: "TABLE",
+      });
+    }
+    return null;
+  }
+
+  return {
+    kind: "drop_table",
+    ifExists: !!match[1],
+    tableName: match[2]!,
+    rawSql,
+  };
+}
+
 function parseCreateViewStatement(
   base: string,
   rawSql: string,
@@ -2505,6 +2531,9 @@ export function parseSqlToAst(
 
   const dropIndex = parseDropIndexStatement(base, sql);
   if (dropIndex) return dropIndex;
+
+  const dropTable = parseDropTableStatement(base, sql);
+  if (dropTable) return dropTable;
 
   const createView = parseCreateViewStatement(base, sql, dialect);
   if (createView) return createView;
