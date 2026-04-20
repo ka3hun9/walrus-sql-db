@@ -4827,7 +4827,7 @@ export class WalrusSqlClient {
     // SELECT: delegate to query() to enforce permission checks
     if (/^\s*SELECT\b/i.test(normalized)) {
       const result = await this.query(sql);
-      return { txDigest: this.fakeDigest(normalized), statementType: "SELECT", affectedRows: result.rows.length };
+      return { txDigest: this.fakeDigest(normalized), statementType: "SELECT", affectedRows: result.rows.length, rows: result.rows as any };
     }
 
     return {
