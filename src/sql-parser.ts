@@ -1665,8 +1665,18 @@ function parseCreateIndexStatement(base: string, rawSql: string): CreateIndexSta
     return null;
   }
 
-  const columns = splitCommaAware(match[4]!).map((c) => c.trim()).filter(Boolean);
-  if (columns.length === 0 || columns.some((c) => !/^[a-zA-Z_][a-zA-Z0-9_\.]*$/.test(c))) {
+  const columnEntries = splitCommaAware(match[4]!).map((c) => c.trim()).filter(Boolean);
+  // Extract column name from each entry: strip optional DESC/ASC/COLLATE suffix
+  const extractColumnName = (entry: string): string => {
+    return entry
+      .replace(/\s+COLLATE\s+\w+/i, "") // Remove COLLATE clause
+      .replace(/\s+(DESC|ASC)\s*$/i, "") // Remove DESC/ASC at end
+      .trim();
+  };
+  const columns = columnEntries.map(extractColumnName);
+  // Validate each column entry
+  const columnIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_\.]*$/;
+  if (columns.length === 0 || columns.some((c) => !columnIdentifierRegex.test(c))) {
     throw createSqlError("SQL_SYNTAX_UNEXPECTED_TOKEN", {
       message: "CREATE INDEX column list must contain valid identifiers",
       token: match[4]!.trim(),
