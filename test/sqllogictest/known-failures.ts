@@ -216,6 +216,57 @@ const SEED_FAILURES: KnownFailure[] = [
     canFix: false,
     tags: ["transaction", "isolation", "onchain"],
   },
+
+  // === EXECUTION_ENGINE ===
+  // These represent known execution limitations causing row count mismatches
+  {
+    id: "exec:join_not_working",
+    category: "EXECUTION_ENGINE",
+    description: "JOIN operations return 0 rows when they should return data",
+    reason: "JOIN execution may not be properly implemented for certain query patterns",
+    canFix: true,
+    tags: ["join", "execution", "row_count"],
+  },
+  {
+    id: "exec:subquery_not_working",
+    category: "EXECUTION_ENGINE",
+    description: "Subquery operations return 0 rows when they should return data",
+    reason: "Subquery execution may not be properly implemented for certain patterns",
+    canFix: true,
+    tags: ["subquery", "execution", "row_count"],
+  },
+  {
+    id: "exec:where_clause_issue",
+    category: "EXECUTION_ENGINE",
+    description: "WHERE clause filtering returns incorrect row count",
+    reason: "WHERE clause evaluation may have issues with certain expressions",
+    canFix: true,
+    tags: ["where", "execution", "row_count"],
+  },
+  {
+    id: "exec:aggregate_not_working",
+    category: "EXECUTION_ENGINE",
+    description: "Aggregate functions return 0 rows when they should return data",
+    reason: "Aggregate function execution may not be properly implemented",
+    canFix: true,
+    tags: ["aggregate", "execution", "row_count"],
+  },
+  {
+    id: "exec:orderby_not_working",
+    category: "EXECUTION_ENGINE",
+    description: "ORDER BY clause affects row count unexpectedly",
+    reason: "ORDER BY execution may cause incorrect row counts",
+    canFix: true,
+    tags: ["orderby", "execution", "row_count"],
+  },
+  {
+    id: "exec:complex_query_returns_empty",
+    category: "EXECUTION_ENGINE",
+    description: "Complex queries return 0 rows when they should return data",
+    reason: "Multiple combined features may not work together correctly",
+    canFix: true,
+    tags: ["complex", "execution", "row_count"],
+  },
 ];
 
 /** Initialize the registry with seed failures */
@@ -250,6 +301,7 @@ export function failureSummary(): Record<FailureCategory, number> {
     DIALECT_MISMATCH: 0,
     PARSER_LIMITATION: 0,
     SEMANTIC_DIFFERENCE: 0,
+    EXECUTION_ENGINE: 0,
     TIMING: 0,
   };
   for (const f of registry.values()) {

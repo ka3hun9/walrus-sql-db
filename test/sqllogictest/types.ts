@@ -196,6 +196,7 @@ export type FailureCategory =
   | "DIALECT_MISMATCH"    // Feature differs between SQLite and our dialect
   | "PARSER_LIMITATION"   // Statement hits baseline parser limit
   | "SEMANTIC_DIFFERENCE" // Same SQL, different semantics (NULL, type coercion)
+  | "EXECUTION_ENGINE"    // Query execution returns wrong results (e.g., 0 rows)
   | "TIMING";             // Race condition or timeout (not applicable to simulator)
 
 /** A known incompatibility entry */

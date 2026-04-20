@@ -10,8 +10,8 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** dolthub/sqllogictest branch */
-export const SQLITE_COMMIT = "master";
+/** dolthub/sqllogictest version tag */
+export const SQLITE_COMMIT = "version-3.11.0";
 
 /** Base URL for sqllogictest files in the dolthub mirror */
 export const SQLITE_TEST_BASE = `https://raw.githubusercontent.com/dolthub/sqllogictest/${SQLITE_COMMIT}/test`;
@@ -88,62 +88,44 @@ export async function fetchTestFiles(testNames: string[]): Promise<Map<string, s
 }
 
 /**
- * Priority list of SQLite test files (only files that exist at version-3.45.0)
- * 39 test files covering: SELECT, WHERE, LIMIT, ORDERBY, JOIN, DISTINCT,
- * AGG (error), SUBQUERY, VIEW, INDEX, WINDOW, TRIGGER
+ * Priority list of SQLite test files (only files that exist at version-3.11.0)
+ * 32 test files covering: SELECT, evidence language tests, and representative index tests
  */
 export const PRIORITY_TESTS = [
-  // Basic SELECT
+  // Basic SELECT (5 files)
   "select1.test",
   "select2.test",
   "select3.test",
   "select4.test",
   "select5.test",
-  // WHERE
-  "where.test",
-  // LIMIT
-  "limit.test",
-  // ORDER BY
-  "orderby1.test",
-  // JOIN
-  "join.test",
-  "join2.test",
-  "join3.test",
-  "join4.test",
-  "join5.test",
-  // Aggregate errors
-  "aggerror.test",
-  // DISTINCT
-  "distinct.test",
-  "distinctagg.test",
-  // Subquery
-  "subquery.test",
-  // VIEW
-  "view.test",
-  // INDEX
-  "index.test",
-  "index2.test",
-  "index3.test",
-  "index4.test",
-  "index5.test",
-  "index6.test",
-  "index7.test",
-  // Window functions
-  "window1.test",
-  "window2.test",
-  "window3.test",
-  "window4.test",
-  "window5.test",
-  // TRIGGER
-  "trigger1.test",
-  "trigger2.test",
-  "trigger3.test",
-  "trigger4.test",
-  "trigger5.test",
-  "trigger6.test",
-  "trigger7.test",
-  "trigger8.test",
-  "trigger9.test",
+  // Evidence language tests (12 files)
+  "evidence/slt_lang_aggfunc.test",
+  "evidence/slt_lang_createtrigger.test",
+  "evidence/slt_lang_createview.test",
+  "evidence/slt_lang_dropindex.test",
+  "evidence/slt_lang_droptable.test",
+  "evidence/slt_lang_droptrigger.test",
+  "evidence/slt_lang_dropview.test",
+  "evidence/slt_lang_reindex.test",
+  "evidence/slt_lang_replace.test",
+  "evidence/slt_lang_update.test",
+  "evidence/in1.test",
+  "evidence/in2.test",
+  // Representative index tests (15 files)
+  "index/between/1/slt_good_0.test",
+  "index/between/10/slt_good_0.test",
+  "index/between/10/slt_good_1.test",
+  "index/commute/10/slt_good_0.test",
+  "index/commute/100/slt_good_0.test",
+  "index/delete/1/slt_good_0.test",
+  "index/delete/10/slt_good_0.test",
+  "index/in/10/slt_good_0.test",
+  "index/in/100/slt_good_0.test",
+  "index/orderby/10/slt_good_0.test",
+  "index/orderby_nosort/10/slt_good_0.test",
+  "index/random/10/slt_good_0.test",
+  "index/random/10/slt_good_1.test",
+  "index/random/100/slt_good_0.test",
 ];
 
 /**

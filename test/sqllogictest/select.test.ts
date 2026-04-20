@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { WalrusSqlClient } from "../../src/client.js";
-import type { SqlClient } from "./runner.js";
+import type { SqlClient, SltFileRunResult } from "./runner.js";
 import { runSltFile, summarizeResults } from "./runner.js";
 import { parseSlt } from "./parser.js";
 import { trackElement, createEmptyCoverage } from "./coverage.js";
@@ -76,6 +76,34 @@ describe("sqllogictest SQLite select suite", () => {
 
       const summary = summarizeResults(results);
 
+      // Analyze failures
+      const failureMessages: string[] = [];
+      const errorCategories: Record<string, number> = {};
+      for (const result of results) {
+        for (const failure of result.failures) {
+          if (failure.status === "failed" && failure.message) {
+            // Categorize errors
+            const msg = failure.message;
+            if (msg.includes("Unknown identifier")) errorCategories["Unknown identifier"] = (errorCategories["Unknown identifier"] || 0) + 1;
+            else if (msg.includes("Query error")) errorCategories["Query error"] = (errorCategories["Query error"] || 0) + 1;
+            else if (msg.includes("Result mismatch")) errorCategories["Result mismatch"] = (errorCategories["Result mismatch"] || 0) + 1;
+            else if (msg.includes("Unexpected exception")) errorCategories["Unexpected exception"] = (errorCategories["Unexpected exception"] || 0) + 1;
+            else {
+              // Truncate long messages for summary
+              const short = msg.substring(0, 80);
+              errorCategories[short] = (errorCategories[short] || 0) + 1;
+            }
+            // Collect first few samples
+            if (failureMessages.length < 20) {
+              failureMessages.push(`${result.filePath}: ${failure.message}`);
+            }
+          }
+        }
+      }
+
+      // Sort categories by count
+      const sortedErrors = Object.entries(errorCategories).sort((a, b) => b[1] - a[1]);
+
       console.log("\n========================================");
       console.log("SQLite sqllogictest Suite Summary");
       console.log("========================================");
@@ -86,6 +114,15 @@ describe("sqllogictest SQLite select suite", () => {
       console.log(`Tests failed:  ${summary.testsFailed}`);
       console.log(`Tests skipped: ${summary.testsSkipped}`);
       console.log(`Pass rate:     ${summary.passRate}`);
+      console.log("========================================");
+      console.log("\n=== Failure Categories (Top 15) ===");
+      for (const [cat, count] of sortedErrors.slice(0, 15)) {
+        console.log(`  ${count}: ${cat}`);
+      }
+      console.log("\n=== Sample Failures ===");
+      for (const msg of failureMessages.slice(0, 10)) {
+        console.log(`  ${msg}`);
+      }
       console.log("========================================\n");
 
       // This test passes as long as we ran the suite
