@@ -1175,6 +1175,8 @@ export interface ExecuteResult {
   txDigest: string;
   statementType: "CREATE" | "ALTER" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "MERGE" | "SELECT" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "CURSOR" | "GRANT" | "REVOKE" | "SET" | "UNKNOWN";
   affectedRows?: number;
+  /** For SELECT statements */
+  rows?: SqlRow[];
   /** For INSERT/UPDATE/DELETE with RETURNING clause */
   returningRows?: SqlRow[];
   tableObjectId?: string;
