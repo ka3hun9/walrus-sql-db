@@ -11743,6 +11743,9 @@ export class WalrusSqlClient {
               break;
             }
           }
+        } else if (join.type === "CROSS") {
+          // CROSS join: always match (Cartesian product)
+          allMatch = true;
         } else {
           // Regular join: check single column pair
           const leftVal = this.resolveJoinFieldValue(leftRow, join.leftField);
@@ -12119,6 +12122,9 @@ export class WalrusSqlClient {
       }
       return spill.rows;
     }
+
+    // CROSS joins must use nested loop to produce Cartesian product
+    if (join.type === "CROSS") return this.applyNestedLoopJoin(leftTable, leftRows, join, rightRows);
 
     if (algorithm === "HASH_JOIN") return this.applyHashJoin(leftTable, leftRows, join, rightRows);
     if (algorithm === "SORT_MERGE_JOIN") return this.applySortMergeJoin(leftTable, leftRows, join, rightRows);
@@ -14780,6 +14786,23 @@ export class WalrusSqlClient {
     if (fields.length === 1 && fields[0] === "*") return row;
     const out: SqlRow = {};
     for (const f of fields) {
+      // Handle qualified wildcard: t1.* -> expand to all columns from t1
+      const qualifiedWildcardMatch = f.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\.\*$/i);
+      if (qualifiedWildcardMatch) {
+        const tablePrefix = qualifiedWildcardMatch[1]!;
+        // Find all keys in the row that belong to this table
+        for (const key of Object.keys(row)) {
+          // Match qualified keys like "t1.a"
+          if (key.startsWith(`${tablePrefix}.`)) {
+            const colName = key.substring(tablePrefix.length + 1);
+            // Add with qualified key
+            out[key] = row[key];
+            // Also add unqualified if not already present
+            if (!(colName in out)) out[colName] = row[key];
+          }
+        }
+        continue;
+      }
       // Handle aggregate functions containing CASE WHEN or other complex expressions
       // that parseFieldExpr cannot handle (they return the whole string as field name)
       const isAggFunction = /^(COUNT|SUM|AVG|MIN|MAX)\s*\(/i.test(f);

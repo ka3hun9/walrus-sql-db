@@ -96,6 +96,11 @@ function verifyRowTypes(row: string[], sig: SltTypeSigChar[]): boolean {
     if (t === expected) continue;
     // INTEGER can match REAL (coercion)
     if (t === "I" && expected === "R") continue;
+    // SQLite type affinity: INTEGER can match TEXT (numeric strings)
+    if (t === "I" && expected === "T") continue;
+    if (t === "R" && expected === "T") continue;
+    if (t === "T" && expected === "I") continue;
+    if (t === "T" && expected === "R") continue;
     return false;
   }
   return true;
