@@ -1,7 +1,7 @@
 ﻿import { randomUUID, createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { evalPredicate3VL, resolveIdentifierValue, toTruthValue } from "./sql-semantics.js";
+import { evalPredicate3VL, resolveIdentifierValue, toTruthValue, containsSubquery } from "./sql-semantics.js";
 import {
   createTransactionLogRecord,
   convertTypedValue,
@@ -633,6 +633,8 @@ type ParsedSubqueryPlan = {
   where?: string;
   whereTree?: WhereExprNode;
   outerRefs: string[];
+  limit?: number;
+  orderBy?: string;
 };
 
 type SubqueryExecutionStats = {
@@ -3533,7 +3535,7 @@ export class WalrusSqlClient {
     if (cached) return cached;
 
     const m = normalizedSubquerySql.match(
-      /^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+WHERE\s+(.+))?$/i,
+      /^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\d+))?\s*$/i,
     );
     if (!m) throw sqlError("ERR_UNSUPPORTED_SUBQUERY", normalizedSubquerySql);
 
@@ -3541,7 +3543,9 @@ export class WalrusSqlClient {
     const table = m[2]!.trim();
     const tableAlias = m[3]?.trim();
     const where = m[4]?.trim();
-    const outerRefs = this.collectOuterReferences(`${fieldExpr} ${where ?? ""}`);
+    const orderBy = m[5]?.trim();
+    const limit = m[6] ? parseInt(m[6], 10) : undefined;
+    const outerRefs = this.collectOuterReferences(`${fieldExpr} ${where ?? ""} ${orderBy ?? ""}`);
 
     const plan: ParsedSubqueryPlan = {
       normalizedSql: normalizedSubquerySql,
@@ -3551,6 +3555,8 @@ export class WalrusSqlClient {
       where,
       whereTree: where ? this.parseWhereTree(where) : undefined,
       outerRefs,
+      limit,
+      orderBy,
     };
     this.subqueryRuntime?.planCache.set(normalizedSubquerySql, plan);
     return plan;
@@ -9531,7 +9537,7 @@ export class WalrusSqlClient {
   // AST-driven DML executors (Phase 3: wired from executeSimulator dispatch)
   // ---------------------------------------------------------------------------
 
-  private executeInsertStatement(ast: InsertStatementAst): ExecuteResult {
+  private async executeInsertStatement(ast: InsertStatementAst): Promise<ExecuteResult> {
     const table = ast.tableName;
     const viewEntry = this.assertUpdatableViewDeferred("INSERT", table, "target");
     // If target is a view with WITH CHECK OPTION, resolve to base table for INSERT
@@ -9542,6 +9548,11 @@ export class WalrusSqlClient {
     // When INSERT has no column list, use actual table column names in order
     const tableSchema = this.schemas.get(baseTable);
     const tableColumns = tableSchema?.columns.map((c) => c.name) ?? [];
+
+    // Handle INSERT ... SELECT
+    if (ast.selectSql) {
+      return this.executeInsertSelect(ast, baseTable, viewEntry, tableColumns, bucket);
+    }
 
     for (const rowExprs of ast.values) {
       const row: SqlRow = {};
@@ -9582,6 +9593,66 @@ export class WalrusSqlClient {
       txDigest: this.fakeDigest(ast.rawSql),
       statementType: "INSERT",
       affectedRows: ast.values.length,
+    };
+  }
+
+  private async executeInsertSelect(
+    ast: InsertStatementAst,
+    baseTable: string,
+    viewEntry: ViewCatalogEntry | undefined,
+    tableColumns: string[],
+    bucket: SqlRow[],
+  ): Promise<ExecuteResult> {
+    // Execute the SELECT to get source rows
+    const sourceResult = await this.executeSimulator(ast.selectSql!);
+    const sourceRows = sourceResult.rows ?? [];
+
+    // Handle column mapping
+    const targetColumns = ast.columns ?? tableColumns;
+
+    let insertedCount = 0;
+    for (const sourceRow of sourceRows) {
+      const row: SqlRow = {};
+
+      // Map SELECT columns to target columns
+      const sourceKeys = Object.keys(sourceRow);
+      for (let i = 0; i < targetColumns.length; i++) {
+        const colName = targetColumns[i]!;
+        // If explicit column list, use positional mapping from source
+        // Otherwise use column name from source row
+        const sourceKey = ast.columns ? sourceKeys[i] : colName;
+        row[colName] = sourceKey !== undefined ? (sourceRow[sourceKey] ?? null) : null;
+      }
+
+      // Apply schema, triggers, constraints
+      let coerced = this.applySchemaOnWrite(baseTable, row, undefined, {});
+      coerced = this.fireBeforeTriggers(baseTable, "INSERT", coerced);
+      this.evaluateCheckConstraints(baseTable, coerced);
+      if (viewEntry) this.validateWithCheckOption(viewEntry, coerced);
+
+      bucket.push(coerced);
+      this.addRowToUniqueIndexes(baseTable, coerced);
+      if (this.isDmlWriteStagingActive()) {
+        this.recordTransactionLogWrite(baseTable, "INSERT", coerced, null, coerced);
+        this.bumpTableWriteStats(baseTable, { insertRows: 1 });
+      } else {
+        this.addRowToSecondaryIndexes(baseTable, coerced);
+        this.bumpIndexMaintenanceStats(baseTable, "INSERT", 1);
+        this.dirtyTables.add(baseTable);
+        this.applyImmediateRowVersion(baseTable, "INSERT", coerced);
+        this.recordImmutableOptimizerStatsVersionObject(baseTable, { confirmationStatus: "confirmed" });
+        this.recordStorageWrite(baseTable, "INSERT_ROW", 1, "simulator");
+        this.invalidateReadCacheOnWrite();
+      }
+      this.fireAfterTriggers(baseTable, "INSERT", coerced);
+      insertedCount++;
+    }
+
+    return {
+      txDigest: this.fakeDigest(ast.rawSql),
+      statementType: "INSERT",
+      affectedRows: insertedCount,
+      rows: sourceRows,
     };
   }
 
@@ -12090,17 +12161,13 @@ export class WalrusSqlClient {
     let out = expr;
     while (out.startsWith("(") && out.endsWith(")")) {
       let depth = 0;
-      let valid = true;
       for (let i = 0; i < out.length; i++) {
         const ch = out[i];
         if (ch === "(") depth++;
         else if (ch === ")") depth--;
-        if (depth === 0 && i < out.length - 1) {
-          valid = false;
-          break;
-        }
+        if (depth < 0) break;
       }
-      if (!valid) break;
+      if (depth !== 0) break;
       out = out.slice(1, -1).trim();
     }
     return out;
@@ -12341,7 +12408,32 @@ export class WalrusSqlClient {
   }
 
   private parseAtomicWhereClause(token: string): WhereClause {
-    const expr = this.trimOuterParentheses(token.trim());
+    // Check for comparison-with-scalar-subquery BEFORE trimOuterParentheses.
+    // trimOuterParentheses can strip the outer parens from "(SELECT ...)" and
+    // break subquery detection in the subsequent checks.
+    const trimmedToken = token.trim();
+    const cmpSubqueryMatch = trimmedToken.match(/^(.+?)\s*(=|!=|<>|>=|<=|>|<)\s*(\(SELECT\s+.+\))$/i);
+    if (cmpSubqueryMatch) {
+      const leftParsed = this.parseFieldExpr(cmpSubqueryMatch[1]!.trim());
+      // Remove the outer parens from "(SELECT ...)" to get "SELECT ..."
+      // Then normalize spaces: remove spaces around parens and function names
+      const rawSubquerySql = cmpSubqueryMatch[3]!.trim().slice(1, -1).trim();
+      const subquerySql = rawSubquerySql
+        .replace(/\s+/g, " ")                   // collapse multiple spaces
+        .replace(/\s+\(/g, "(")                 // remove space before (
+        .replace(/\(\s+/g, "(")                 // remove space after (
+        .replace(/\s+\)/g, ")")                 // remove space before )
+        .replace(/\s+,/g, ",")                  // remove space before comma
+        .replace(/,\s+/g, ",");                 // remove space after comma
+      return {
+        field: leftParsed.field,
+        valueExpr: leftParsed.valueExpr,
+        op: cmpSubqueryMatch[2] as CompareOp,
+        subquerySql,
+      };
+    }
+
+    const expr = this.trimOuterParentheses(trimmedToken);
 
     const existsSubquery = this.parseExistsSubquery(expr);
     if (existsSubquery) {
@@ -12478,6 +12570,46 @@ export class WalrusSqlClient {
     throw sqlError("ERR_UNSUPPORTED_WHERE", token);
   }
 
+  private applyOrderByAndLimit(rows: SqlRow[], plan: ParsedSubqueryPlan): SqlRow[] {
+    let result = rows;
+
+    // Apply ORDER BY if present
+    if (plan.orderBy) {
+      const orderParts = plan.orderBy.split(",").map(p => p.trim());
+      const comparators: Array<{ field: string; desc: boolean }> = [];
+
+      for (const part of orderParts) {
+        const match = part.match(/^([a-zA-Z_][a-zA-Z0-9_\.]*)\s+(ASC|DESC)?$/i);
+        if (match) {
+          comparators.push({ field: match[1]!, desc: match[2]?.toUpperCase() === "DESC" });
+        } else {
+          comparators.push({ field: part, desc: false });
+        }
+      }
+
+      result = [...result].sort((a, b) => {
+        for (const comp of comparators) {
+          const valA = this.resolveRowValue(a, comp.field);
+          const valB = this.resolveRowValue(b, comp.field);
+          let cmp = 0;
+          if (valA === null || valA === undefined) cmp = valB === null || valB === undefined ? 0 : -1;
+          else if (valB === null || valB === undefined) cmp = 1;
+          else if (typeof valA === "number" && typeof valB === "number") cmp = valA - valB;
+          else cmp = String(valA).localeCompare(String(valB));
+          if (cmp !== 0) return comp.desc ? -cmp : cmp;
+        }
+        return 0;
+      });
+    }
+
+    // Apply LIMIT if present
+    if (plan.limit !== undefined && plan.limit >= 0) {
+      result = result.slice(0, plan.limit);
+    }
+
+    return result;
+  }
+
   private parseSubquerySelect(subquerySql: string, outerRow?: SqlRow): SqlRow[] {
     const normalized = subquerySql.trim().replace(/\s+/g, " ");
     const plan = this.getParsedSubqueryPlan(normalized);
@@ -12508,9 +12640,10 @@ export class WalrusSqlClient {
     }
 
     if (plan.fieldExpr === "*") {
-      stats.rowsReturned += matchedInnerRows.length;
-      this.storeSubqueryResultCache(cacheKey, matchedInnerRows);
-      return this.deepCloneRows(matchedInnerRows);
+      const result = this.applyOrderByAndLimit(matchedInnerRows, plan);
+      stats.rowsReturned += result.length;
+      this.storeSubqueryResultCache(cacheKey, result);
+      return this.deepCloneRows(result);
     }
 
     const aggMatch = plan.fieldExpr.match(
@@ -12556,9 +12689,10 @@ export class WalrusSqlClient {
       for (const f of fields) out[f] = this.evalExpr(row, f) ?? null;
       return out;
     });
-    stats.rowsReturned += projected.length;
-    this.storeSubqueryResultCache(cacheKey, projected);
-    return this.deepCloneRows(projected);
+    const result = this.applyOrderByAndLimit(projected, plan);
+    stats.rowsReturned += result.length;
+    this.storeSubqueryResultCache(cacheKey, result);
+    return this.deepCloneRows(result);
   }
 
   private parseSubqueryExistsValue(subquerySql: string, outerRow?: SqlRow): boolean {
@@ -12745,7 +12879,26 @@ export class WalrusSqlClient {
   }
 
   private evalExpr(row: SqlRow, exprRaw: string): SqlPrimitive | undefined {
-    const expr = this.trimOuterParentheses(exprRaw.trim());
+    const rawTrimmed = exprRaw.trim();
+
+    // Detect scalar subquery BEFORE trimOuterParentheses strips the outer parens.
+    // Pattern: one or more outer parens wrapping (SELECT ...).
+    // Strip matching outer parens first, then check for SELECT.
+    let exprToCheck = rawTrimmed;
+    while (exprToCheck.startsWith("(") && exprToCheck.endsWith(")")) {
+      // Check if the inner content starts with SELECT
+      const inner = exprToCheck.slice(1, -1).trim();
+      if (/^SELECT\s+/i.test(inner)) {
+        // This is a scalar subquery - strip all outer parens and execute
+        const subquerySql = inner.trim();
+        const values = this.parseSubqueryValues(subquerySql, undefined, row);
+        return values[0] ?? null;
+      }
+      // Try removing one level of parens and check again
+      exprToCheck = inner;
+    }
+
+    const expr = this.trimOuterParentheses(rawTrimmed);
 
     if (/^NULL$/i.test(expr)) return null;
     if (/^TRUE$/i.test(expr)) return true;
@@ -12867,6 +13020,79 @@ export class WalrusSqlClient {
       }
     }
 
+    // Handle simple CASE: CASE expr WHEN value THEN result [WHEN ...] [ELSE result] END
+    // Use a more sophisticated parser that handles multiple WHEN clauses
+    {
+      const upper = expr.toUpperCase();
+      const caseIdx = upper.indexOf("CASE");
+      if (caseIdx === 0) {
+        // Find the base expression (after CASE, before first WHEN)
+        const firstWhenIdx = upper.indexOf(" WHEN ");
+        if (firstWhenIdx > 0) {
+          const baseExprText = expr.substring(caseIdx + 4, firstWhenIdx).trim();
+          // Skip if no base expression (searched CASE starts directly with CASE WHEN)
+          if (!baseExprText) {
+            // Fall through to searched CASE handling below
+          } else {
+          // Find all WHEN-THEN pairs and ELSE-END
+          const whenThenPairs: Array<{ whenExpr: string; thenExpr: string }> = [];
+          let elseExpr: string | undefined;
+          let endIdx = -1;
+
+          let searchStart = firstWhenIdx;
+          while (true) {
+            const whenIdx = upper.indexOf(" WHEN ", searchStart);
+            if (whenIdx < 0) break;
+            const thenIdx = upper.indexOf(" THEN ", whenIdx);
+            if (thenIdx < 0) break;
+            const whenExpr = expr.substring(whenIdx + 6, thenIdx).trim();
+            // Look for next WHEN, ELSE, or END after THEN
+            const nextWhenIdx = upper.indexOf(" WHEN ", thenIdx);
+            const nextElseIdx = upper.indexOf(" ELSE ", thenIdx);
+            const nextEndIdx = upper.indexOf(" END", thenIdx);
+
+            let thenExprEnd = expr.length;
+            if (nextEndIdx > thenIdx && (nextElseIdx < 0 || nextEndIdx < nextElseIdx) && (nextWhenIdx < 0 || nextEndIdx < nextWhenIdx)) {
+              thenExprEnd = nextEndIdx;
+              endIdx = nextEndIdx;
+            } else if (nextElseIdx > thenIdx && (nextWhenIdx < 0 || nextElseIdx < nextWhenIdx)) {
+              thenExprEnd = nextElseIdx;
+              elseExpr = expr.substring(nextElseIdx + 5, nextElseIdx + 5 + 1000).trim(); // rough
+              const elseEndIdx = upper.indexOf(" END", nextElseIdx);
+              if (elseEndIdx > nextElseIdx) {
+                elseExpr = expr.substring(nextElseIdx + 5, elseEndIdx).trim();
+                endIdx = elseEndIdx;
+              }
+            } else if (nextWhenIdx > thenIdx) {
+              thenExprEnd = nextWhenIdx;
+            }
+
+            const thenExpr = expr.substring(thenIdx + 6, thenExprEnd).trim();
+            whenThenPairs.push({ whenExpr, thenExpr });
+            searchStart = thenIdx + 6;
+
+            if (endIdx > 0) break;
+          }
+
+          if (whenThenPairs.length > 0) {
+            const baseValue = this.evalExpr(row, baseExprText);
+            for (const pair of whenThenPairs) {
+              const whenValue = this.evalExpr(row, pair.whenExpr);
+              if (baseValue === whenValue) {
+                return this.evalExpr(row, pair.thenExpr);
+              }
+            }
+            // No match found, return ELSE or NULL
+            if (elseExpr) {
+              return this.evalExpr(row, elseExpr);
+            }
+            return null;
+          }
+          }
+        }
+      }
+    }
+
     const caseMatch = expr.match(/^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+(?:ELSE\s+(.+?)\s+)?END$/i);
     if (caseMatch) {
       const cond = this.evaluateWhereTree(row, this.parseWhereTree(caseMatch[1]!));
@@ -12948,7 +13174,7 @@ export class WalrusSqlClient {
   private toRpn(tokens: string[]): string[] {
     const out: string[] = [];
     const ops: string[] = [];
-    const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "||": 0, "&": 0, "|": 0, "^": 0, "u-": 3 };
+    const pri: Record<string, number> = { "+": 1, "-": 1, "*": 2, "/": 2, "%": 2, "||": 0, "&": 0, "|": 0, "^": 0, "u-": 3, "<": 1, ">": 1, "<=": 1, ">=": 1, "=": 1, "!=": 1, "<>": 1 };
 
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i]!;
@@ -12961,9 +13187,9 @@ export class WalrusSqlClient {
         ops.pop();
         continue;
       }
-      if (["+", "-", "*", "/", "%", "||"].includes(t)) {
+      if (["+", "-", "*", "/", "%", "||", "<", ">", "<=", ">=", "=", "!=", "<>"].includes(t)) {
         const prev = tokens[i - 1];
-        const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%", "||"].includes(prev!));
+        const unary = t === "-" && (i === 0 || prev === "(" || ["+", "-", "*", "/", "%", "||", "<", ">", "<=", ">=", "=", "!=", "<>"].includes(prev!));
         const op = unary ? "u-" : t;
         while (ops.length && pri[ops[ops.length - 1]!] >= pri[op]) out.push(ops.pop()!);
         ops.push(op);
@@ -13014,6 +13240,39 @@ export class WalrusSqlClient {
         else if (t === "&") st.push((an & bn) | 0);
         else if (t === "|") st.push((an | bn) | 0);
         else if (t === "^") st.push((an ^ bn) | 0);
+        continue;
+      }
+
+      // Comparison operators: return 1 for TRUE, 0 for FALSE (SQLite behavior)
+      if (["<", ">", "<=", ">=", "=", "!=", "<>"].includes(t)) {
+        const b = st.pop();
+        const a = st.pop();
+        if (a == null || b == null) {
+          st.push(null);
+          continue;
+        }
+        const an = Number(a);
+        const bn = Number(b);
+        // If both are numeric, compare as numbers; otherwise compare as strings
+        let result: boolean;
+        if (!Number.isNaN(an) && !Number.isNaN(bn)) {
+          if (t === "<") result = an < bn;
+          else if (t === ">") result = an > bn;
+          else if (t === "<=") result = an <= bn;
+          else if (t === ">=") result = an >= bn;
+          else if (t === "=" || t === "==") result = an === bn;
+          else result = an !== bn;
+        } else {
+          const as = String(a);
+          const bs = String(b);
+          if (t === "<") result = as < bs;
+          else if (t === ">") result = as > bs;
+          else if (t === "<=") result = as <= bs;
+          else if (t === ">=") result = as >= bs;
+          else if (t === "=" || t === "==") result = as === bs;
+          else result = as !== bs;
+        }
+        st.push(result ? 1 : 0);
         continue;
       }
 
@@ -13207,7 +13466,8 @@ export class WalrusSqlClient {
   private evaluateWhereAst(row: SqlRow, expr: ExprAst, fallbackSql?: string): TruthValue {
     // Subquery expression kinds need the fallback path since they require SQL execution
     const subqueryKinds = ["exists", "in_subquery", "scalar_subquery", "any_subquery"] as const;
-    if (!subqueryKinds.includes(expr.kind as any)) {
+    // Also use fallback if expression contains subqueries (e.g., CASE WHEN with scalar subquery)
+    if (!subqueryKinds.includes(expr.kind as any) && !containsSubquery(expr)) {
       // prefer semantic 3VL evaluator for non-raw AST
       if (expr.kind !== "raw") return evalPredicate3VL(expr, row, "strict");
     }

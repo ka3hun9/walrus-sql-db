@@ -697,11 +697,12 @@ function parseCompare(ts: TokenStream): ExprAst {
   const op = ts.peek();
   if (op && ["=", "!=", "<>", ">", "<", ">=", "<="].includes(op)) {
     ts.next();
-    // Check for scalar subquery: = (SELECT ...)
+    // Check for scalar subquery: = (SELECT ...), > (SELECT ...), etc.
     if (ts.peek() === "(" && ts.peek2()?.toUpperCase() === "SELECT") {
       ts.next(); // consume '('
       const subquerySql = collectUntilClosingParen(ts);
-      return { kind: "scalar_subquery", subquerySql };
+      // Return a binary expression with scalar subquery as the right operand
+      return { kind: "binary", op, left, right: { kind: "scalar_subquery", subquerySql } };
     }
     // Check for ANY/SOME/ALL: = ANY (SELECT ...), > ALL (SELECT ...), etc.
     const quantifier = ts.peek();

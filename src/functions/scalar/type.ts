@@ -69,6 +69,7 @@ export const TYPEOF: SqlScalarFunction = {
       return fromJs("real" as SqlPrimitive, undefined, {}, "type.typeof");
     }
     if (typeof v.value === "boolean") return fromJs("integer" as SqlPrimitive, undefined, {}, "type.typeof");
+    if (typeof v.value === "string") return fromJs("text" as SqlPrimitive, undefined, {}, "type.typeof");
     return fromJs(typeof v.value as SqlPrimitive, undefined, {}, "type.typeof");
   },
 };
@@ -266,6 +267,7 @@ function typeofPrim(args: SqlPrimitive[], _ctx: EvalContextPrimitive): SqlPrimit
     return Number.isInteger(v) ? "integer" : "real";
   }
   if (typeof v === "boolean") return "integer";
+  if (typeof v === "string") return "text";
   return typeof v;
 }
 

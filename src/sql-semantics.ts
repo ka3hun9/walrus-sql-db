@@ -146,11 +146,44 @@ export function toTruthValue(value: SqlPrimitive | undefined): TruthValue {
   return "UNKNOWN";
 }
 
+const SUBQUERY_KINDS = new Set(["exists", "in_subquery", "scalar_subquery", "any_subquery"]);
+
+export function containsSubquery(expr: ExprAst): boolean {
+  if (SUBQUERY_KINDS.has(expr.kind)) return true;
+  switch (expr.kind) {
+    case "binary":
+      if (containsSubquery(expr.left)) return true;
+      if (containsSubquery(expr.right)) return true;
+      if (expr.escape && containsSubquery(expr.escape)) return true;
+      return false;
+    case "case":
+      if (expr.baseExpr && containsSubquery(expr.baseExpr)) return true;
+      for (const wc of expr.whenClauses) {
+        if (containsSubquery(wc.condition) || containsSubquery(wc.result)) return true;
+      }
+      if (expr.elseResult && containsSubquery(expr.elseResult)) return true;
+      return false;
+    case "unary":
+      return containsSubquery(expr.expr);
+    case "function":
+      for (const arg of expr.args) {
+        if (containsSubquery(arg)) return true;
+      }
+      if (expr.filter && containsSubquery(expr.filter)) return true;
+      return false;
+    default:
+      return false;
+  }
+}
+
 export function evalPredicate3VL(
   expr: ExprAst,
   row: Record<string, unknown>,
   mode: "lenient" | "strict" = "lenient",
 ): TruthValue {
+  // If expression contains subqueries, return UNKNOWN to force fallback evaluation
+  // (evalExprAst cannot execute subqueries - it needs the fallback path via evaluateWhereAst)
+  if (containsSubquery(expr)) return "UNKNOWN";
   const value = evalExprAst(expr, (name) => resolveIdentifierValue(row, name, mode));
   return toTruthValue(value);
 }

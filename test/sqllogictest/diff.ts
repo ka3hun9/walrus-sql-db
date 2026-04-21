@@ -127,13 +127,57 @@ export function diffResults(
   query: SltQuery,
   hashThreshold: number,
 ): DiffResult {
-  // If hash mode applies, compare hashes
-  if (actual.length > hashThreshold) {
+  // Check if expected results use hash mode (e.g., "66 values hashing to <hash>")
+  const expectedHashMatch = expected.length === 1 &&
+    typeof expected[0] === "string" &&
+    /^(\d+)\s+values\s+hashing\s+to\s+[a-fA-F0-9]+$/i.test(expected[0]!);
+
+  // If expected uses hash mode OR actual exceeds threshold, compare hashes
+  if (expectedHashMatch || actual.length > hashThreshold) {
     const actualHash = hashResults(actual);
-    // For hash mode, we need the expected hash — but SLT doesn't embed it directly
-    // Instead we just verify row count matches
+
+    // If expected is a hash string, extract and compare hashes
+    if (expectedHashMatch) {
+      const hashMatch = expected[0]!.match(/^(\d+)\s+values\s+hashing\s+to\s+([a-fA-F0-9]+)$/i);
+      if (hashMatch) {
+        const expectedHash = hashMatch[2]!.toLowerCase();
+        const actualRowCount = parseInt(hashMatch[1]!, 10);
+
+        if (actual.length !== actualRowCount) {
+          return {
+            equal: false,
+            message: `Row count mismatch: expected ${actualRowCount}, got ${actual.length}`,
+          };
+        }
+
+        if (actualHash !== expectedHash) {
+          return {
+            equal: false,
+            message: `Hash mismatch: expected ${expectedHash.slice(0, 16)}..., got ${actualHash.slice(0, 16)}...`,
+          };
+        }
+        return { equal: true };
+      }
+    }
+
+    // If expected has actual row data but actual exceeds threshold, compare by hash
+    if (actual.length > hashThreshold && expected.length > 1) {
+      const expectedHash = hashResults(expected as SltResultRow[]);
+      if (actualHash !== expectedHash) {
+        return {
+          equal: false,
+          message: `Hash mismatch: expected ${expectedHash.slice(0, 16)}..., got ${actualHash.slice(0, 16)}...`,
+        };
+      }
+      return { equal: true };
+    }
+
+    // Fall back to row count comparison when in hash mode but expected is empty or has single row
     if (actual.length !== expected.length) {
-      return { equal: false, message: `Row count mismatch: expected ${expected.length}, got ${actual.length}` };
+      return {
+        equal: false,
+        message: `Row count mismatch: expected ${expected.length}, got ${actual.length}`,
+      };
     }
     return { equal: true };
   }
